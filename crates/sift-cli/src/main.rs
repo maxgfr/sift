@@ -7,6 +7,7 @@ use sift_core::model;
 use std::path::PathBuf;
 
 mod fit;
+mod ls;
 mod source;
 use source::Source;
 
@@ -117,6 +118,16 @@ enum Command {
         json: bool,
     },
 
+    /// Every local model, across LM Studio, Ollama, colibri and ~/.sift.
+    Ls {
+        /// Context length to size the KV cache for, in tokens.
+        #[arg(long, default_value_t = DEFAULT_CONTEXT_TOKENS)]
+        ctx: u64,
+        /// Emit JSON instead of a human-readable report.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// List the inference engines installed on this machine.
     Engines {
         /// Emit JSON instead of a human-readable report.
@@ -159,6 +170,7 @@ fn main() -> Result<()> {
         Command::Route { model, quant, json } => {
             cmd_route(&Source::resolve(&model, quant.as_deref())?, json)
         }
+        Command::Ls { ctx, json } => cmd_ls(ctx, json),
         Command::Engines { json } => cmd_engines(json),
     }
 }
@@ -271,6 +283,16 @@ fn cmd_route(src: &Source, json: bool) -> Result<()> {
         println!("\n  also suitable if installed: {}", names.join(", "));
     }
     Ok(())
+}
+
+fn cmd_ls(context_tokens: u64, json: bool) -> Result<()> {
+    let facts = MachineFacts::collect();
+    let usable = usable_ram(&facts);
+    let mem = doctor::measure_memory_bandwidth(doctor::BANDWIDTH_BUF_BYTES, 3);
+
+    let models = ls::discover();
+    let rows = ls::evaluate(models, mem.gb_per_sec * 1e9, usable, context_tokens);
+    ls::report(&rows, context_tokens, json)
 }
 
 fn cmd_engines(json: bool) -> Result<()> {
