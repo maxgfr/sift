@@ -8,12 +8,14 @@
 pub mod experts;
 pub mod ggml;
 pub mod gguf;
+pub mod remote;
 
 pub use experts::{
     expert_ranges, expert_slice, ExpertError, ExpertRanges, ExpertSlice, TokenTraffic,
 };
 pub use ggml::{BlockLayout, GgmlType};
 pub use gguf::{Gguf, GgufError, TensorInfo, Value};
+pub use remote::{hf_url, RemoteFile};
 
 /// A model's MoE shape, as far as the tensor directory reveals it.
 #[derive(Debug, Clone, PartialEq, Eq)]

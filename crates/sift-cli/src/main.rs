@@ -1,19 +1,24 @@
-//! `sift` — compile the model to the machine.
+//! `sift` — will this model run on your machine, and how fast?
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use sift_core::doctor::{self, MachineFacts};
-use sift_core::model::{self, Gguf};
+use sift_core::model;
 use std::path::PathBuf;
+
+mod source;
+use source::Source;
 
 #[derive(Parser)]
 #[command(
     name = "sift",
     version,
-    about = "Run large MoE models in a RAM budget you choose",
-    long_about = "sift measures your machine, measures which weights a model actually \
-                  touches, and decides what stays resident. The resident-set size is a \
-                  number you set, not one that emerges from kernel paging."
+    about = "Will this model fit and run fast on your machine? Answered before you download it.",
+    long_about = "sift measures your machine, reads a model's real header straight from \
+                  HuggingFace without downloading it, and tells you which quantization \
+                  fits and roughly how many tokens per second to expect.\n\n\
+                  There is no bundled model list, so a model uploaded ten minutes ago \
+                  works exactly like one from last year."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -33,10 +38,13 @@ enum Command {
         json: bool,
     },
 
-    /// Inspect a model file without loading its weights.
+    /// Read a model's shape. Works on a local file or straight off HuggingFace.
     Inspect {
-        /// Path to a .gguf file.
-        model: PathBuf,
+        /// A .gguf path, an `org/repo`, an `org/repo:QUANT`, or a URL.
+        model: String,
+        /// Pick a quantization when `model` is a repo.
+        #[arg(long)]
+        quant: Option<String>,
         /// Also print every tensor.
         #[arg(long)]
         tensors: bool,
@@ -44,8 +52,11 @@ enum Command {
 
     /// Show what a model would cost per token, and the resulting speed ceilings.
     Plan {
-        /// Path to a .gguf file.
-        model: PathBuf,
+        /// A .gguf path, an `org/repo`, an `org/repo:QUANT`, or a URL.
+        model: String,
+        /// Pick a quantization when `model` is a repo.
+        #[arg(long)]
+        quant: Option<String>,
         /// Expert-cache hit rate to assume, 0.0 to 1.0.
         #[arg(long, default_value_t = 0.0)]
         hit_rate: f64,
@@ -55,8 +66,16 @@ enum Command {
 fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Doctor { disk_sample, json } => cmd_doctor(disk_sample, json),
-        Command::Inspect { model, tensors } => cmd_inspect(model, tensors),
-        Command::Plan { model, hit_rate } => cmd_plan(model, hit_rate),
+        Command::Inspect {
+            model,
+            quant,
+            tensors,
+        } => cmd_inspect(&Source::resolve(&model, quant.as_deref())?, tensors),
+        Command::Plan {
+            model,
+            quant,
+            hit_rate,
+        } => cmd_plan(&Source::resolve(&model, quant.as_deref())?, hit_rate),
     }
 }
 
@@ -209,29 +228,31 @@ fn cmd_doctor(disk_sample: Option<PathBuf>, json: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_inspect(path: PathBuf, list_tensors: bool) -> Result<()> {
-    let rss_before = doctor::peak_rss_bytes();
-    let g = Gguf::open(&path).with_context(|| format!("reading {}", path.display()))?;
-    let rss_after = doctor::peak_rss_bytes();
+fn cmd_inspect(src: &Source, list_tensors: bool) -> Result<()> {
+    let (g, fetched) = src.read_gguf()?;
 
-    let file_bytes = std::fs::metadata(&path)?.len();
+    // Payload size is authoritative for remote files: the server's Content-Length covers
+    // the whole file, but only the directory was read.
+    let payload = g.total_tensor_bytes();
 
-    println!("{}", path.display());
+    println!("{}", src.label());
     println!("  gguf version     {}", g.version);
     println!(
         "  architecture     {}",
         g.architecture().unwrap_or("unknown")
     );
     println!("  tensors          {}", g.tensors.len());
-    println!("  file size        {:.2} GiB", sift_core::gib(file_bytes));
-    println!(
-        "  tensor payload   {:.2} GiB",
-        sift_core::gib(g.total_tensor_bytes())
-    );
-    println!(
-        "  read to open     {:.1} MiB of RSS growth (payload untouched)",
-        sift_core::mib(rss_after.saturating_sub(rss_before))
-    );
+    println!("  tensor payload   {:.2} GiB", sift_core::gib(payload));
+    match fetched {
+        // The headline claim of this tool, stated as a measurement rather than a promise.
+        Some(bytes) => println!(
+            "  read over HTTP   {:.2} MiB of a {:.2} GiB model ({:.4}%)",
+            sift_core::mib(bytes),
+            sift_core::gib(payload),
+            bytes as f64 / payload.max(1) as f64 * 100.0
+        ),
+        None => println!("  read from disk   directory only, payload untouched"),
+    }
 
     match model::infer_moe_shape(&g) {
         Some(shape) => {
@@ -285,8 +306,8 @@ fn cmd_inspect(path: PathBuf, list_tensors: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_plan(path: PathBuf, hit_rate: f64) -> Result<()> {
-    let g = Gguf::open(&path).with_context(|| format!("reading {}", path.display()))?;
+fn cmd_plan(src: &Source, hit_rate: f64) -> Result<()> {
+    let (g, _) = src.read_gguf()?;
     let shape = model::infer_moe_shape(&g)
         .context("this model has no stacked expert tensors; planning targets MoE models")?;
 
@@ -300,7 +321,7 @@ fn cmd_plan(path: PathBuf, hit_rate: f64) -> Result<()> {
         trunk_bytes,
     };
 
-    println!("{}", path.display());
+    println!("{}", src.label());
     println!("\nper-token weight traffic");
     println!(
         "  routed experts   {:.3} GB   ({} experts x {} layers)",
