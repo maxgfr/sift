@@ -66,6 +66,13 @@ jobs:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             artifact: sift-windows-x64.exe
+          # Built on the ARM runner rather than cross-compiled from x64, so the smoke test
+          # below runs the binary on the architecture it ships for. The same runner runs
+          # the full test suite in ci.yml, which is what took this row off the "unverified,
+          # so not shipped" list.
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            artifact: sift-windows-arm64.exe
     steps:
       - uses: actions/checkout@v5
         with:
@@ -126,6 +133,7 @@ jobs:
             artifacts/sift-linux-x64/sift-linux-x64 \
             artifacts/sift-linux-arm64/sift-linux-arm64 \
             artifacts/sift-windows-x64.exe/sift-windows-x64.exe \
+            artifacts/sift-windows-arm64.exe/sift-windows-arm64.exe \
             --clobber
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

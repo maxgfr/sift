@@ -13,12 +13,16 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # All three are real targets, not aspirations: the measurement layer has a
+        # All four are real targets, not aspirations: the measurement layer has a
         # per-OS implementation behind `sift_core::platform`, and each has its own way to
         # be wrong. Windows in particular enforces at runtime what the others tolerate
         # silently — unbuffered reads reject unaligned offsets outright — so a green
         # Windows job is the strongest single signal that the read path is correct.
-        os: [macos-latest, ubuntu-latest, windows-latest]
+        #
+        # `windows-11-arm` is here so the ARM64 binary the release workflow ships is one
+        # whose tests have actually run on that hardware. Building for a target nobody has
+        # executed is how an unstartable binary reaches users through Homebrew.
+        os: [macos-latest, ubuntu-latest, windows-latest, windows-11-arm]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
