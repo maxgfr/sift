@@ -6,6 +6,7 @@ use sift_core::doctor::{self, AccelMemory, MachineFacts};
 use sift_core::model;
 use std::path::PathBuf;
 
+mod bench;
 mod fit;
 mod ls;
 mod source;
@@ -128,6 +129,37 @@ enum Command {
         json: bool,
     },
 
+    /// Measure a real engine, and record what it achieved.
+    ///
+    /// `sift` never runs a model. This drives one that does, so the estimates have
+    /// something to be checked against.
+    Bench {
+        /// Which engine to drive. Defaults to whichever is serving.
+        #[arg(long, value_enum, default_value_t = bench::Target::Auto)]
+        engine: bench::Target,
+        /// Model id as the engine reports it. Defaults to whatever is loaded.
+        #[arg(long)]
+        model: Option<String>,
+        /// Tokens to generate per run.
+        #[arg(long, default_value_t = 128)]
+        max_tokens: u32,
+        /// Measured runs, after a discarded warm-up.
+        #[arg(long, default_value_t = 3)]
+        repeats: usize,
+        /// Prompt to send.
+        #[arg(long, default_value = "Explain what a mixture-of-experts layer does.")]
+        prompt: String,
+        /// LM Studio server port.
+        #[arg(long, default_value_t = bench::lmstudio::DEFAULT_PORT)]
+        lms_port: u16,
+        /// Ollama server port.
+        #[arg(long, default_value_t = bench::ollama::DEFAULT_PORT)]
+        ollama_port: u16,
+        /// Emit JSON instead of a human-readable report.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// List the inference engines installed on this machine.
     Engines {
         /// Emit JSON instead of a human-readable report.
@@ -171,6 +203,25 @@ fn main() -> Result<()> {
             cmd_route(&Source::resolve(&model, quant.as_deref())?, json)
         }
         Command::Ls { ctx, json } => cmd_ls(ctx, json),
+        Command::Bench {
+            engine,
+            model,
+            max_tokens,
+            repeats,
+            prompt,
+            lms_port,
+            ollama_port,
+            json,
+        } => cmd_bench(
+            engine,
+            model,
+            max_tokens,
+            repeats,
+            &prompt,
+            lms_port,
+            ollama_port,
+            json,
+        ),
         Command::Engines { json } => cmd_engines(json),
     }
 }
@@ -208,13 +259,16 @@ fn cmd_fit(repo: &str, context_tokens: u64, json: bool) -> Result<()> {
 }
 
 fn cmd_route(src: &Source, json: bool) -> Result<()> {
-    let (g, _) = src.read_gguf()?;
+    let (shape, _) = src.read_shape()?;
     let facts = MachineFacts::collect();
     let usable = usable_ram(&facts);
     let installed = sift_core::engine::detect_installed();
 
-    let size = g.total_tensor_bytes();
-    let rec = sift_core::engine::route(size, sift_core::engine::Format::Gguf, usable, &installed);
+    // Route on the actual format. mlx-lm reads safetensors and llama.cpp does not, so
+    // assuming GGUF here would recommend an engine that cannot open the file.
+    let format = src.format();
+    let size = shape.total_tensor_bytes();
+    let rec = sift_core::engine::route(size, format, usable, &installed);
 
     if json {
         println!(
@@ -223,6 +277,7 @@ fn cmd_route(src: &Source, json: bool) -> Result<()> {
                 "model": src.label(),
                 "size_bytes": size,
                 "usable_memory_bytes": usable,
+                "format": format,
                 "regime": sift_core::engine::Regime::classify(size, usable),
                 "engine": rec.engine.as_ref().map(|e| serde_json::json!({
                     "id": e.id,
@@ -295,6 +350,107 @@ fn cmd_ls(context_tokens: u64, json: bool) -> Result<()> {
     let models = ls::discover();
     let rows = ls::evaluate(models, mem.gb_per_sec * 1e9, usable, context_tokens);
     ls::report(&rows, context_tokens, json)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cmd_bench(
+    engine: bench::Target,
+    model: Option<String>,
+    max_tokens: u32,
+    repeats: usize,
+    prompt: &str,
+    lms_port: u16,
+    ollama_port: u16,
+    json: bool,
+) -> Result<()> {
+    let target = bench::resolve(engine, lms_port, ollama_port)?;
+
+    let (runs, engine_name) = match target {
+        bench::Target::LmStudio => {
+            let model = match model {
+                Some(m) => m,
+                None => bench::lmstudio::loaded_models(lms_port)?
+                    .first()
+                    .cloned()
+                    .context("no model is loaded; run `lms load <model>` first")?,
+            };
+            (
+                bench::lmstudio::measure(lms_port, &model, prompt, max_tokens, repeats)?,
+                "LM Studio",
+            )
+        }
+        bench::Target::Ollama => {
+            let model = match model {
+                Some(m) => m,
+                None => bench::ollama::local_models(ollama_port)?
+                    .first()
+                    .cloned()
+                    .context("Ollama has no local models; run `ollama pull <model>` first")?,
+            };
+            (
+                bench::ollama::measure(ollama_port, &model, prompt, max_tokens, repeats)?,
+                "Ollama",
+            )
+        }
+        bench::Target::Auto => unreachable!("resolve never returns Auto"),
+    };
+
+    let median = bench::median_tps(&runs).context("no runs completed")?;
+
+    // Recorded before printing: a measurement that reaches the terminal and not the log is
+    // one that cannot replace an estimate later, which is the whole reason to take it.
+    let recorded = bench::record(&runs, &stamp());
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "engine": runs.first().map(|r| r.engine),
+                "model": runs.first().map(|r| r.model.clone()),
+                "median_tokens_per_sec": median,
+                "runs": runs,
+                "recorded_to": recorded.as_ref().ok().map(|p| p.display().to_string()),
+            }))?
+        );
+        return Ok(());
+    }
+
+    println!("{engine_name}: {}", runs[0].model);
+    println!("  {:>3}  {:>10}  {:>9}", "run", "tok/s", "tokens");
+    for (i, r) in runs.iter().enumerate() {
+        println!(
+            "  {:>3}  {:>10.2}  {:>9}",
+            i + 1,
+            r.tokens_per_sec,
+            r.completion_tokens
+        );
+    }
+    println!(
+        "
+  median {median:.2} tok/s"
+    );
+    if !runs[0].engine_timed {
+        // Say which clock produced the number. LM Studio's API reports no decode duration,
+        // so this includes prompt processing and HTTP overhead and reads slightly low.
+        println!("  wall clock, including prompt processing — this engine reports no decode time");
+    }
+    match &recorded {
+        Ok(path) => println!("  recorded to {}", path.display()),
+        Err(e) => println!("  not recorded: {e}"),
+    }
+    Ok(())
+}
+
+/// A UTC timestamp for the bench log.
+///
+/// Derived from the wall clock rather than a date crate: the log needs runs to be
+/// orderable and attributable, and seconds since the epoch does both without adding a
+/// dependency to a binary that otherwise has none at runtime.
+fn stamp() -> String {
+    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => format!("{}", d.as_secs()),
+        Err(_) => "0".to_string(),
+    }
 }
 
 fn cmd_engines(json: bool) -> Result<()> {

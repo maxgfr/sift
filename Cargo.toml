@@ -3,7 +3,6 @@ resolver = "2"
 members = [
     "crates/sift-core",
     "crates/sift-cli",
-    "crates/sift-bench",
 ]
 
 [workspace.package]

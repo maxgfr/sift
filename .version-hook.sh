@@ -10,8 +10,8 @@
 #   2. `[workspace.dependencies] sift-core`'s `version` requirement. sift-cli and
 #      sift-bench depend on sift-core by path *and* version; once the crate is 0.2.0 a
 #      `^0.1.0` requirement no longer matches and cargo refuses to resolve.
-#   3. The three member entries in Cargo.lock, which is tracked because this workspace
-#      ships binaries.
+#   3. The member entries in Cargo.lock, which is tracked because this workspace ships
+#      binaries.
 #
 # The `cargo metadata --locked` at the end is the guard: it fails loudly if the three ever
 # disagree, so a bad bump stops the release instead of producing an unbuildable tag.
@@ -38,7 +38,7 @@ rm -f Cargo.toml.bak
 
 # 3. Every workspace member in the lockfile. `n` advances to the line after the name, which
 #    is where cargo writes the version.
-for crate in sift-core sift-cli sift-bench; do
+for crate in sift-core sift-cli; do
   sed -i.bak "/^name = \"${crate}\"$/{n;s/^version = \".*\"$/version = \"${NEW_VERSION}\"/;}" Cargo.lock
   rm -f Cargo.lock.bak
 done

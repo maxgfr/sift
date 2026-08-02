@@ -133,8 +133,19 @@ pub fn evaluate(
     usable_ram: u64,
     context_tokens: u64,
 ) -> Result<Vec<Candidate>> {
-    let files = hub::list_gguf(repo)?;
+    let files = hub::list_weights(repo)?;
     let (whole, sets) = hub::group_shards(&files);
+
+    // Safetensors keeps its architecture numbers in a separate `config.json`, so fetch it
+    // once for the whole repo rather than per candidate. `None` means the KV cache cannot
+    // be sized and `fits` covers weights only — reported, not assumed away.
+    let config = if files.iter().any(|f| f.is_safetensors())
+        || sets.iter().any(|s| s.base.is_safetensors())
+    {
+        fetch_config(repo)
+    } else {
+        None
+    };
 
     // Everything to evaluate, as one list, so the workers below need no per-kind logic.
     let work: Vec<Work> = whole
@@ -158,9 +169,14 @@ pub fn evaluate(
                 let Some(item) = queue.lock().expect("queue lock").next() else {
                     return;
                 };
-                if let Some(c) =
-                    evaluate_one(repo, &item, mem_bytes_per_sec, usable_ram, context_tokens)
-                {
+                if let Some(c) = evaluate_one(
+                    repo,
+                    &item,
+                    config.as_ref(),
+                    mem_bytes_per_sec,
+                    usable_ram,
+                    context_tokens,
+                ) {
                     out.lock().expect("results lock").push(c);
                 }
             });
@@ -186,20 +202,20 @@ enum Work<'a> {
 fn evaluate_one(
     repo: &str,
     item: &Work,
+    config: Option<&serde_json::Value>,
     mem_bytes_per_sec: f64,
     usable_ram: u64,
     context_tokens: u64,
 ) -> Option<Candidate> {
     match item {
         Work::Whole(f) => {
-            let g = match read_header(repo, &f.path) {
-                Ok(g) => g,
+            let shape = match read_shape(repo, std::slice::from_ref(&f.path), config) {
+                Ok(s) => s,
                 Err(e) => {
                     eprintln!("  skipped {}: {e}", f.quant_label());
                     return None;
                 }
             };
-            let shape = g.shape();
             let size = f.size.unwrap_or_else(|| shape.total_tensor_bytes());
             Some(build(
                 f.quant_label(),
@@ -225,18 +241,14 @@ fn evaluate_one(
             // Read every part, not just the first. Each shard carries only its own slice
             // of the tensor directory, so asking part 1 for the model's size or expert
             // layout gives an answer that is confidently a third of the truth.
-            let mut parts = Vec::with_capacity(set.parts.len());
-            for p in &set.parts {
-                match read_header(repo, &p.path) {
-                    Ok(g) => parts.push(g),
-                    Err(e) => {
-                        eprintln!("  skipped {}: {}: {e}", set.base.quant_label(), p.path);
-                        return None;
-                    }
+            let paths: Vec<String> = set.parts.iter().map(|p| p.path.clone()).collect();
+            let shape = match read_shape(repo, &paths, config) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("  skipped {}: {e}", set.base.quant_label());
+                    return None;
                 }
-            }
-
-            let shape = model::ModelShape::sharded(&parts)?;
+            };
             let size = set.size().unwrap_or_else(|| shape.total_tensor_bytes());
             Some(build(
                 set.base.quant_label(),
@@ -256,15 +268,74 @@ fn evaluate_one(
 /// Built from the set's base path, so `Q4_K_M/Model-Q4_K_M.gguf` becomes
 /// `--include "Q4_K_M/Model-Q4_K_M-*.gguf"`. Quoted because the shell would otherwise
 /// expand the glob against the local directory before the tool ever sees it.
+///
+/// The extension is carried through rather than assumed: a safetensors set given a
+/// `.gguf` pattern matches nothing, and the user finds out only after the command runs.
 fn shard_glob(base_path: &str) -> String {
-    let stem = base_path.strip_suffix(".gguf").unwrap_or(base_path);
-    format!("--include \"{stem}-*.gguf\"")
+    for ext in [".gguf", ".safetensors"] {
+        if let Some(stem) = base_path.strip_suffix(ext) {
+            return format!("--include \"{stem}-*{ext}\"");
+        }
+    }
+    format!("--include \"{base_path}-*\"")
 }
 
-/// Read one file's header over range requests, touching no payload.
-fn read_header(repo: &str, path: &str) -> Result<sift_core::model::Gguf> {
-    let mut remote = RemoteFile::new(hf_url(repo, path));
-    Ok(sift_core::model::Gguf::parse(&mut remote)?)
+/// Read every part's header and merge them into one shape.
+///
+/// Dispatches on extension. Both formats are read the same way — a few kilobytes of range
+/// requests, no payload — but they carry their architecture numbers in different places:
+/// GGUF in its own header, safetensors in the repo's `config.json`, which the caller has
+/// already fetched once for the whole sweep.
+fn read_shape(
+    repo: &str,
+    paths: &[String],
+    config: Option<&serde_json::Value>,
+) -> Result<model::ModelShape> {
+    let first = paths.first().context("a model with no files")?;
+
+    if first.ends_with(".safetensors") {
+        let mut tensors = Vec::new();
+        for p in paths {
+            let mut remote = RemoteFile::new(hf_url(repo, p));
+            let st =
+                model::Safetensors::parse(&mut remote).with_context(|| format!("reading {p}"))?;
+            tensors.extend(st.tensors);
+        }
+        let facts = config
+            .map(model::safetensors::facts_from_config)
+            .unwrap_or_default();
+        return Ok(model::ModelShape::new(facts, tensors, paths.len() as u32));
+    }
+
+    let mut parts = Vec::with_capacity(paths.len());
+    for p in paths {
+        let mut remote = RemoteFile::new(hf_url(repo, p));
+        parts.push(
+            sift_core::model::Gguf::parse(&mut remote).with_context(|| format!("reading {p}"))?,
+        );
+    }
+    model::ModelShape::sharded(&parts).context("no parts to merge")
+}
+
+/// Fetch a repo's `config.json`, which safetensors needs and GGUF does not.
+///
+/// Absence is not an error: plenty of repos omit it, and the honest consequence is that
+/// the KV cache goes uncounted and `fit` says so.
+fn fetch_config(repo: &str) -> Option<serde_json::Value> {
+    let out = std::process::Command::new("curl")
+        .args([
+            "-sSL",
+            "--fail",
+            "--max-time",
+            "20",
+            &model::safetensors::hf_config_url(repo),
+        ])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    serde_json::from_slice(&out.stdout).ok()
 }
 
 /// Turn a model's shape into an evaluated candidate.
@@ -701,7 +772,17 @@ mod download_tests {
     }
 
     #[test]
-    fn a_base_path_without_the_extension_still_yields_a_usable_pattern() {
-        assert_eq!(shard_glob("Model-Q8_0"), "--include \"Model-Q8_0-*.gguf\"");
+    fn a_safetensors_set_keeps_its_own_extension() {
+        // A `.gguf` pattern on a safetensors set matches nothing, and the user finds out
+        // only after the download command runs and fetches zero files.
+        assert_eq!(
+            shard_glob("model.safetensors"),
+            "--include \"model-*.safetensors\""
+        );
+    }
+
+    #[test]
+    fn a_base_path_without_a_known_extension_still_yields_a_usable_pattern() {
+        assert_eq!(shard_glob("Model-Q8_0"), "--include \"Model-Q8_0-*\"");
     }
 }

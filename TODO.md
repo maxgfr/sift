@@ -73,8 +73,14 @@ Roughly in order of how much they improve the answer.
       with regime and predicted speed. Ollama needed its manifests read rather than its
       blob directory listed: the blobs are `sha256-<digest>` with no extension and no
       indication of which is a model, which a projector and which a template.
-- [ ] **`sift bench`** — fold `sift-bench` into the main binary, drive Ollama as well as
-      LM Studio, and persist results so measurements replace estimates over time.
+- [x] **`sift bench`** — folded in; the `sift-bench` crate is gone, since `probe` and
+      `models` are now `sift engines` and `sift ls`. Drives Ollama as well as LM Studio,
+      and refuses to guess when both are serving rather than labelling a measurement with
+      the wrong engine. Ollama's native API reports `eval_duration`, so its figure excludes
+      prompt processing where LM Studio's OpenAI shape gives wall clock only; each run
+      records which clock it came from instead of presenting the two as one. Every run is
+      appended to `~/.sift/bench.jsonl` — a measurement kept in a terminal scrollback
+      cannot replace an estimate later.
 - [x] **`--json` on every command.** Under `--json`, progress chatter goes to stderr so
       stdout stays one parseable document.
 
@@ -90,7 +96,15 @@ Roughly in order of how much they improve the answer.
       A repeated sweep drops from 3.42s to 0.68s.
 - [x] Parallelise the `fit` sweep. Eight workers over a shared queue: 72 files in 22
       seconds, against a serial run that had not finished after five minutes.
-- [ ] Safetensors support, so non-GGUF repos are not a dead end.
+- [x] Safetensors support, so non-GGUF repos are not a dead end. `fit`, `route` and
+      `inspect` read the header — eight bytes of length, then JSON — and size each tensor
+      from its `data_offsets` rather than a dtype table, so a quantization this code has
+      never heard of is still sized exactly. Architecture numbers come from the repo's
+      `config.json`, normalised into `ArchFacts` so the KV arithmetic is written once for
+      both formats. `route` now dispatches on format: mlx-lm reads safetensors and
+      llama.cpp does not, so assuming GGUF recommended an engine that cannot open the file.
+      Verified on `allenai/OLMoE-1B-7B-0924-Instruct`: 13.84 GB, 16.00 bpw (BF16 exactly),
+      MoE detected across 3 parts.
 - [x] Homebrew formula in `maxgfr/homebrew-tap` plus a release workflow building
       macOS/Linux/Windows binaries. Cron hour 19 UTC is free; 0–18 are taken.
 - [ ] Windows on ARM (`aarch64-pc-windows-msvc`). The `windows-11-arm` runner exists, so

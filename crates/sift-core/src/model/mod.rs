@@ -9,6 +9,7 @@ pub mod experts;
 pub mod ggml;
 pub mod gguf;
 pub mod remote;
+pub mod safetensors;
 
 pub use experts::{
     expert_ranges, expert_slice, ExpertError, ExpertRanges, ExpertSlice, TokenTraffic,
@@ -18,6 +19,7 @@ pub use ggml::{BlockLayout, GgmlType};
 pub use self::KV_F16_BYTES as KV_DEFAULT_BYTES;
 pub use gguf::{Gguf, GgufError, TensorInfo, Value};
 pub use remote::{hf_url, RemoteFile};
+pub use safetensors::{Safetensors, SafetensorsError};
 
 /// One model's shape, whether it ships as a single file or several.
 ///
@@ -30,69 +32,103 @@ pub use remote::{hf_url, RemoteFile};
 /// bytes because its offsets are relative to its own file, and a merged view cannot. That
 /// distinction is kept in the type rather than in a comment nobody reads, so
 /// [`expert_ranges`] still takes a `Gguf` and cannot accidentally be handed a shard set.
-pub struct ModelShape<'a> {
-    metadata: &'a std::collections::HashMap<String, Value>,
-    tensors: Vec<&'a TensorInfo>,
+pub struct ModelShape {
+    /// Architecture facts, however the source format spelled them.
+    pub facts: ArchFacts,
+    tensors: Vec<TensorEntry>,
     /// Files this model is stored in. 1 for the ordinary case.
     pub shard_count: u32,
 }
 
-impl<'a> ModelShape<'a> {
-    /// View a single-file model.
-    pub fn single(g: &'a Gguf) -> Self {
+/// One tensor, reduced to what analysis needs.
+///
+/// Deliberately not [`TensorInfo`]: that carries a GGUF dtype and a file-relative offset,
+/// neither of which a safetensors file has in the same terms — there, a tensor's size is
+/// the difference of its two data offsets and its dtype is a string. Sizes and shapes are
+/// the only things the fit arithmetic needs, so they are all this holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TensorEntry {
+    pub name: String,
+    /// Dimensions as the file stores them. GGUF puts the expert count last on a stacked
+    /// expert tensor, which is how [`infer_moe_shape`] reads it off.
+    pub dims: Vec<u64>,
+    pub n_elems: u64,
+    pub size_bytes: u64,
+}
+
+/// The architecture numbers, normalised across formats.
+///
+/// GGUF keeps these in its own header under architecture-scoped keys
+/// (`qwen3moe.attention.head_count_kv`); a safetensors repo keeps them in a separate
+/// `config.json` under HuggingFace's names (`num_key_value_heads`). Normalising here means
+/// [`infer_kv_shape`] is written once and is right for both, rather than growing a branch
+/// per format in the place where a mistake is most expensive.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ArchFacts {
+    pub architecture: Option<String>,
+    pub block_count: Option<u64>,
+    pub head_count: Option<u64>,
+    pub head_count_kv: Option<u64>,
+    pub embedding_length: Option<u64>,
+    /// Explicit head width, where the architecture states one rather than implying it.
+    pub key_length: Option<u64>,
+    pub context_length: Option<u64>,
+    /// Experts activated per token, the top-k of the router.
+    pub expert_used_count: Option<u64>,
+}
+
+impl ModelShape {
+    /// Build from parts, taking the facts from the first.
+    pub fn new(facts: ArchFacts, tensors: Vec<TensorEntry>, shard_count: u32) -> Self {
         Self {
-            metadata: &g.metadata,
-            tensors: g.tensors.iter().collect(),
-            shard_count: 1,
+            facts,
+            tensors,
+            shard_count,
         }
     }
 
-    /// Merge the parts of a split model, in shard order.
+    /// View a single-file GGUF model.
+    pub fn single(g: &Gguf) -> Self {
+        Self::new(gguf_facts(g), gguf_entries(g), 1)
+    }
+
+    /// Merge the parts of a split GGUF model, in shard order.
     ///
-    /// Metadata comes from the first part: every shard repeats the architecture keys, and
-    /// the first is the one whose presence is guaranteed. Returns `None` for an empty
-    /// slice, since a model with no parts has no shape.
-    pub fn sharded(parts: &'a [Gguf]) -> Option<Self> {
+    /// Facts come from the first part: every shard repeats the architecture keys, and the
+    /// first is the one whose presence is guaranteed. Returns `None` for an empty slice,
+    /// since a model with no parts has no shape.
+    pub fn sharded(parts: &[Gguf]) -> Option<Self> {
         let first = parts.first()?;
-        Some(Self {
-            metadata: &first.metadata,
-            tensors: parts.iter().flat_map(|g| g.tensors.iter()).collect(),
-            shard_count: parts.len() as u32,
-        })
+        Some(Self::new(
+            gguf_facts(first),
+            parts.iter().flat_map(gguf_entries).collect(),
+            parts.len() as u32,
+        ))
     }
 
     /// The model architecture string, e.g. `qwen3moe`.
     pub fn architecture(&self) -> Option<&str> {
-        self.metadata
-            .get("general.architecture")
-            .and_then(Value::as_str)
+        self.facts.architecture.as_deref()
     }
 
-    /// Read an architecture-scoped metadata integer.
-    pub fn arch_u64(&self, suffix: &str) -> Option<u64> {
-        let arch = self.architecture()?;
-        self.metadata
-            .get(&format!("{arch}.{suffix}"))
-            .and_then(Value::as_u64)
+    /// Every tensor, across every shard.
+    pub fn tensors(&self) -> &[TensorEntry] {
+        &self.tensors
     }
 
     /// Look a tensor up by exact name, across every shard.
-    pub fn tensor(&self, name: &str) -> Option<&TensorInfo> {
-        self.tensors.iter().find(|t| t.name == name).copied()
+    pub fn tensor(&self, name: &str) -> Option<&TensorEntry> {
+        self.tensors.iter().find(|t| t.name == name)
     }
 
     /// Total payload bytes across every shard.
     pub fn total_tensor_bytes(&self) -> u64 {
-        self.tensors.iter().filter_map(|t| t.size_bytes()).sum()
+        self.tensors.iter().map(|t| t.size_bytes).sum()
     }
 
     /// Total weight count across every shard.
     pub fn total_parameters(&self) -> u64 {
-        self.tensors
-            .iter()
-            .filter(|t| t.size_bytes().is_some())
-            .map(|t| t.n_elems())
-            .sum()
+        self.tensors.iter().map(|t| t.n_elems).sum()
     }
 
     /// Mean bits stored per weight. See [`Gguf::bits_per_weight`].
@@ -105,9 +141,42 @@ impl<'a> ModelShape<'a> {
     }
 }
 
+/// Tensors whose size we can compute, as analysis entries.
+///
+/// A tensor of unknown dtype is dropped rather than counted at zero, so the byte total and
+/// the parameter total always cover the same set — otherwise [`ModelShape::bits_per_weight`]
+/// would divide a partial numerator by a whole denominator and understate precision.
+fn gguf_entries(g: &Gguf) -> Vec<TensorEntry> {
+    g.tensors
+        .iter()
+        .filter_map(|t| {
+            t.size_bytes().map(|size_bytes| TensorEntry {
+                name: t.name.clone(),
+                dims: t.dims.clone(),
+                n_elems: t.n_elems(),
+                size_bytes,
+            })
+        })
+        .collect()
+}
+
+/// Read the architecture-scoped metadata GGUF stores.
+fn gguf_facts(g: &Gguf) -> ArchFacts {
+    ArchFacts {
+        architecture: g.architecture().map(str::to_owned),
+        block_count: g.arch_u64("block_count"),
+        head_count: g.arch_u64("attention.head_count"),
+        head_count_kv: g.arch_u64("attention.head_count_kv"),
+        embedding_length: g.arch_u64("embedding_length"),
+        key_length: g.arch_u64("attention.key_length"),
+        context_length: g.arch_u64("context_length"),
+        expert_used_count: g.arch_u64("expert_used_count"),
+    }
+}
+
 impl Gguf {
     /// This file viewed as a whole model.
-    pub fn shape(&self) -> ModelShape<'_> {
+    pub fn shape(&self) -> ModelShape {
         ModelShape::single(self)
     }
 }
@@ -158,22 +227,21 @@ impl KvShape {
 /// would be a silently low one — and a low KV estimate makes a model look like it fits
 /// when it does not, which is the failure mode with the highest cost to the user.
 pub fn infer_kv_shape(g: &ModelShape) -> Option<KvShape> {
-    let layers = g.arch_u64("block_count")?;
+    let f = &g.facts;
+    let layers = f.block_count?;
     // Grouped-query attention means K/V heads are usually fewer than query heads. Fall
     // back to `head_count` only when `head_count_kv` is absent, which means multi-head
     // attention where the two are equal by definition.
-    let kv_heads = g
-        .arch_u64("attention.head_count_kv")
-        .or_else(|| g.arch_u64("attention.head_count"))?;
+    let kv_heads = f.head_count_kv.or(f.head_count)?;
 
     // Some architectures state the head width outright; the rest imply it. Deepseek-style
     // models with a decoupled head dimension state it, and deriving it from the embedding
     // width would be wrong for them.
-    let head_dim = match g.arch_u64("attention.key_length") {
+    let head_dim = match f.key_length {
         Some(d) => d,
         None => {
-            let embedding = g.arch_u64("embedding_length")?;
-            let heads = g.arch_u64("attention.head_count")?;
+            let embedding = f.embedding_length?;
+            let heads = f.head_count?;
             if heads == 0 {
                 return None;
             }
@@ -189,7 +257,7 @@ pub fn infer_kv_shape(g: &ModelShape) -> Option<KvShape> {
         layers,
         kv_heads,
         head_dim,
-        train_context: g.arch_u64("context_length"),
+        train_context: f.context_length,
     })
 }
 
@@ -257,6 +325,29 @@ impl MoeShape {
 /// reveals it. Absent that key we assume 8, the near-universal default, and callers that
 /// care should check metadata themselves.
 pub fn infer_moe_shape(g: &ModelShape) -> Option<MoeShape> {
+    // Two layouts, because two ecosystems name the same thing differently. GGUF stacks a
+    // layer's experts into one tensor with the expert count as its last dimension;
+    // safetensors keeps one tensor per expert. Trying stacked first costs a single lookup
+    // on the far more common case.
+    let (moe_layers, experts_per_layer, total_expert_bytes) =
+        stacked_experts(g).or_else(|| per_expert_tensors(g))?;
+
+    if moe_layers == 0 || experts_per_layer == 0 || total_expert_bytes == 0 {
+        return None;
+    }
+
+    let experts_per_token = g.facts.expert_used_count.unwrap_or(8);
+
+    Some(MoeShape {
+        moe_layers,
+        experts_per_layer,
+        experts_per_token,
+        total_expert_bytes,
+    })
+}
+
+/// GGUF's layout: `blk.{layer}.ffn_{gate,up,down}_exps.weight`, experts stacked.
+fn stacked_experts(g: &ModelShape) -> Option<(u32, u64, u64)> {
     let mut moe_layers = 0u32;
     let mut experts_per_layer = 0u64;
     let mut total_expert_bytes = 0u64;
@@ -278,25 +369,67 @@ pub fn infer_moe_shape(g: &ModelShape) -> Option<MoeShape> {
         for proj in ["gate", "up", "down"] {
             let n = format!("blk.{layer}.ffn_{proj}_exps.weight");
             if let Some(t) = g.tensor(&n) {
-                if let Some(b) = t.size_bytes() {
-                    total_expert_bytes += b;
-                }
+                total_expert_bytes += t.size_bytes;
             }
         }
     }
 
-    if moe_layers == 0 || experts_per_layer == 0 || total_expert_bytes == 0 {
-        return None;
+    (moe_layers > 0).then_some((moe_layers, experts_per_layer, total_expert_bytes))
+}
+
+/// HuggingFace's layout: `model.layers.{i}.mlp.experts.{j}.{gate,up,down}_proj.weight`.
+///
+/// Counted by scanning names rather than probing indices, because expert numbering is not
+/// guaranteed dense across a split repo — a shard can hold experts 40 to 63 of a layer and
+/// nothing else, and probing from zero would stop at the first gap and report a model with
+/// a fraction of its experts.
+fn per_expert_tensors(g: &ModelShape) -> Option<(u32, u64, u64)> {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let mut per_layer: BTreeMap<u64, BTreeSet<u64>> = BTreeMap::new();
+    let mut total_expert_bytes = 0u64;
+
+    for t in g.tensors() {
+        let Some((layer, expert)) = parse_expert_name(&t.name) else {
+            continue;
+        };
+        per_layer.entry(layer).or_default().insert(expert);
+        total_expert_bytes += t.size_bytes;
     }
 
-    let experts_per_token = g.arch_u64("expert_used_count").unwrap_or(8);
-
-    Some(MoeShape {
-        moe_layers,
+    if per_layer.is_empty() {
+        return None;
+    }
+    // The widest layer, not the first. A shard boundary can leave the lowest-numbered
+    // layer holding only some of its experts.
+    let experts_per_layer = per_layer
+        .values()
+        .map(|s| s.len() as u64)
+        .max()
+        .unwrap_or(0);
+    Some((
+        per_layer.len() as u32,
         experts_per_layer,
-        experts_per_token,
         total_expert_bytes,
-    })
+    ))
+}
+
+/// Pull `(layer, expert)` out of a HuggingFace expert tensor name.
+fn parse_expert_name(name: &str) -> Option<(u64, u64)> {
+    let rest = name.strip_prefix("model.layers.")?;
+    let (layer, rest) = rest.split_once('.')?;
+    let rest = rest.strip_prefix("mlp.experts.")?;
+    let (expert, tail) = rest.split_once('.')?;
+
+    // Only the three feed-forward projections count as expert weight. A per-expert bias or
+    // a router tensor caught by a looser match would inflate the traffic figure.
+    if !matches!(
+        tail,
+        "gate_proj.weight" | "up_proj.weight" | "down_proj.weight"
+    ) {
+        return None;
+    }
+    Some((layer.parse().ok()?, expert.parse().ok()?))
 }
 
 #[cfg(test)]

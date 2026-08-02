@@ -121,12 +121,14 @@ sift ls [--ctx N]               every local model, across every engine
 sift route <model>              which engine should run it
 sift inspect <path|hf-repo>     model shape, local or remote, no download
 sift plan <model>               per-token traffic and speed ceilings
+sift bench [--engine E]         measure a real engine, and record it
 sift doctor [--disk-sample F]   measure this machine
 sift engines                    which runtimes are installed here
 ```
 
-`<model>` accepts a path, `org/repo`, `org/repo:QUANT`, or a URL.
-Every command takes `--json`.
+`<model>` accepts a path, `org/repo`, `org/repo:QUANT`, or a URL, in GGUF **or
+safetensors** — a safetensors repo is sized from `data_offsets` and its `config.json`, and
+routed to an engine that can actually open it. Every command takes `--json`.
 
 `sift ls` is the one view across tools that cannot see each other — LM Studio, Ollama,
 colibri and `~/.sift` in one table, each scored against this machine:
@@ -147,7 +149,7 @@ served on trust. `SIFT_NO_CACHE=1` switches it off.
 
 Reproduce with the commands; don't take the table.
 
-**LM Studio baseline** (`sift-bench baseline`), Qwen3.5-9B Q4_K_M resident on MLX-NAX:
+**LM Studio baseline** (`sift bench`), Qwen3.5-9B Q4_K_M resident on MLX-NAX:
 **21.03 tok/s** median, under 1% spread across runs. A dense model re-reads every weight
 per token, so that's 118.1 GB/s effective against 119–136 GB/s of measured read bandwidth —
 about **90% of what this machine actually delivers**, and ~77% of the M5's 153.6 GB/s
@@ -230,7 +232,7 @@ Early, and honest about it. See [TODO.md](TODO.md) for what is deliberately *not
   on host memory. Discrete VRAM is a different quantity and is **not** counted, so `fits`
   is conservative on a Linux or Windows box with a dedicated GPU. `sift doctor` says so
   rather than substituting a guess.
-- 123 tests, clippy clean on all three.
+- 130 tests, clippy clean on all three.
 
 ## Prior art
 

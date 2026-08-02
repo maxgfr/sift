@@ -28,12 +28,11 @@ impl RepoFile {
     /// Falls back to the filename stem when nothing matches, which is always something the
     /// user can recognise.
     pub fn quant_label(&self) -> String {
-        let stem = self
-            .path
-            .rsplit('/')
-            .next()
-            .unwrap_or(&self.path)
-            .trim_end_matches(".gguf");
+        let file = self.path.rsplit('/').next().unwrap_or(&self.path);
+        let stem = file
+            .strip_suffix(".gguf")
+            .or_else(|| file.strip_suffix(".safetensors"))
+            .unwrap_or(file);
 
         let parts: Vec<&str> = stem.split('-').collect();
         let mut take_from = parts.len();
@@ -58,6 +57,11 @@ impl RepoFile {
     pub fn is_shard(&self) -> bool {
         shard_position(&self.path).is_some()
     }
+
+    /// Whether this file is safetensors rather than GGUF.
+    pub fn is_safetensors(&self) -> bool {
+        self.path.ends_with(".safetensors")
+    }
 }
 
 /// Where a file sits in a split set: `(name without the suffix, index, total)`.
@@ -67,7 +71,11 @@ impl RepoFile {
 /// legitimately called `Mixture-of-Experts-Q4_K_M.gguf` is one file, and treating it as a
 /// shard would drop it from the table entirely.
 pub fn shard_position(path: &str) -> Option<(String, u32, u32)> {
-    let stem = path.strip_suffix(".gguf")?;
+    let (stem, ext) = if let Some(s) = path.strip_suffix(".gguf") {
+        (s, ".gguf")
+    } else {
+        (path.strip_suffix(".safetensors")?, ".safetensors")
+    };
     let (rest, total) = stem.rsplit_once("-of-")?;
     let (base, index) = rest.rsplit_once('-')?;
 
@@ -76,7 +84,7 @@ pub fn shard_position(path: &str) -> Option<(String, u32, u32)> {
     if total == 0 || index == 0 || index > total {
         return None;
     }
-    Some((format!("{base}.gguf"), index, total))
+    Some((format!("{base}{ext}"), index, total))
 }
 
 /// One model that ships as several files.
@@ -181,12 +189,15 @@ pub enum HubError {
     Request { repo: String, detail: String },
     #[error("could not parse the hub response for `{repo}`: {detail}")]
     Parse { repo: String, detail: String },
-    #[error("`{0}` has no .gguf files")]
-    NoGguf(String),
+    #[error("`{0}` has no .gguf or .safetensors files")]
+    NoWeights(String),
 }
 
-/// List the GGUF files a repo offers, with sizes, without downloading anything.
-pub fn list_gguf(repo: &str) -> Result<Vec<RepoFile>, HubError> {
+/// List the weight files a repo offers, with sizes, without downloading anything.
+///
+/// Both formats, because a repo that ships only safetensors is a repo `sift` should have
+/// something to say about rather than a dead end.
+pub fn list_weights(repo: &str) -> Result<Vec<RepoFile>, HubError> {
     let url = format!("https://huggingface.co/api/models/{repo}?blobs=true");
     let out = Command::new("curl")
         .args(["-sSL", "--fail", "--max-time", "30", &url])
@@ -218,7 +229,7 @@ pub fn list_gguf(repo: &str) -> Result<Vec<RepoFile>, HubError> {
             arr.iter()
                 .filter_map(|s| {
                     let path = s["rfilename"].as_str()?;
-                    if !path.ends_with(".gguf") {
+                    if !path.ends_with(".gguf") && !path.ends_with(".safetensors") {
                         return None;
                     }
                     Some(RepoFile {
@@ -232,7 +243,7 @@ pub fn list_gguf(repo: &str) -> Result<Vec<RepoFile>, HubError> {
         .unwrap_or_default();
 
     if files.is_empty() {
-        return Err(HubError::NoGguf(repo.to_string()));
+        return Err(HubError::NoWeights(repo.to_string()));
     }
 
     files.sort_by_key(|f| f.size);
