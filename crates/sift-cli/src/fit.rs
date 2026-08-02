@@ -18,99 +18,395 @@
 
 use anyhow::{Context, Result};
 use sift_core::engine::{self, Format, Installed, Regime};
-use sift_core::hub::{self, RepoFile};
+use sift_core::hub;
 use sift_core::model::{self, hf_url, RemoteFile, TokenTraffic};
 
 /// One evaluated quantization.
 pub struct Candidate {
     pub label: String,
-    pub file: String,
+    /// What to pass `huggingface-cli download` to get this quantization.
+    ///
+    /// A path for a single file, a `--include` glob for a split set. Naming one shard
+    /// would fetch a third of a model that then fails to load, which is a worse outcome
+    /// than no hint at all.
+    pub download_arg: String,
     pub size_bytes: u64,
     pub traffic: TokenTraffic,
     pub regime: Regime,
     pub est_tok_s: f64,
     pub is_moe: bool,
+    /// Mean bits stored per weight, measured from this file's tensor directory.
+    pub bits_per_weight: Option<f64>,
+    /// KV cache bytes at the context this evaluation assumed.
+    pub kv_bytes: u64,
+    /// Files this quantization ships as. 1 for the ordinary case.
+    pub shard_count: u32,
 }
 
-/// Fraction of the memory-bandwidth roofline that real decode achieves.
+impl Candidate {
+    /// Everything that has to be resident at once: weights plus KV cache.
+    ///
+    /// The number `fits` is actually about. File size alone answers a question nobody
+    /// asked — a 30B model at 4 bits is ~18 GB of weights, and a long context can add more
+    /// than that again.
+    pub fn footprint_bytes(&self) -> u64 {
+        self.size_bytes.saturating_add(self.kv_bytes)
+    }
+}
+
+/// Bits per weight below which a quantization is damaged enough to warn about.
 ///
-/// Measured, not guessed: LM Studio on an M5 runs Qwen3.5-9B at 20.91 tok/s against
-/// ~128 GB/s of effective traffic on a 153.6 GB/s bus. Dense resident decode lands close to
-/// the roofline; MoE decode is lower because expert gather is scattered.
+/// Quantization quality does not fall off smoothly. Down to roughly 3 bits a model loses
+/// accuracy gradually and stays useful; below that it degrades fast, and the 1- and 2-bit
+/// formats are a last resort for models that would otherwise not run at all.
 ///
-/// This is the crudest part of the tool and it is labelled as such wherever it is printed.
-/// `sift bench` exists to replace it with measurement.
-const DENSE_EFFICIENCY: f64 = 0.80;
-const MOE_EFFICIENCY: f64 = 0.35;
+/// 3.0 is a judgement, not a measurement, and it is applied as a *warning threshold*
+/// rather than a filter: if nothing above it fits, `sift` still names the best option
+/// available and says plainly what the user is accepting.
+const QUALITY_FLOOR_BPW: f64 = 3.0;
 
-/// Evaluate every quantization a repo offers.
-pub fn evaluate(repo: &str, mem_bytes_per_sec: f64, usable_ram: u64) -> Result<Vec<Candidate>> {
-    let files = hub::list_gguf(repo)?;
-    let whole: Vec<&RepoFile> = files.iter().filter(|f| !f.is_shard()).collect();
-
-    let mut out = Vec::new();
-    for f in whole {
-        // A file whose header we cannot read is skipped with a note rather than guessed
-        // at: a wrong row in this table is worse than a missing one.
-        let mut remote = RemoteFile::new(hf_url(repo, &f.path));
-        let g = match sift_core::model::Gguf::parse(&mut remote) {
-            Ok(g) => g,
-            Err(e) => {
-                eprintln!("  skipped {}: {e}", f.quant_label());
-                continue;
-            }
-        };
-
-        let size = f.size.unwrap_or_else(|| g.total_tensor_bytes());
-        let (traffic, is_moe) = match model::infer_moe_shape(&g) {
-            Some(shape) => (
-                TokenTraffic {
-                    expert_bytes: shape.expert_bytes_per_token(),
-                    trunk_bytes: g
-                        .total_tensor_bytes()
-                        .saturating_sub(shape.total_expert_bytes()),
-                },
-                true,
-            ),
-            // Dense: every weight is read every token.
-            None => (
-                TokenTraffic {
-                    expert_bytes: 0,
-                    trunk_bytes: g.total_tensor_bytes(),
-                },
-                false,
-            ),
-        };
-
-        let regime = Regime::classify(size, usable_ram);
-        let efficiency = if is_moe {
-            MOE_EFFICIENCY
-        } else {
-            DENSE_EFFICIENCY
-        };
-
-        // Only a resident model runs at memory speed. Past the boundary the bottleneck
-        // becomes the disk, and pretending otherwise is how a router misleads people.
-        let est_tok_s = match regime {
-            Regime::Fits | Regime::Tight => {
-                traffic.tokens_per_sec(mem_bytes_per_sec * efficiency, 0.0)
-            }
-            Regime::Oversized => f64::NAN,
-        };
-
-        out.push(Candidate {
-            label: f.quant_label(),
-            file: f.path.clone(),
-            size_bytes: size,
-            traffic,
-            regime,
-            est_tok_s,
-            is_moe,
-        });
+impl Candidate {
+    /// Whether this quantization is above the quality floor.
+    ///
+    /// Unknown precision counts as acceptable: refusing to recommend a file whose bits per
+    /// weight could not be computed would silently drop valid options, and a missing
+    /// measurement is not evidence of a bad one.
+    fn meets_quality_floor(&self) -> bool {
+        self.bits_per_weight
+            .is_none_or(|bpw| bpw >= QUALITY_FLOOR_BPW)
     }
 
+    /// Ranking key for "which of these should you download".
+    ///
+    /// Ordered by what actually matters, most significant first:
+    ///
+    /// 1. **Above the quality floor.** A 3-bit quant that only just fits beats a 1-bit one
+    ///    with room to spare. This is the whole point: file size is a bad proxy for
+    ///    quality below ~3 bits, and ranking on size alone recommends a damaged model.
+    /// 2. **Comfortably resident over tight.** Between two quants that are both good
+    ///    enough, take the one that will not fall over once the KV cache grows.
+    /// 3. **More bits.** Within one regime, precision is the tiebreak — and bits per
+    ///    weight, not file size, because a dynamic quantization can be larger and no more
+    ///    precise.
+    fn rank(&self) -> (u8, u8, u64) {
+        let regime_rank = match self.regime {
+            Regime::Fits => 1,
+            Regime::Tight => 0,
+            Regime::Oversized => 0,
+        };
+        // Scaled to an integer so the key stays Ord; a millibit of resolution is far finer
+        // than the difference between any two real quantizations.
+        let bpw_rank = (self.bits_per_weight.unwrap_or(0.0) * 1000.0).max(0.0) as u64;
+        (self.meets_quality_floor() as u8, regime_rank, bpw_rank)
+    }
+}
+
+/// Fraction of the measured read-bandwidth roofline that real dense decode achieves.
+///
+/// **Calibrated against a measurement, and the calibration changed the number.** LM Studio
+/// decoding Qwen3.5-9B Q4_K_M on an M5: 21.03 tok/s median over three runs, 5.616 GB of
+/// weight traffic per token, so 118.1 GB/s effective. Read bandwidth measured on the same
+/// machine is 119–136 GB/s. That is ~0.90 of the ceiling, not the 0.80 this used to carry.
+///
+/// The old figure was not merely stale, it was measured against the wrong ruler: a
+/// single-threaded STREAM *copy*. Decode is read-dominated and one core cannot saturate an
+/// Apple Silicon bus, so that benchmark understated the machine and 0.80 was silently
+/// absorbing the error. See [`sift_core::doctor::measure_read_bandwidth`].
+pub const DENSE_EFFICIENCY: f64 = 0.90;
+
+/// The same fraction for mixture-of-experts decode.
+///
+/// **Not calibrated.** MoE decode is lower than dense because expert gather is scattered
+/// rather than streamed, but no MoE model has been measured on this machine, so this is
+/// a judgement carried forward.
+///
+/// It has been rescaled to preserve the predictions the old copy-based basis produced —
+/// 0.35 of ~103 GB/s copy is 0.28 of ~128 GB/s read — so switching rulers did not silently
+/// move every MoE estimate. Rescaling a guess leaves a guess; it is marked as such wherever
+/// it is printed, and replacing it is the open half of the predicted-versus-measured work.
+pub const MOE_EFFICIENCY: f64 = 0.28;
+
+/// Evaluate every quantization a repo offers, at a given context length.
+pub fn evaluate(
+    repo: &str,
+    mem_bytes_per_sec: f64,
+    usable_ram: u64,
+    context_tokens: u64,
+) -> Result<Vec<Candidate>> {
+    let files = hub::list_gguf(repo)?;
+    let (whole, sets) = hub::group_shards(&files);
+
+    // Everything to evaluate, as one list, so the workers below need no per-kind logic.
+    let work: Vec<Work> = whole
+        .iter()
+        .map(Work::Whole)
+        .chain(sets.iter().map(Work::Split))
+        .collect();
+
+    // The sweep is entirely network-bound — 25 quantizations meant 25 serial round-trips,
+    // and a fully split repo like Qwen3-235B is 72 of them. Threads spend their lives
+    // blocked on a socket, so the useful count is set by politeness to the hub rather than
+    // by cores; 8 is enough to hide latency without looking like a scraper.
+    let workers = work.len().clamp(1, 8);
+
+    let queue = std::sync::Mutex::new(work.into_iter());
+    let out = std::sync::Mutex::new(Vec::new());
+
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| loop {
+                let Some(item) = queue.lock().expect("queue lock").next() else {
+                    return;
+                };
+                if let Some(c) =
+                    evaluate_one(repo, &item, mem_bytes_per_sec, usable_ram, context_tokens)
+                {
+                    out.lock().expect("results lock").push(c);
+                }
+            });
+        }
+    });
+
+    let mut out = out.into_inner().expect("results lock");
+    // Sort here rather than relying on arrival order, which is now nondeterministic.
     out.sort_by_key(|c| c.size_bytes);
     Ok(out)
+}
+
+/// One unit of work for the sweep.
+enum Work<'a> {
+    Whole(&'a hub::RepoFile),
+    Split(&'a hub::ShardSet),
+}
+
+/// Evaluate one quantization, whether it ships as one file or several.
+///
+/// Returns `None` when the headers could not be read, having said why on stderr. A wrong
+/// row in this table is worse than a missing one, so nothing is guessed at.
+fn evaluate_one(
+    repo: &str,
+    item: &Work,
+    mem_bytes_per_sec: f64,
+    usable_ram: u64,
+    context_tokens: u64,
+) -> Option<Candidate> {
+    match item {
+        Work::Whole(f) => {
+            let g = match read_header(repo, &f.path) {
+                Ok(g) => g,
+                Err(e) => {
+                    eprintln!("  skipped {}: {e}", f.quant_label());
+                    return None;
+                }
+            };
+            let shape = g.shape();
+            let size = f.size.unwrap_or_else(|| shape.total_tensor_bytes());
+            Some(build(
+                f.quant_label(),
+                f.path.clone(),
+                size,
+                &shape,
+                mem_bytes_per_sec,
+                usable_ram,
+                context_tokens,
+            ))
+        }
+        Work::Split(set) => {
+            if !set.is_complete() {
+                eprintln!(
+                    "  skipped {}: {} of {} shards present in the repo",
+                    set.base.quant_label(),
+                    set.parts.len(),
+                    set.expected
+                );
+                return None;
+            }
+
+            // Read every part, not just the first. Each shard carries only its own slice
+            // of the tensor directory, so asking part 1 for the model's size or expert
+            // layout gives an answer that is confidently a third of the truth.
+            let mut parts = Vec::with_capacity(set.parts.len());
+            for p in &set.parts {
+                match read_header(repo, &p.path) {
+                    Ok(g) => parts.push(g),
+                    Err(e) => {
+                        eprintln!("  skipped {}: {}: {e}", set.base.quant_label(), p.path);
+                        return None;
+                    }
+                }
+            }
+
+            let shape = model::ModelShape::sharded(&parts)?;
+            let size = set.size().unwrap_or_else(|| shape.total_tensor_bytes());
+            Some(build(
+                set.base.quant_label(),
+                shard_glob(&set.base.path),
+                size,
+                &shape,
+                mem_bytes_per_sec,
+                usable_ram,
+                context_tokens,
+            ))
+        }
+    }
+}
+
+/// A `--include` pattern matching every part of a split model.
+///
+/// Built from the set's base path, so `Q4_K_M/Model-Q4_K_M.gguf` becomes
+/// `--include "Q4_K_M/Model-Q4_K_M-*.gguf"`. Quoted because the shell would otherwise
+/// expand the glob against the local directory before the tool ever sees it.
+fn shard_glob(base_path: &str) -> String {
+    let stem = base_path.strip_suffix(".gguf").unwrap_or(base_path);
+    format!("--include \"{stem}-*.gguf\"")
+}
+
+/// Read one file's header over range requests, touching no payload.
+fn read_header(repo: &str, path: &str) -> Result<sift_core::model::Gguf> {
+    let mut remote = RemoteFile::new(hf_url(repo, path));
+    Ok(sift_core::model::Gguf::parse(&mut remote)?)
+}
+
+/// Turn a model's shape into an evaluated candidate.
+///
+/// Shared by the single-file and split paths so the two cannot drift. A split model that
+/// scored differently from the same weights in one file would be a bug nobody would spot.
+#[allow(clippy::too_many_arguments)]
+fn build(
+    label: String,
+    download_arg: String,
+    size: u64,
+    shape: &model::ModelShape,
+    mem_bytes_per_sec: f64,
+    usable_ram: u64,
+    context_tokens: u64,
+) -> Candidate {
+    let (traffic, is_moe) = match model::infer_moe_shape(shape) {
+        Some(moe) => (
+            TokenTraffic {
+                expert_bytes: moe.expert_bytes_per_token(),
+                trunk_bytes: shape
+                    .total_tensor_bytes()
+                    .saturating_sub(moe.total_expert_bytes()),
+            },
+            true,
+        ),
+        // Dense: every weight is read every token.
+        None => (
+            TokenTraffic {
+                expert_bytes: 0,
+                trunk_bytes: shape.total_tensor_bytes(),
+            },
+            false,
+        ),
+    };
+
+    // A model that fits only with an empty context is a model that fails an hour in.
+    // Classify on weights plus cache, not on the file size.
+    let kv_bytes = model::infer_kv_shape(shape)
+        .map(|kv| kv.bytes_at(context_tokens, model::KV_F16_BYTES))
+        .unwrap_or(0);
+
+    let regime = Regime::classify(size.saturating_add(kv_bytes), usable_ram);
+    let efficiency = if is_moe {
+        MOE_EFFICIENCY
+    } else {
+        DENSE_EFFICIENCY
+    };
+
+    // Only a resident model runs at memory speed. Past the boundary the bottleneck
+    // becomes the disk, and pretending otherwise is how a router misleads people.
+    let est_tok_s = match regime {
+        Regime::Fits | Regime::Tight => traffic.tokens_per_sec(mem_bytes_per_sec * efficiency, 0.0),
+        Regime::Oversized => f64::NAN,
+    };
+
+    Candidate {
+        label,
+        download_arg,
+        shard_count: shape.shard_count,
+        size_bytes: size,
+        traffic,
+        regime,
+        est_tok_s,
+        is_moe,
+        bits_per_weight: shape.bits_per_weight(),
+        kv_bytes,
+    }
+}
+
+/// The candidate `report` would recommend, if any.
+///
+/// Shared by both output paths so the human table and the JSON document can never
+/// disagree about which quantization to download.
+pub fn recommended(cands: &[Candidate]) -> Option<&Candidate> {
+    cands
+        .iter()
+        .filter(|c| c.regime != Regime::Oversized)
+        .max_by_key(|c| c.rank())
+}
+
+/// Emit the same evaluation as [`report`], as one JSON document on stdout.
+pub fn report_json(
+    repo: &str,
+    cands: &[Candidate],
+    facts: &sift_core::doctor::MachineFacts,
+    usable_ram: u64,
+    memory_gb_per_sec: f64,
+    context_tokens: u64,
+) -> Result<()> {
+    let rows: Vec<_> = cands
+        .iter()
+        .map(|c| {
+            serde_json::json!({
+                "quant": c.label,
+                "size_bytes": c.size_bytes,
+                "kv_cache_bytes": c.kv_bytes,
+                "footprint_bytes": c.footprint_bytes(),
+                "regime": c.regime,
+                "bits_per_weight": c.bits_per_weight,
+                // Named `below_quality_floor` rather than `damaged` so the field says what
+                // was measured, not what to conclude from it.
+                "below_quality_floor": !c.meets_quality_floor(),
+                "bytes_per_token": c.traffic.total(),
+                "is_moe": c.is_moe,
+                "shard_count": c.shard_count,
+                // Null rather than 0 when disk-bound: a consumer that plots this must not
+                // read "we did not estimate" as "zero tokens per second".
+                "estimated_tokens_per_sec": (!c.est_tok_s.is_nan()).then_some(c.est_tok_s),
+                "download_arg": c.download_arg,
+            })
+        })
+        .collect();
+
+    let best = recommended(cands);
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "repo": repo,
+            "machine": {
+                "model": facts.model,
+                "ram_bytes": facts.ram_bytes,
+                "usable_memory_bytes": usable_ram,
+                "measured_memory_gb_per_sec": memory_gb_per_sec,
+                "accel_memory": facts.accel_memory,
+            },
+            "context_tokens": context_tokens,
+            "quality_floor_bits_per_weight": QUALITY_FLOOR_BPW,
+            "candidates": rows,
+            "recommended": best.map(|c| serde_json::json!({
+                "quant": c.label,
+                "download_arg": c.download_arg,
+                "below_quality_floor": !c.meets_quality_floor(),
+            })),
+            "estimates": {
+                "dense_efficiency": DENSE_EFFICIENCY,
+                "moe_efficiency": MOE_EFFICIENCY,
+                "note": "tokens per second are estimates from measured memory bandwidth, not measurements",
+            },
+        }))?
+    );
+    Ok(())
 }
 
 /// Print the table and a recommendation.
@@ -119,14 +415,33 @@ pub fn report(
     cands: &[Candidate],
     usable_ram: u64,
     installed: &[Installed],
+    context_tokens: u64,
 ) -> Result<()> {
     if cands.is_empty() {
         anyhow::bail!("no readable GGUF files in `{repo}`");
     }
 
+    // State the assumption before the table, because `fits` is only meaningful relative to
+    // it. The same model fits at 4k and does not at 128k, and a table that hides which one
+    // it answered is worse than no table.
+    let kv = cands.iter().map(|c| c.kv_bytes).max().unwrap_or(0);
+    if kv > 0 {
+        println!(
+            "\n  fits assumes {} tokens of context: {:.2} GB of f16 KV cache, counted\n  \
+             alongside the weights. Change it with --ctx.",
+            context_tokens,
+            kv as f64 / 1e9
+        );
+    } else {
+        println!(
+            "\n  KV cache not counted: this model's metadata does not state its attention\n  \
+             shape, so `fits` covers weights only and is optimistic at long context."
+        );
+    }
+
     println!(
-        "\n  {:<14} {:>9} {:>8} {:>11} {:>10}",
-        "quant", "size", "fits", "GB/token", "est tok/s"
+        "\n  {:<14} {:>9} {:>8} {:>6} {:>11} {:>10}",
+        "quant", "size", "fits", "bpw", "GB/token", "est tok/s"
     );
     for c in cands {
         let fits = match c.regime {
@@ -139,37 +454,45 @@ pub fn report(
         } else {
             format!("{:>10.0}", c.est_tok_s)
         };
+        let bpw = match c.bits_per_weight {
+            Some(b) => format!("{b:>6.2}"),
+            None => format!("{:>6}", "?"),
+        };
+        // Annotations go after the numbers, never inside the label: a label that grows to
+        // "UD-Q2_K_XL (2 parts)" overflows its column and unaligns every row below it.
+        let mut notes = vec![if c.is_moe { "moe" } else { "dense" }.to_string()];
+        if c.shard_count > 1 {
+            notes.push(format!("{} parts", c.shard_count));
+        }
+        if !c.meets_quality_floor() {
+            notes.push("damaged".to_string());
+        }
+
         println!(
-            "  {:<14} {:>6.2} GB {:>8} {:>11.3} {}  {}",
+            "  {:<14} {:>6.2} GB {:>8} {} {:>11.3} {}  {}",
             c.label,
             c.size_bytes as f64 / 1e9,
             fits,
-            c.traffic.total() as f64 / 1e9,
-            tps,
+            bpw,
             // Worth showing: a MoE row's GB/token is far below its file size, and that gap
             // is the whole reason these models are fast. Hiding it makes the table look
             // like an arithmetic error.
-            if c.is_moe { "moe" } else { "dense" }
+            c.traffic.total() as f64 / 1e9,
+            tps,
+            notes.join(", ")
         );
     }
 
-    // Recommend the largest that still fits: more bits is better quality, and the biggest
-    // resident option is the best trade available on this machine.
-    let best = cands
-        .iter()
-        .filter(|c| c.regime == Regime::Fits)
-        .max_by_key(|c| c.size_bytes)
-        .or_else(|| {
-            cands
-                .iter()
-                .filter(|c| c.regime == Regime::Tight)
-                .max_by_key(|c| c.size_bytes)
-        });
+    // Rank on quality first, size never. See `Candidate::rank`: on Qwen3-30B-A3B, picking
+    // the largest file that fits elects a 1-bit quant over a 3-bit one barely larger.
+    let best = recommended(cands);
 
     match best {
         Some(c) => {
             let format = Format::Gguf;
-            let rec = engine::route(c.size_bytes, format, usable_ram, installed);
+            // Route on the footprint, so an engine is not recommended for a model that
+            // only fits with an empty context.
+            let rec = engine::route(c.footprint_bytes(), format, usable_ram, installed);
             println!("\n  recommended: {}", c.label);
             if let Some(e) = &rec.engine {
                 println!("    engine     {} — {}", e.name, rec.reason);
@@ -177,7 +500,26 @@ pub fn report(
                     println!("    not installed: {}", e.install);
                 }
             }
-            println!("    download   huggingface-cli download {repo} {}", c.file);
+            // Say it out loud when the best available option is a damaged one. The user is
+            // about to spend an hour downloading it, and "it fits" is not the same claim
+            // as "it is worth running".
+            if !c.meets_quality_floor() {
+                println!(
+                    "\n    warning    at {:.2} bits per weight this is below the {:.1}-bit\n\
+                     {:>15}floor where quantization stops degrading gracefully. Nothing\n\
+                     {:>15}better fits here. Expect noticeably worse output than the same\n\
+                     {:>15}model at 4 bits — consider a smaller model instead.",
+                    c.bits_per_weight.unwrap_or(0.0),
+                    QUALITY_FLOOR_BPW,
+                    "",
+                    "",
+                    ""
+                );
+            }
+            println!(
+                "    download   huggingface-cli download {repo} {}",
+                c.download_arg
+            );
         }
         None => {
             println!(
@@ -185,7 +527,12 @@ pub fn report(
                 sift_core::gib(usable_ram)
             );
             let smallest = cands.first().context("no candidates")?;
-            let rec = engine::route(smallest.size_bytes, Format::Gguf, usable_ram, installed);
+            let rec = engine::route(
+                smallest.footprint_bytes(),
+                Format::Gguf,
+                usable_ram,
+                installed,
+            );
             if let Some(e) = &rec.engine {
                 println!(
                     "    the smallest option is {} at {:.2} GB.",
@@ -210,4 +557,151 @@ pub fn report(
         DENSE_EFFICIENCY * 100.0
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn candidate(label: &str, gb: f64, bpw: Option<f64>, regime: Regime) -> Candidate {
+        let size_bytes = (gb * 1e9) as u64;
+        Candidate {
+            label: label.into(),
+            download_arg: format!("{label}.gguf"),
+            size_bytes,
+            traffic: TokenTraffic {
+                expert_bytes: 0,
+                trunk_bytes: size_bytes,
+            },
+            regime,
+            est_tok_s: 10.0,
+            is_moe: false,
+            bits_per_weight: bpw,
+            // The regime is supplied directly by these tests, so the cache is already
+            // accounted for in whatever the caller passed.
+            kv_bytes: 0,
+            shard_count: 1,
+        }
+    }
+
+    /// Pick the way `report` does.
+    fn pick(cands: &[Candidate]) -> &Candidate {
+        cands
+            .iter()
+            .filter(|c| c.regime != Regime::Oversized)
+            .max_by_key(|c| c.rank())
+            .expect("a candidate")
+    }
+
+    #[test]
+    fn a_three_bit_quant_that_is_tight_beats_a_one_bit_quant_that_fits() {
+        // The bug this exists to prevent, with the real Qwen3-30B-A3B numbers from the
+        // README. Ranking on file size elects UD-IQ1_S because it is the only row marked
+        // "yes" — and hands the user a model damaged past the point of being worth an
+        // 9 GB download when a usable one was 5 GB away.
+        let cands = vec![
+            candidate("UD-IQ1_S", 9.04, Some(2.37), Regime::Fits),
+            candidate("Q2_K", 11.26, Some(2.95), Regime::Tight),
+            candidate("Q3_K_M", 14.71, Some(3.86), Regime::Tight),
+            candidate("Q4_K_M", 18.56, Some(4.87), Regime::Oversized),
+        ];
+        assert_eq!(pick(&cands).label, "Q3_K_M");
+    }
+
+    #[test]
+    fn among_quants_that_all_clear_the_floor_the_safe_fit_wins_over_the_tight_one() {
+        // Both are good enough to run, so the tiebreak stops being quality and becomes
+        // whether it will survive a growing KV cache.
+        let cands = vec![
+            candidate("Q3_K_M", 14.0, Some(3.86), Regime::Fits),
+            candidate("Q4_K_M", 18.0, Some(4.87), Regime::Tight),
+        ];
+        assert_eq!(pick(&cands).label, "Q3_K_M");
+    }
+
+    #[test]
+    fn within_one_regime_more_bits_wins() {
+        let cands = vec![
+            candidate("Q4_K_M", 18.0, Some(4.87), Regime::Fits),
+            candidate("Q6_K", 25.0, Some(6.56), Regime::Fits),
+            candidate("Q3_K_M", 14.0, Some(3.86), Regime::Fits),
+        ];
+        assert_eq!(pick(&cands).label, "Q6_K");
+    }
+
+    #[test]
+    fn bits_per_weight_decides_not_file_size() {
+        // A dynamic quantization can be the larger file and the less precise one, because
+        // it spends its extra bytes on a few sensitive layers rather than uniformly. Size
+        // would pick the wrong one; bits per weight does not.
+        let cands = vec![
+            candidate("UD-Q2_K_XL", 12.0, Some(2.80), Regime::Fits),
+            candidate("Q3_K_S", 11.5, Some(3.41), Regime::Fits),
+        ];
+        let best = pick(&cands);
+        assert_eq!(best.label, "Q3_K_S");
+        assert!(
+            best.size_bytes < cands[0].size_bytes,
+            "the smaller file won"
+        );
+    }
+
+    #[test]
+    fn when_nothing_clears_the_floor_the_best_available_is_still_named() {
+        // Refusing to answer is not more honest than answering with a warning. The user
+        // has this machine and wants this model; say which is least bad and why.
+        let cands = vec![
+            candidate("IQ1_S", 6.0, Some(1.78), Regime::Fits),
+            candidate("IQ2_XXS", 8.0, Some(2.10), Regime::Fits),
+        ];
+        let best = pick(&cands);
+        assert_eq!(best.label, "IQ2_XXS");
+        assert!(
+            !best.meets_quality_floor(),
+            "and it must be flagged as such"
+        );
+    }
+
+    #[test]
+    fn unknown_precision_is_not_treated_as_damaged() {
+        // A file whose bits per weight could not be computed is an unmeasured one, not a
+        // bad one. Excluding it would silently drop valid options — the same failure as
+        // guessing a number we do not have.
+        let c = candidate("MYSTERY", 10.0, None, Regime::Fits);
+        assert!(c.meets_quality_floor());
+    }
+
+    #[test]
+    fn the_floor_sits_exactly_at_three_bits() {
+        assert!(candidate("x", 1.0, Some(3.0), Regime::Fits).meets_quality_floor());
+        assert!(!candidate("x", 1.0, Some(2.999), Regime::Fits).meets_quality_floor());
+    }
+
+    #[test]
+    fn an_oversized_quant_is_never_recommended_however_good_it_is() {
+        let cands = vec![
+            candidate("Q3_K_M", 14.0, Some(3.86), Regime::Fits),
+            candidate("F16", 60.0, Some(16.0), Regime::Oversized),
+        ];
+        assert_eq!(pick(&cands).label, "Q3_K_M");
+    }
+}
+
+#[cfg(test)]
+mod download_tests {
+    use super::*;
+
+    #[test]
+    fn a_split_model_downloads_every_part_not_just_the_first() {
+        // Naming one shard fetches a third of a model that then fails to load — worse
+        // than giving no hint at all.
+        let g = shard_glob("Q4_K_M/Qwen3-235B-A22B-Q4_K_M.gguf");
+        assert_eq!(g, "--include \"Q4_K_M/Qwen3-235B-A22B-Q4_K_M-*.gguf\"");
+        assert!(g.contains('"'), "must be quoted against shell expansion");
+    }
+
+    #[test]
+    fn a_base_path_without_the_extension_still_yields_a_usable_pattern() {
+        assert_eq!(shard_glob("Model-Q8_0"), "--include \"Model-Q8_0-*.gguf\"");
+    }
 }

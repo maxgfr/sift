@@ -66,7 +66,7 @@ fn expert_offsets_land_inside_the_file_and_tile_their_tensor() {
     let g = Gguf::open(&path).expect("parse");
     let file_bytes = std::fs::metadata(&path).expect("stat").len();
 
-    let Some(shape) = model::infer_moe_shape(&g) else {
+    let Some(shape) = model::infer_moe_shape(&g.shape()) else {
         eprintln!("skipping: {} is dense, not MoE", path.display());
         return;
     };
@@ -104,7 +104,7 @@ fn different_experts_hold_different_bytes() {
     let path = model_or_skip!();
     let g = Gguf::open(&path).expect("parse");
 
-    let Some(shape) = model::infer_moe_shape(&g) else {
+    let Some(shape) = model::infer_moe_shape(&g.shape()) else {
         eprintln!("skipping: dense model");
         return;
     };
@@ -143,7 +143,7 @@ fn stock_layout_costs_three_scattered_reads_per_expert() {
     let path = model_or_skip!();
     let g = Gguf::open(&path).expect("parse");
 
-    if model::infer_moe_shape(&g).is_none() {
+    if model::infer_moe_shape(&g.shape()).is_none() {
         eprintln!("skipping: dense model");
         return;
     }
@@ -179,7 +179,7 @@ fn projections_may_carry_different_dtypes() {
     let path = model_or_skip!();
     let g = Gguf::open(&path).expect("parse");
 
-    if model::infer_moe_shape(&g).is_none() {
+    if model::infer_moe_shape(&g.shape()).is_none() {
         eprintln!("skipping: dense model");
         return;
     }
@@ -217,7 +217,7 @@ fn per_token_traffic_matches_the_activation_ratio() {
     let path = model_or_skip!();
     let g = Gguf::open(&path).expect("parse");
 
-    let Some(shape) = model::infer_moe_shape(&g) else {
+    let Some(shape) = model::infer_moe_shape(&g.shape()) else {
         eprintln!("skipping: dense model");
         return;
     };

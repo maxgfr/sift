@@ -56,8 +56,94 @@ impl RepoFile {
     /// Split shards must not be evaluated individually: shard 2 of 3 is not a model, and
     /// reporting its size as the model's size would be badly misleading.
     pub fn is_shard(&self) -> bool {
-        self.path.contains("-of-")
+        shard_position(&self.path).is_some()
     }
+}
+
+/// Where a file sits in a split set: `(name without the suffix, index, total)`.
+///
+/// GGUF splits are named `Model-Q4_K_M-00002-of-00003.gguf`. Matching the whole
+/// `-<digits>-of-<digits>` shape rather than the bare `-of-` substring matters: a model
+/// legitimately called `Mixture-of-Experts-Q4_K_M.gguf` is one file, and treating it as a
+/// shard would drop it from the table entirely.
+pub fn shard_position(path: &str) -> Option<(String, u32, u32)> {
+    let stem = path.strip_suffix(".gguf")?;
+    let (rest, total) = stem.rsplit_once("-of-")?;
+    let (base, index) = rest.rsplit_once('-')?;
+
+    let total: u32 = total.parse().ok()?;
+    let index: u32 = index.parse().ok()?;
+    if total == 0 || index == 0 || index > total {
+        return None;
+    }
+    Some((format!("{base}.gguf"), index, total))
+}
+
+/// One model that ships as several files.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShardSet {
+    /// The path the set would have had as a single file, used for its quant label.
+    pub base: RepoFile,
+    /// Every part, ordered by shard index.
+    pub parts: Vec<RepoFile>,
+    /// How many parts the filenames claim exist.
+    pub expected: u32,
+}
+
+impl ShardSet {
+    /// Total bytes across every part.
+    pub fn size(&self) -> Option<u64> {
+        self.parts.iter().map(|p| p.size).sum()
+    }
+
+    /// Whether every part the filenames promise is actually present.
+    ///
+    /// An incomplete set is reported rather than silently summed: two of three shards add
+    /// up to a plausible number that is wrong by a third, and a user acting on it
+    /// downloads a model that cannot load.
+    pub fn is_complete(&self) -> bool {
+        self.parts.len() as u32 == self.expected
+    }
+}
+
+/// Split whole files from shard sets.
+///
+/// Both are returned because both belong in the table. Shards used to be dropped outright,
+/// which left `sift` silent on exactly the largest models — the cases where "will this
+/// fit" is hardest and the download most expensive to get wrong.
+pub fn group_shards(files: &[RepoFile]) -> (Vec<RepoFile>, Vec<ShardSet>) {
+    use std::collections::BTreeMap;
+
+    let mut whole = Vec::new();
+    let mut sets: BTreeMap<String, (Vec<(u32, RepoFile)>, u32)> = BTreeMap::new();
+
+    for f in files {
+        match shard_position(&f.path) {
+            Some((base, index, total)) => {
+                let entry = sets.entry(base).or_insert_with(|| (Vec::new(), total));
+                entry.0.push((index, f.clone()));
+                // Trust the largest claim: a set whose parts disagree is malformed, and
+                // over-counting makes `is_complete` false, which is the safe direction.
+                entry.1 = entry.1.max(total);
+            }
+            None => whole.push(f.clone()),
+        }
+    }
+
+    let sets = sets
+        .into_iter()
+        .map(|(base, (mut parts, expected))| {
+            parts.sort_by_key(|(i, _)| *i);
+            let size = parts.iter().map(|(_, p)| p.size).sum();
+            ShardSet {
+                base: RepoFile { path: base, size },
+                parts: parts.into_iter().map(|(_, p)| p).collect(),
+                expected,
+            }
+        })
+        .collect();
+
+    (whole, sets)
 }
 
 /// Whether a hyphen-separated filename part names a quantization.
@@ -221,5 +307,108 @@ mod tests {
     fn split_shards_are_identifiable() {
         assert!(f("Qwen3-30B-A3B-BF16-00001-of-00002.gguf").is_shard());
         assert!(!f("Qwen3-30B-A3B-Q4_K_M.gguf").is_shard());
+    }
+}
+
+#[cfg(test)]
+mod shard_tests {
+    use super::*;
+
+    fn sized(path: &str, size: u64) -> RepoFile {
+        RepoFile {
+            path: path.into(),
+            size: Some(size),
+        }
+    }
+
+    #[test]
+    fn a_split_set_is_recognised_and_ordered() {
+        let (base, i, n) = shard_position("Qwen3-235B-Q4_K_M-00002-of-00003.gguf").unwrap();
+        assert_eq!(base, "Qwen3-235B-Q4_K_M.gguf");
+        assert_eq!((i, n), (2, 3));
+    }
+
+    #[test]
+    fn a_model_whose_name_contains_of_is_not_a_shard() {
+        // The bug the old `contains("-of-")` test had: `Mixture-of-Experts` is a name, not
+        // a split, and treating it as one dropped the file from the table entirely.
+        assert!(shard_position("Mixture-of-Experts-Q4_K_M.gguf").is_none());
+        assert!(!sized("Mixture-of-Experts-Q4_K_M.gguf", 1).is_shard());
+        assert!(sized("M-Q4_K_M-00001-of-00002.gguf", 1).is_shard());
+    }
+
+    #[test]
+    fn shards_are_grouped_and_their_sizes_summed() {
+        let files = vec![
+            sized("M-Q4_K_M-00002-of-00003.gguf", 20),
+            sized("M-Q8_0.gguf", 99),
+            sized("M-Q4_K_M-00001-of-00003.gguf", 10),
+            sized("M-Q4_K_M-00003-of-00003.gguf", 30),
+        ];
+        let (whole, sets) = group_shards(&files);
+
+        assert_eq!(whole.len(), 1);
+        assert_eq!(whole[0].path, "M-Q8_0.gguf");
+
+        assert_eq!(sets.len(), 1);
+        let s = &sets[0];
+        assert_eq!(s.size(), Some(60), "the model is the sum of its parts");
+        assert!(s.is_complete());
+        assert_eq!(s.base.quant_label(), "Q4_K_M");
+        // Order matters: part 1 carries the header that the rest is read against.
+        let order: Vec<&str> = s.parts.iter().map(|p| p.path.as_str()).collect();
+        assert_eq!(order[0], "M-Q4_K_M-00001-of-00003.gguf");
+        assert_eq!(order[2], "M-Q4_K_M-00003-of-00003.gguf");
+    }
+
+    #[test]
+    fn an_incomplete_set_is_flagged_rather_than_silently_summed() {
+        // Two of three shards add up to a plausible number that is wrong by a third. A
+        // user acting on it downloads a model that cannot load.
+        let files = vec![
+            sized("M-Q4_K_M-00001-of-00003.gguf", 10),
+            sized("M-Q4_K_M-00002-of-00003.gguf", 20),
+        ];
+        let (_, sets) = group_shards(&files);
+        assert!(!sets[0].is_complete());
+        assert_eq!(sets[0].expected, 3);
+        assert_eq!(sets[0].parts.len(), 2);
+    }
+
+    #[test]
+    fn two_quantizations_split_separately_stay_separate() {
+        let files = vec![
+            sized("M-Q4_K_M-00001-of-00002.gguf", 10),
+            sized("M-Q4_K_M-00002-of-00002.gguf", 10),
+            sized("M-Q8_0-00001-of-00002.gguf", 40),
+            sized("M-Q8_0-00002-of-00002.gguf", 40),
+        ];
+        let (whole, sets) = group_shards(&files);
+        assert!(whole.is_empty());
+        assert_eq!(sets.len(), 2);
+        let labels: Vec<String> = sets.iter().map(|s| s.base.quant_label()).collect();
+        assert!(labels.contains(&"Q4_K_M".to_string()));
+        assert!(labels.contains(&"Q8_0".to_string()));
+    }
+
+    #[test]
+    fn a_size_the_api_did_not_report_makes_the_total_unknown_not_wrong() {
+        let files = vec![
+            sized("M-Q4_K_M-00001-of-00002.gguf", 10),
+            RepoFile {
+                path: "M-Q4_K_M-00002-of-00002.gguf".into(),
+                size: None,
+            },
+        ];
+        let (_, sets) = group_shards(&files);
+        assert_eq!(sets[0].size(), None, "a partial sum would understate it");
+    }
+
+    #[test]
+    fn nonsense_shard_numbering_is_not_treated_as_a_split() {
+        assert!(shard_position("M-Q4_K_M-00000-of-00003.gguf").is_none());
+        assert!(shard_position("M-Q4_K_M-00004-of-00003.gguf").is_none());
+        assert!(shard_position("M-Q4_K_M-000x-of-00003.gguf").is_none());
+        assert!(shard_position("M-Q4_K_M-00001-of-.gguf").is_none());
     }
 }

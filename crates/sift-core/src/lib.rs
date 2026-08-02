@@ -14,6 +14,7 @@
 //!
 //! - [`platform`] — the per-OS seam. Everything that differs between macOS, Linux and
 //!   Windows lives here so the rest of the crate never sees a `cfg`.
+//! - [`cache`] — validated reuse of fetched headers, so a repeated sweep is cheap.
 //! - [`doctor`] — measure the machine: memory bandwidth, cold disk reads, what the OS
 //!   reports about itself.
 //! - [`model`] — read model files without loading them.
@@ -21,6 +22,7 @@
 //! - [`engine`] — which runtime should run a given model, and which to avoid.
 //! - [`io`] — explicit reads that bypass the page cache, so a cold measurement is honest.
 
+pub mod cache;
 pub mod doctor;
 pub mod engine;
 pub mod hub;

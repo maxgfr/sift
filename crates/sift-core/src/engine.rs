@@ -19,7 +19,8 @@
 use std::path::PathBuf;
 
 /// Weight formats an engine can load.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Format {
     Gguf,
     Mlx,
@@ -30,7 +31,8 @@ pub enum Format {
 ///
 /// This is the axis that actually decides the recommendation, and the one no existing tool
 /// surfaces.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Oversized {
     /// Refuses to load, or fails allocating.
     Refuses,
@@ -42,7 +44,8 @@ pub enum Oversized {
 }
 
 /// How a model's size compares to what the machine can hold.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Regime {
     /// Comfortably resident.
     Fits,
@@ -73,7 +76,7 @@ impl Regime {
 }
 
 /// A known inference engine.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct Engine {
     /// Stable identifier, e.g. `lm-studio`.
     pub id: &'static str,
