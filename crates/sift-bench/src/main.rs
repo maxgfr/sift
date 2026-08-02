@@ -21,7 +21,10 @@ use std::process::Command as Proc;
 const LMS_DEFAULT: &str = ".lmstudio/bin/lms";
 
 #[derive(Parser)]
-#[command(name = "sift-bench", about = "Compare sift against LM Studio on this machine")]
+#[command(
+    name = "sift-bench",
+    about = "Compare sift against LM Studio on this machine"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Cmd,
@@ -78,7 +81,9 @@ impl Regime {
 }
 
 fn home() -> Result<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from).context("HOME is not set")
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .context("HOME is not set")
 }
 
 fn lms_path() -> Result<PathBuf> {
@@ -115,9 +120,15 @@ fn main() -> Result<()> {
 fn probe() -> Result<()> {
     let facts = sift_core::doctor::MachineFacts::collect();
     println!("machine");
-    println!("  model        {}", facts.model.as_deref().unwrap_or("unknown"));
+    println!(
+        "  model        {}",
+        facts.model.as_deref().unwrap_or("unknown")
+    );
     println!("  ram          {:.1} GiB", sift_core::gib(facts.ram_bytes));
-    println!("  usable       {:.1} GiB (regime boundary)", sift_core::gib(usable_ram_bytes()));
+    println!(
+        "  usable       {:.1} GiB (regime boundary)",
+        sift_core::gib(usable_ram_bytes())
+    );
 
     println!("\nlm studio");
     match lms_path() {
@@ -168,7 +179,10 @@ fn models() -> Result<()> {
         return Ok(());
     }
 
-    println!("usable RAM for regime classification: {:.1} GiB\n", sift_core::gib(usable));
+    println!(
+        "usable RAM for regime classification: {:.1} GiB\n",
+        sift_core::gib(usable)
+    );
     for (path, size) in &found {
         let regime = Regime::classify(*size, usable);
         let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("?");

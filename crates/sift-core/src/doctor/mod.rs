@@ -92,7 +92,9 @@ impl MachineFacts {
         Self {
             ram_bytes: sysctl_u64("hw.memsize").unwrap_or(0),
             page_bytes: crate::io::page_size(),
-            cpus: std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1),
+            cpus: std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1),
             model: sysctl_string("hw.model"),
             gpu_wired_limit_bytes: sysctl_u64("iogpu.wired_limit_mb")
                 .filter(|&mb| mb > 0)
@@ -130,7 +132,13 @@ fn sysctl_string(name: &str) -> Option<String> {
     let mut size: usize = 0;
     // SAFETY: querying with a null buffer asks for the required size; `size` is a live local.
     let rc = unsafe {
-        libc::sysctlbyname(cname.as_ptr(), std::ptr::null_mut(), &mut size, std::ptr::null_mut(), 0)
+        libc::sysctlbyname(
+            cname.as_ptr(),
+            std::ptr::null_mut(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
     };
     if rc != 0 || size == 0 {
         return None;
@@ -222,9 +230,9 @@ pub fn measure_random_read(
 
     let mut total_bytes = 0u64;
     for h in handles {
-        total_bytes += h.join().map_err(|_| {
-            std::io::Error::other("reader thread panicked")
-        })??;
+        total_bytes += h
+            .join()
+            .map_err(|_| std::io::Error::other("reader thread panicked"))??;
     }
 
     let seconds = started.elapsed().as_secs_f64();
@@ -240,7 +248,11 @@ pub fn measure_random_read(
 }
 
 /// Measure sequential read throughput with a single reader.
-pub fn measure_sequential_read(path: &Path, block_bytes: usize, blocks: usize) -> std::io::Result<DiskSample> {
+pub fn measure_sequential_read(
+    path: &Path,
+    block_bytes: usize,
+    blocks: usize,
+) -> std::io::Result<DiskSample> {
     let file = WeightFile::open(path, CachePolicy::Uncached)?;
     let mut buf = AlignedBuf::new(block_bytes);
 

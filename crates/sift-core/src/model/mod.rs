@@ -9,7 +9,9 @@ pub mod experts;
 pub mod ggml;
 pub mod gguf;
 
-pub use experts::{expert_ranges, expert_slice, ExpertError, ExpertRanges, ExpertSlice, TokenTraffic};
+pub use experts::{
+    expert_ranges, expert_slice, ExpertError, ExpertRanges, ExpertSlice, TokenTraffic,
+};
 pub use ggml::{BlockLayout, GgmlType};
 pub use gguf::{Gguf, GgufError, TensorInfo, Value};
 
@@ -111,7 +113,10 @@ mod tests {
             bytes_per_expert: 884_736 * 3,
         };
 
-        assert!((shape.activation_ratio() - 0.0625).abs() < 1e-9, "8 of 128 is 6.25%");
+        assert!(
+            (shape.activation_ratio() - 0.0625).abs() < 1e-9,
+            "8 of 128 is 6.25%"
+        );
 
         let per_token_gb = shape.expert_bytes_per_token() as f64 / 1e9;
         assert!(

@@ -109,7 +109,11 @@ pub enum GgufError {
     #[error("unknown metadata value type {0}")]
     BadValueType(u32),
     #[error("{what} claims {n} entries, which exceeds the {limit} sanity limit")]
-    Implausible { what: &'static str, n: u64, limit: u64 },
+    Implausible {
+        what: &'static str,
+        n: u64,
+        limit: u64,
+    },
     #[error("string of {0} bytes is implausible")]
     ImplausibleString(u64),
 }
@@ -175,7 +179,11 @@ impl<R: Read + Seek> Reader<R> {
                 let elem_ty = self.u32()?;
                 let n = self.u64()?;
                 if n > MAX_ARRAY {
-                    return Err(GgufError::Implausible { what: "array", n, limit: MAX_ARRAY });
+                    return Err(GgufError::Implausible {
+                        what: "array",
+                        n,
+                        limit: MAX_ARRAY,
+                    });
                 }
                 let mut items = Vec::with_capacity(n.min(4096) as usize);
                 for _ in 0..n {
@@ -254,7 +262,12 @@ impl Gguf {
             }
             let dtype = GgmlType(r.u32()?);
             let rel_offset = r.u64()?;
-            tensors.push(TensorInfo { name, dims, dtype, rel_offset });
+            tensors.push(TensorInfo {
+                name,
+                dims,
+                dtype,
+                rel_offset,
+            });
         }
 
         // Tensor data starts at the next `general.alignment` boundary after the directory.
@@ -266,7 +279,12 @@ impl Gguf {
         let pos = r.inner.stream_position()?;
         let data_offset = pos.div_ceil(alignment) * alignment;
 
-        Ok(Gguf { version, metadata, tensors, data_offset })
+        Ok(Gguf {
+            version,
+            metadata,
+            tensors,
+            data_offset,
+        })
     }
 
     /// Absolute file offset of a tensor's payload.
@@ -281,14 +299,18 @@ impl Gguf {
 
     /// The model architecture string, e.g. `qwen3moe`.
     pub fn architecture(&self) -> Option<&str> {
-        self.metadata.get("general.architecture").and_then(Value::as_str)
+        self.metadata
+            .get("general.architecture")
+            .and_then(Value::as_str)
     }
 
     /// Read an architecture-scoped metadata integer, e.g. `expert_count` resolves to
     /// `qwen3moe.expert_count`.
     pub fn arch_u64(&self, suffix: &str) -> Option<u64> {
         let arch = self.architecture()?;
-        self.metadata.get(&format!("{arch}.{suffix}")).and_then(Value::as_u64)
+        self.metadata
+            .get(&format!("{arch}.{suffix}"))
+            .and_then(Value::as_u64)
     }
 
     /// Total payload bytes across all tensors whose size we can compute.
@@ -355,7 +377,9 @@ mod tests {
         assert_eq!(g.arch_u64("expert_count"), Some(128));
         assert_eq!(g.tensors.len(), 1);
 
-        let t = g.tensor("blk.0.ffn_gate_exps.weight").expect("tensor present");
+        let t = g
+            .tensor("blk.0.ffn_gate_exps.weight")
+            .expect("tensor present");
         assert_eq!(t.dims, vec![2048, 768, 128]);
         assert_eq!(t.dtype.name(), "Q4_K");
         assert_eq!(t.n_elems(), 2048 * 768 * 128);
@@ -388,7 +412,10 @@ mod tests {
         b.extend_from_slice(&(1u64 << 40).to_le_bytes());
         b.extend_from_slice(&0u64.to_le_bytes());
         match Gguf::parse(Cursor::new(b)) {
-            Err(GgufError::Implausible { what: "tensor count", .. }) => {}
+            Err(GgufError::Implausible {
+                what: "tensor count",
+                ..
+            }) => {}
             other => panic!("expected Implausible, got {other:?}"),
         }
     }

@@ -102,8 +102,14 @@ fn cmd_doctor(disk_sample: Option<PathBuf>, json: bool) -> Result<()> {
     }
 
     println!("machine");
-    println!("  model            {}", facts.model.as_deref().unwrap_or("unknown"));
-    println!("  ram              {:.1} GiB", sift_core::gib(facts.ram_bytes));
+    println!(
+        "  model            {}",
+        facts.model.as_deref().unwrap_or("unknown")
+    );
+    println!(
+        "  ram              {:.1} GiB",
+        sift_core::gib(facts.ram_bytes)
+    );
     println!("  page size        {} KiB", facts.page_bytes / 1024);
     println!("  cpus             {}", facts.cpus);
     match facts.gpu_wired_limit_bytes {
@@ -129,7 +135,10 @@ fn cmd_doctor(disk_sample: Option<PathBuf>, json: bool) -> Result<()> {
         println!("  caching but cannot evict resident pages, so a warm file reports RAM.");
     } else {
         println!("\ndisk, cold random read");
-        println!("  {:>8}  {:>7}  {:>9}  {:>10}", "block", "threads", "GB/s", "ms/read");
+        println!(
+            "  {:>8}  {:>7}  {:>9}  {:>10}",
+            "block", "threads", "GB/s", "ms/read"
+        );
         for s in &disk {
             println!(
                 "  {:>7}K  {:>7}  {:>9.2}  {:>10.3}{}",
@@ -137,7 +146,11 @@ fn cmd_doctor(disk_sample: Option<PathBuf>, json: bool) -> Result<()> {
                 s.threads,
                 s.gb_per_sec,
                 s.ms_per_read,
-                if s.looks_cached() { "   <- page cache, not disk" } else { "" }
+                if s.looks_cached() {
+                    "   <- page cache, not disk"
+                } else {
+                    ""
+                }
             );
         }
 
@@ -205,10 +218,16 @@ fn cmd_inspect(path: PathBuf, list_tensors: bool) -> Result<()> {
 
     println!("{}", path.display());
     println!("  gguf version     {}", g.version);
-    println!("  architecture     {}", g.architecture().unwrap_or("unknown"));
+    println!(
+        "  architecture     {}",
+        g.architecture().unwrap_or("unknown")
+    );
     println!("  tensors          {}", g.tensors.len());
     println!("  file size        {:.2} GiB", sift_core::gib(file_bytes));
-    println!("  tensor payload   {:.2} GiB", sift_core::gib(g.total_tensor_bytes()));
+    println!(
+        "  tensor payload   {:.2} GiB",
+        sift_core::gib(g.total_tensor_bytes())
+    );
     println!(
         "  read to open     {:.1} MiB of RSS growth (payload untouched)",
         sift_core::mib(rss_after.saturating_sub(rss_before))
@@ -237,7 +256,11 @@ fn cmd_inspect(path: PathBuf, list_tensors: bool) -> Result<()> {
             if let Ok(r) = model::expert_ranges(&g, 0, 0) {
                 println!(
                     "\n  layer 0 expert 0 spans 3 ranges, contiguous: {}",
-                    if r.is_contiguous() { "yes" } else { "no -> 3 scattered reads" }
+                    if r.is_contiguous() {
+                        "yes"
+                    } else {
+                        "no -> 3 scattered reads"
+                    }
                 );
             }
         }
@@ -252,7 +275,9 @@ fn cmd_inspect(path: PathBuf, list_tensors: bool) -> Result<()> {
                 t.name,
                 t.dtype.name(),
                 t.dims,
-                t.size_bytes().map(|b| b.to_string()).unwrap_or_else(|| "?".into())
+                t.size_bytes()
+                    .map(|b| b.to_string())
+                    .unwrap_or_else(|| "?".into())
             );
         }
     }
@@ -266,7 +291,9 @@ fn cmd_plan(path: PathBuf, hit_rate: f64) -> Result<()> {
         .context("this model has no stacked expert tensors; planning targets MoE models")?;
 
     // Everything that is not a routed expert is read on every token regardless of routing.
-    let trunk_bytes = g.total_tensor_bytes().saturating_sub(shape.total_expert_bytes());
+    let trunk_bytes = g
+        .total_tensor_bytes()
+        .saturating_sub(shape.total_expert_bytes());
 
     let traffic = model::TokenTraffic {
         expert_bytes: shape.expert_bytes_per_token(),
@@ -281,7 +308,10 @@ fn cmd_plan(path: PathBuf, hit_rate: f64) -> Result<()> {
         shape.experts_per_token,
         shape.moe_layers
     );
-    println!("  always-active    {:.3} GB   (read every token, no cache helps)", trunk_bytes as f64 / 1e9);
+    println!(
+        "  always-active    {:.3} GB   (read every token, no cache helps)",
+        trunk_bytes as f64 / 1e9
+    );
     println!("  total cold       {:.3} GB", traffic.total() as f64 / 1e9);
 
     let mem = doctor::measure_memory_bandwidth(256 << 20, 4);

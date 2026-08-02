@@ -75,14 +75,23 @@ pub enum ExpertError {
     #[error("tensor `{name}` has rank {rank}, expected 3 (a stacked expert tensor)")]
     NotStacked { name: String, rank: usize },
     #[error("expert {index} is out of range; tensor `{name}` holds {count}")]
-    OutOfRange { name: String, index: u64, count: u64 },
+    OutOfRange {
+        name: String,
+        index: u64,
+        count: u64,
+    },
     #[error("tensor `{name}` uses dtype {dtype}, whose block layout this build does not know")]
     UnknownDtype { name: String, dtype: String },
     #[error(
         "tensor `{name}` holds {elems} weights across {count} experts, which is not a whole \
          number of {block}-weight blocks per expert; the layout assumption is wrong"
     )]
-    NotBlockAligned { name: String, elems: u64, count: u64, block: u64 },
+    NotBlockAligned {
+        name: String,
+        elems: u64,
+        count: u64,
+        block: u64,
+    },
 }
 
 /// Compute the byte range of one expert inside a stacked expert tensor.
@@ -110,10 +119,13 @@ pub fn expert_slice(g: &Gguf, tensor_name: &str, expert: u64) -> Result<ExpertSl
         });
     }
 
-    let layout = t.dtype.block_layout().ok_or_else(|| ExpertError::UnknownDtype {
-        name: t.name.clone(),
-        dtype: t.dtype.name().to_string(),
-    })?;
+    let layout = t
+        .dtype
+        .block_layout()
+        .ok_or_else(|| ExpertError::UnknownDtype {
+            name: t.name.clone(),
+            dtype: t.dtype.name().to_string(),
+        })?;
 
     // Weights in one expert's matrix.
     let per_expert_elems = t.dims[0] * t.dims[1];
@@ -240,7 +252,11 @@ mod tests {
         let g = model();
         let a = expert_slice(&g, "blk.0.ffn_gate_exps.weight", 5).expect("slice 5");
         let b = expert_slice(&g, "blk.0.ffn_gate_exps.weight", 6).expect("slice 6");
-        assert_eq!(a.end(), b.offset, "experts must tile the stacked tensor without gaps");
+        assert_eq!(
+            a.end(),
+            b.offset,
+            "experts must tile the stacked tensor without gaps"
+        );
         assert_eq!(a.len, b.len);
     }
 
@@ -250,14 +266,22 @@ mod tests {
         let t = g.tensor("blk.0.ffn_gate_exps.weight").expect("present");
         let last = expert_slice(&g, "blk.0.ffn_gate_exps.weight", 127).expect("slice 127");
         let tensor_end = g.absolute_offset(t) + t.size_bytes().expect("size");
-        assert_eq!(last.end(), tensor_end, "slices must exactly cover the tensor");
+        assert_eq!(
+            last.end(),
+            tensor_end,
+            "slices must exactly cover the tensor"
+        );
     }
 
     #[test]
     fn an_out_of_range_expert_is_refused() {
         let g = model();
         match expert_slice(&g, "blk.0.ffn_gate_exps.weight", 128) {
-            Err(ExpertError::OutOfRange { index: 128, count: 128, .. }) => {}
+            Err(ExpertError::OutOfRange {
+                index: 128,
+                count: 128,
+                ..
+            }) => {}
             other => panic!("expected OutOfRange, got {other:?}"),
         }
     }
@@ -279,7 +303,10 @@ mod tests {
     fn down_projection_has_the_same_size_despite_transposed_dims() {
         let g = model();
         let r = expert_ranges(&g, 0, 0).expect("ranges");
-        assert_eq!(r.gate.len, r.down.len, "768x2048 and 2048x768 hold equal weights");
+        assert_eq!(
+            r.gate.len, r.down.len,
+            "768x2048 and 2048x768 hold equal weights"
+        );
     }
 
     #[test]
@@ -297,14 +324,23 @@ mod tests {
     fn token_traffic_matches_the_hand_computed_qwen3_figure() {
         // Qwen3-30B-A3B at Q4_K: 8 experts x 48 layers x 3 projections x 884,736 bytes.
         let expert_bytes = 8 * 48 * 3 * 884_736u64;
-        let t = TokenTraffic { expert_bytes, trunk_bytes: 0 };
+        let t = TokenTraffic {
+            expert_bytes,
+            trunk_bytes: 0,
+        };
         let gb = t.total() as f64 / 1e9;
-        assert!((gb - 1.019).abs() < 0.01, "expected ~1.02 GB/token, got {gb:.3}");
+        assert!(
+            (gb - 1.019).abs() < 0.01,
+            "expected ~1.02 GB/token, got {gb:.3}"
+        );
     }
 
     #[test]
     fn hit_rate_scales_only_expert_traffic() {
-        let t = TokenTraffic { expert_bytes: 1_000_000_000, trunk_bytes: 500_000_000 };
+        let t = TokenTraffic {
+            expert_bytes: 1_000_000_000,
+            trunk_bytes: 500_000_000,
+        };
 
         // Cold: reads everything.
         let cold = t.tokens_per_sec(6.15e9, 0.0);
@@ -319,7 +355,10 @@ mod tests {
 
     #[test]
     fn hit_rate_is_clamped_rather_than_producing_nonsense() {
-        let t = TokenTraffic { expert_bytes: 1_000, trunk_bytes: 1_000 };
+        let t = TokenTraffic {
+            expert_bytes: 1_000,
+            trunk_bytes: 1_000,
+        };
         assert_eq!(t.tokens_per_sec(1e9, 2.0), t.tokens_per_sec(1e9, 1.0));
         assert_eq!(t.tokens_per_sec(1e9, -5.0), t.tokens_per_sec(1e9, 0.0));
     }

@@ -195,8 +195,14 @@ mod tests {
     #[test]
     fn page_size_is_plausible() {
         let ps = page_size();
-        assert!(ps.is_power_of_two(), "page size {ps} should be a power of two");
-        assert!((4096..=65536).contains(&ps), "page size {ps} outside expected range");
+        assert!(
+            ps.is_power_of_two(),
+            "page size {ps} should be a power of two"
+        );
+        assert!(
+            (4096..=65536).contains(&ps),
+            "page size {ps} outside expected range"
+        );
     }
 
     #[test]
@@ -204,7 +210,10 @@ mod tests {
         let buf = AlignedBuf::new(4096);
         assert_eq!(buf.as_slice().as_ptr() as usize % DEST_ALIGN, 0);
         assert_eq!(buf.len(), 4096);
-        assert!(buf.as_slice().iter().all(|&b| b == 0), "must be zero-initialised");
+        assert!(
+            buf.as_slice().iter().all(|&b| b == 0),
+            "must be zero-initialised"
+        );
     }
 
     #[test]
@@ -222,7 +231,10 @@ mod tests {
         let mut b = [0u8; 64];
         wf.read_at(&mut a, 1024).expect("read a");
         wf.read_at(&mut b, 1024).expect("read b");
-        assert_eq!(a, b, "repeated pread at one offset must return identical bytes");
+        assert_eq!(
+            a, b,
+            "repeated pread at one offset must return identical bytes"
+        );
         assert_eq!(a[..], data[1024..1088]);
     }
 
@@ -234,6 +246,9 @@ mod tests {
 
         let wf = WeightFile::open(f.path(), CachePolicy::Cached).expect("open");
         let mut buf = [0u8; 200];
-        assert!(wf.read_at(&mut buf, 0).is_err(), "short read must surface as an error");
+        assert!(
+            wf.read_at(&mut buf, 0).is_err(),
+            "short read must surface as an error"
+        );
     }
 }
