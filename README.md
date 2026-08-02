@@ -4,16 +4,16 @@
 
 ```console
 $ sift fit unsloth/Qwen3-30B-A3B-GGUF
-machine: Mac17,2, 16.0 GiB RAM, 12.0 GiB usable, 85 GB/s memory
+machine: Mac17,2, 16.0 GiB RAM, 12.0 GiB usable, 123 GB/s memory
 reading headers from unsloth/Qwen3-30B-A3B-GGUF without downloading…
 
   fits assumes 4096 tokens of context: 0.40 GB of f16 KV cache, counted
   alongside the weights. Change it with --ctx.
 
   quant               size     fits    bpw    GB/token  est tok/s
-  UD-IQ1_S         9.04 GB      yes   2.37       1.427         21  moe  damaged
-  Q2_K            11.26 GB    tight   2.91       1.399         21  moe  damaged
-  Q3_K_M          14.71 GB    tight   3.85       1.753         14  moe
+  UD-IQ1_S         9.04 GB      yes   2.37       1.427         24  moe, damaged
+  Q2_K            11.26 GB    tight   2.91       1.399         25  moe, damaged
+  Q3_K_M          14.71 GB    tight   3.85       1.753         20  moe
   Q4_K_M          18.56 GB       no   4.86       2.095   disk-bound  moe
   Q8_0            32.48 GB       no   8.51       3.600   disk-bound  moe
 
@@ -117,6 +117,7 @@ Or `cargo build --release` — Rust 1.85+, no runtime dependencies beyond `curl`
 
 ```
 sift fit <hf-repo> [--ctx N]    which quantization to download, and why
+sift ls [--ctx N]               every local model, across every engine
 sift route <model>              which engine should run it
 sift inspect <path|hf-repo>     model shape, local or remote, no download
 sift plan <model>               per-token traffic and speed ceilings
@@ -125,6 +126,22 @@ sift engines                    which runtimes are installed here
 ```
 
 `<model>` accepts a path, `org/repo`, `org/repo:QUANT`, or a URL.
+Every command takes `--json`.
+
+`sift ls` is the one view across tools that cannot see each other — LM Studio, Ollama,
+colibri and `~/.sift` in one table, each scored against this machine:
+
+```console
+$ sift ls
+  engine       model                                    size    fits    bpw  est tok/s
+  LM Studio    …Qwen3.5-9B-GGUF/Qwen3.5-9B-Q4_K_M.gguf  5.63 GB  yes   5.02   21  dense
+  sift         olmoe-q4km.gguf                          4.21 GB  yes   4.87   46  moe
+```
+
+Headers are cached in `~/.sift/cache/` and revalidated by ETag, so a repeated sweep costs
+one small conditional request per file instead of the bytes again — 3.42s to 0.68s on a
+13-quant repo. A `304` proves the cached header is still the file on the server; nothing is
+served on trust. `SIFT_NO_CACHE=1` switches it off.
 
 ## Measured on an Apple M5, 16 GB
 
@@ -147,7 +164,7 @@ headroom left in kernel work.
 | 64 KiB | **0.75 GB/s** | 3.19 GB/s |
 | 12 MiB | 6.92 GB/s | 16.70 GB/s |
 
-RAM measures ~95 GB/s against ~6.9 GB/s from cold disk — **RAM is roughly 14× faster than
+RAM reads at ~128 GB/s against ~6.9 GB/s from cold disk — **RAM is roughly 19× faster than
 the SSD**, and that ratio is why "does it fit" is the question that matters.
 
 ### On honest disk numbers
@@ -213,7 +230,7 @@ Early, and honest about it. See [TODO.md](TODO.md) for what is deliberately *not
   on host memory. Discrete VRAM is a different quantity and is **not** counted, so `fits`
   is conservative on a Linux or Windows box with a dedicated GPU. `sift doctor` says so
   rather than substituting a guess.
-- 107 tests, clippy clean on all three.
+- 123 tests, clippy clean on all three.
 
 ## Prior art
 
