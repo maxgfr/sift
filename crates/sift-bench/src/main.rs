@@ -30,12 +30,35 @@ struct Cli {
     command: Cmd,
 }
 
+mod lmstudio;
+
 #[derive(Subcommand)]
 enum Cmd {
     /// Report what is installed and runnable before benchmarking anything.
     Probe,
     /// List models LM Studio has locally, with the regime each falls into here.
     Models,
+    /// Measure LM Studio's decode throughput. This is the baseline sift must beat.
+    Baseline {
+        /// Model id as LM Studio's server reports it. Defaults to whatever is loaded.
+        #[arg(long)]
+        model: Option<String>,
+        /// Server port.
+        #[arg(long, default_value_t = lmstudio::DEFAULT_PORT)]
+        port: u16,
+        /// Tokens to generate per run.
+        #[arg(long, default_value_t = 128)]
+        max_tokens: u32,
+        /// Measured runs, after a discarded warm-up.
+        #[arg(long, default_value_t = 3)]
+        repeats: usize,
+        /// Prompt to send.
+        #[arg(long, default_value = "Explain what a mixture-of-experts layer does.")]
+        prompt: String,
+        /// Emit JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Which side of the RAM boundary a model sits on.
@@ -114,7 +137,78 @@ fn main() -> Result<()> {
     match Cli::parse().command {
         Cmd::Probe => probe(),
         Cmd::Models => models(),
+        Cmd::Baseline {
+            model,
+            port,
+            max_tokens,
+            repeats,
+            prompt,
+            json,
+        } => baseline(model, port, max_tokens, repeats, &prompt, json),
     }
+}
+
+fn baseline(
+    model: Option<String>,
+    port: u16,
+    max_tokens: u32,
+    repeats: usize,
+    prompt: &str,
+    json: bool,
+) -> Result<()> {
+    if !lmstudio::server_is_up(port) {
+        bail!(
+            "no LM Studio server on port {port}.\n  \
+             Start it with:  lms server start\n  \
+             Then load a model:  lms load <model>"
+        );
+    }
+
+    let loaded = lmstudio::loaded_models(port)?;
+    let model = match model {
+        Some(m) => m,
+        None => loaded
+            .first()
+            .cloned()
+            .context("no model is loaded; run `lms load <model>` first")?,
+    };
+
+    let runs = lmstudio::measure(port, &model, prompt, max_tokens, repeats)?;
+    let median = lmstudio::median_tps(&runs).context("no runs completed")?;
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "engine": "lm-studio",
+                "model": model,
+                "median_tokens_per_sec": median,
+                "runs": runs,
+            }))?
+        );
+        return Ok(());
+    }
+
+    println!("lm studio baseline");
+    println!("  model            {model}");
+    println!("  prompt tokens    {}", runs[0].prompt_tokens);
+    println!("  tokens per run   {}", runs[0].completion_tokens);
+    println!("\n  {:>5}  {:>9}  {:>10}", "run", "seconds", "tok/s");
+    for (i, r) in runs.iter().enumerate() {
+        println!(
+            "  {:>5}  {:>9.2}  {:>10.2}",
+            i + 1,
+            r.seconds,
+            r.tokens_per_sec
+        );
+    }
+    println!("\n  median {median:.2} tok/s");
+    println!(
+        "\n  This is the number sift has to beat, on this machine, on this model.\n  \
+         Regime matters: on a model that fits, LM Studio is expected to win."
+    );
+
+    Ok(())
 }
 
 fn probe() -> Result<()> {

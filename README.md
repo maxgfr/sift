@@ -66,6 +66,32 @@ Memory streams at **~95 GB/s** on this machine, against ~6.9 GB/s from cold disk
 roughly 14× faster than the SSD**, and that single ratio governs every design decision
 here.
 
+### Baseline: LM Studio, and why kernels are not the lever
+
+Measured with `sift-bench baseline` against LM Studio's own server, MLX-NAX runtime,
+Qwen3.5-9B Q4_K_M (6.10 GiB, dense, fully resident), 128 tokens per run after a discarded
+warm-up:
+
+| run | seconds | tok/s |
+|---|---|---|
+| 1 | 6.15 | 20.80 |
+| 2 | 6.12 | 20.93 |
+| 3 | 6.12 | 20.91 |
+
+**Median 20.91 tok/s**, and the spread across runs is under 1%.
+
+A dense model re-reads every weight per token, so ~6.1 GB moves each token. At 20.91 tok/s
+that is roughly **128 GB/s of effective bandwidth against the M5's 153.6 GB/s ceiling** —
+LM Studio is running at ~83% of what the memory bus can physically deliver.
+
+That is the most useful thing we have measured, and it is inconvenient: **there is almost
+no headroom in kernel optimisation.** A faster matmul cannot help when the bus is the
+limit. The only remaining lever is to move *fewer bytes per token* — which is what MoE
+sparsity (a token touches 6–12% of expert weights) and speculative decoding actually do.
+
+It also sets an honest expectation: on a dense model that fits, `sift` will not beat LM
+Studio, and this README will keep saying so.
+
 ### On honest disk numbers
 
 `F_NOCACHE` prevents *new* caching but cannot evict pages already resident, so a file the
