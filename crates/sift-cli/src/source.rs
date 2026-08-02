@@ -64,7 +64,7 @@ impl Source {
             );
         }
 
-        let files = hub::list_gguf(repo)?;
+        let files = hub::list_weights(repo)?;
         let chosen = pick(&files, wanted).with_context(|| {
             let available: Vec<String> = files.iter().take(12).map(RepoFile::quant_label).collect();
             format!(
@@ -79,11 +79,61 @@ impl Source {
         })
     }
 
-    /// Read the model's tensor directory. Payload is never fetched.
+    /// The weight format this source is in.
+    pub fn format(&self) -> sift_core::engine::Format {
+        let name = match self {
+            Source::Local(p) => p.to_string_lossy().to_string(),
+            Source::Remote { url, .. } => url.clone(),
+        };
+        // Query strings on a signed CDN URL come after the filename, so match anywhere
+        // rather than only at the end.
+        if name.contains(".safetensors") {
+            sift_core::engine::Format::Safetensors
+        } else {
+            sift_core::engine::Format::Gguf
+        }
+    }
+
+    /// Read the model's shape, whatever format it is in. Payload is never fetched.
     ///
-    /// Returns the parsed directory and, for remote sources, how many bytes crossed the
-    /// network — which callers print, because "we did not download the model" is a claim
-    /// that should come with evidence.
+    /// Returns the shape and, for remote sources, how many bytes crossed the network —
+    /// which callers print, because "we did not download the model" is a claim that should
+    /// come with evidence.
+    ///
+    /// Architecture facts are only available for GGUF here. A safetensors file keeps them
+    /// in the repo's `config.json`, which a single-file reference has no way to locate —
+    /// so KV sizing is reported as unavailable rather than guessed.
+    pub fn read_shape(&self) -> Result<(sift_core::model::ModelShape, Option<u64>)> {
+        if self.format() == sift_core::engine::Format::Safetensors {
+            let (st, fetched) = match self {
+                Source::Local(p) => {
+                    let mut f = std::fs::File::open(p)
+                        .with_context(|| format!("opening {}", p.display()))?;
+                    (
+                        sift_core::model::Safetensors::parse(&mut f)
+                            .with_context(|| format!("reading {}", p.display()))?,
+                        None,
+                    )
+                }
+                Source::Remote { url, .. } => {
+                    let mut f = RemoteFile::new(url.clone());
+                    let st = sift_core::model::Safetensors::parse(&mut f)
+                        .with_context(|| format!("reading {url}"))?;
+                    let bytes = f.bytes_fetched();
+                    (st, Some(bytes))
+                }
+            };
+            return Ok((
+                sift_core::model::ModelShape::new(Default::default(), st.tensors, 1),
+                fetched,
+            ));
+        }
+
+        let (g, fetched) = self.read_gguf()?;
+        Ok((g.shape(), fetched))
+    }
+
+    /// Read the model's GGUF tensor directory. Payload is never fetched.
     pub fn read_gguf(&self) -> Result<(Gguf, Option<u64>)> {
         match self {
             Source::Local(p) => {
@@ -107,7 +157,7 @@ impl Source {
     }
 }
 
-/// Choose one file from a repo's GGUF listing.
+/// Choose one file from a repo's weight listing.
 ///
 /// With no preference, prefers the largest non-shard file, on the reasoning that a repo's
 /// flagship quantization is usually its biggest single file. Split shards are excluded:

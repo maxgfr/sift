@@ -4,40 +4,21 @@
 //! job is to be trusted, and a two-line subprocess call has less surface to be wrong in
 //! than a TLS stack we would never otherwise depend on.
 //!
-//! # What makes a comparison fair
+//! The OpenAI shape reports token counts but no decode duration, so every figure here is
+//! wall clock and includes prompt processing and HTTP overhead. [`super::ollama`] gets the
+//! engine's own decode timing and is the more accurate of the two; the difference is
+//! recorded on each [`Run`] rather than smoothed over.
 //!
-//! Decode throughput is the number under test, so it must be isolated from everything
-//! else. Three rules, each of which someone has published a wrong number by breaking:
-//!
-//! - **Warm up first.** The first request pays model load and graph construction. It is
-//!   not decode speed and must not be averaged into it.
-//! - **Report prefill and decode separately.** Time-to-first-token is dominated by prompt
-//!   processing, which scales with prompt length; mixing them lets a short prompt
-//!   masquerade as a fast engine.
-//! - **Fix the token count.** Comparing runs that generated different numbers of tokens
-//!   compares two different workloads.
+//! See [`super`] for what makes the comparison fair.
 
 use anyhow::{bail, Context, Result};
 use std::process::Command;
 use std::time::Instant;
 
+use super::Run;
+
 /// Default port for LM Studio's local server.
 pub const DEFAULT_PORT: u16 = 1234;
-
-/// One decode measurement.
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct Run {
-    /// Model identifier as the server reported it.
-    pub model: String,
-    /// Tokens the server said it generated.
-    pub completion_tokens: u32,
-    /// Tokens in the prompt.
-    pub prompt_tokens: u32,
-    /// Total wall-clock seconds for the request.
-    pub seconds: f64,
-    /// Decode throughput, completion tokens per second.
-    pub tokens_per_sec: f64,
-}
 
 /// Is the LM Studio server reachable?
 pub fn server_is_up(port: u16) -> bool {
@@ -138,11 +119,16 @@ pub fn measure_once(port: u16, model: &str, prompt: &str, max_tokens: u32) -> Re
     }
 
     Ok(Run {
+        engine: "lm-studio",
         model: json["model"].as_str().unwrap_or(model).to_string(),
         completion_tokens,
         prompt_tokens,
         seconds,
         tokens_per_sec: completion_tokens as f64 / seconds,
+        // The OpenAI shape reports token counts but no decode duration, so this is wall
+        // clock — prompt processing and HTTP overhead included. Ollama's native API does
+        // report it, which is why that driver is not a copy of this one.
+        engine_timed: false,
     })
 }
 
@@ -170,64 +156,4 @@ pub fn measure(
         );
     }
     Ok(runs)
-}
-
-/// Median tokens per second across runs.
-///
-/// Median, not mean: one thermal stall should not drag the headline number, and with a
-/// handful of runs the median is the more honest summary.
-pub fn median_tps(runs: &[Run]) -> Option<f64> {
-    if runs.is_empty() {
-        return None;
-    }
-    let mut v: Vec<f64> = runs.iter().map(|r| r.tokens_per_sec).collect();
-    v.sort_by(|a, b| a.partial_cmp(b).expect("throughput is never NaN"));
-    let mid = v.len() / 2;
-    Some(if v.len() % 2 == 0 {
-        (v[mid - 1] + v[mid]) / 2.0
-    } else {
-        v[mid]
-    })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn run(tps: f64) -> Run {
-        Run {
-            model: "m".into(),
-            completion_tokens: 100,
-            prompt_tokens: 10,
-            seconds: 100.0 / tps,
-            tokens_per_sec: tps,
-        }
-    }
-
-    #[test]
-    fn median_of_an_odd_count_is_the_middle_value() {
-        let runs = [run(10.0), run(30.0), run(20.0)];
-        assert_eq!(median_tps(&runs), Some(20.0));
-    }
-
-    #[test]
-    fn median_of_an_even_count_averages_the_middle_pair() {
-        let runs = [run(10.0), run(20.0), run(30.0), run(40.0)];
-        assert_eq!(median_tps(&runs), Some(25.0));
-    }
-
-    #[test]
-    fn a_single_outlier_does_not_move_the_median() {
-        // The point of using a median: one thermal stall must not become the headline.
-        let clean = [run(50.0), run(51.0), run(52.0)];
-        let stalled = [run(50.0), run(51.0), run(2.0)];
-        assert_eq!(median_tps(&clean), Some(51.0));
-        assert_eq!(median_tps(&stalled), Some(50.0));
-    }
-
-    #[test]
-    fn no_runs_yields_no_median_rather_than_zero() {
-        // Returning 0.0 would read as "measured, and it was slow".
-        assert_eq!(median_tps(&[]), None);
-    }
 }

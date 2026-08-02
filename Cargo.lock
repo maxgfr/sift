@@ -281,22 +281,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "sift-bench"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "clap",
- "serde",
- "serde_json",
- "sift-core",
-]
-
-[[package]]
 name = "sift-cli"
 version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
+ "serde",
  "serde_json",
  "sift-core",
 ]

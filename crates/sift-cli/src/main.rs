@@ -6,6 +6,7 @@ use sift_core::doctor::{self, AccelMemory, MachineFacts};
 use sift_core::model;
 use std::path::PathBuf;
 
+mod bench;
 mod fit;
 mod ls;
 mod source;
@@ -128,6 +129,37 @@ enum Command {
         json: bool,
     },
 
+    /// Measure a real engine, and record what it achieved.
+    ///
+    /// `sift` never runs a model. This drives one that does, so the estimates have
+    /// something to be checked against.
+    Bench {
+        /// Which engine to drive. Defaults to whichever is serving.
+        #[arg(long, value_enum, default_value_t = bench::Target::Auto)]
+        engine: bench::Target,
+        /// Model id as the engine reports it. Defaults to whatever is loaded.
+        #[arg(long)]
+        model: Option<String>,
+        /// Tokens to generate per run.
+        #[arg(long, default_value_t = 128)]
+        max_tokens: u32,
+        /// Measured runs, after a discarded warm-up.
+        #[arg(long, default_value_t = 3)]
+        repeats: usize,
+        /// Prompt to send.
+        #[arg(long, default_value = "Explain what a mixture-of-experts layer does.")]
+        prompt: String,
+        /// LM Studio server port.
+        #[arg(long, default_value_t = bench::lmstudio::DEFAULT_PORT)]
+        lms_port: u16,
+        /// Ollama server port.
+        #[arg(long, default_value_t = bench::ollama::DEFAULT_PORT)]
+        ollama_port: u16,
+        /// Emit JSON instead of a human-readable report.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// List the inference engines installed on this machine.
     Engines {
         /// Emit JSON instead of a human-readable report.
@@ -171,6 +203,25 @@ fn main() -> Result<()> {
             cmd_route(&Source::resolve(&model, quant.as_deref())?, json)
         }
         Command::Ls { ctx, json } => cmd_ls(ctx, json),
+        Command::Bench {
+            engine,
+            model,
+            max_tokens,
+            repeats,
+            prompt,
+            lms_port,
+            ollama_port,
+            json,
+        } => cmd_bench(
+            engine,
+            model,
+            max_tokens,
+            repeats,
+            &prompt,
+            lms_port,
+            ollama_port,
+            json,
+        ),
         Command::Engines { json } => cmd_engines(json),
     }
 }
@@ -208,13 +259,16 @@ fn cmd_fit(repo: &str, context_tokens: u64, json: bool) -> Result<()> {
 }
 
 fn cmd_route(src: &Source, json: bool) -> Result<()> {
-    let (g, _) = src.read_gguf()?;
+    let (shape, _) = src.read_shape()?;
     let facts = MachineFacts::collect();
     let usable = usable_ram(&facts);
     let installed = sift_core::engine::detect_installed();
 
-    let size = g.total_tensor_bytes();
-    let rec = sift_core::engine::route(size, sift_core::engine::Format::Gguf, usable, &installed);
+    // Route on the actual format. mlx-lm reads safetensors and llama.cpp does not, so
+    // assuming GGUF here would recommend an engine that cannot open the file.
+    let format = src.format();
+    let size = shape.total_tensor_bytes();
+    let rec = sift_core::engine::route(size, format, usable, &installed);
 
     if json {
         println!(
@@ -223,6 +277,7 @@ fn cmd_route(src: &Source, json: bool) -> Result<()> {
                 "model": src.label(),
                 "size_bytes": size,
                 "usable_memory_bytes": usable,
+                "format": format,
                 "regime": sift_core::engine::Regime::classify(size, usable),
                 "engine": rec.engine.as_ref().map(|e| serde_json::json!({
                     "id": e.id,
@@ -295,6 +350,107 @@ fn cmd_ls(context_tokens: u64, json: bool) -> Result<()> {
     let models = ls::discover();
     let rows = ls::evaluate(models, mem.gb_per_sec * 1e9, usable, context_tokens);
     ls::report(&rows, context_tokens, json)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cmd_bench(
+    engine: bench::Target,
+    model: Option<String>,
+    max_tokens: u32,
+    repeats: usize,
+    prompt: &str,
+    lms_port: u16,
+    ollama_port: u16,
+    json: bool,
+) -> Result<()> {
+    let target = bench::resolve(engine, lms_port, ollama_port)?;
+
+    let (runs, engine_name) = match target {
+        bench::Target::LmStudio => {
+            let model = match model {
+                Some(m) => m,
+                None => bench::lmstudio::loaded_models(lms_port)?
+                    .first()
+                    .cloned()
+                    .context("no model is loaded; run `lms load <model>` first")?,
+            };
+            (
+                bench::lmstudio::measure(lms_port, &model, prompt, max_tokens, repeats)?,
+                "LM Studio",
+            )
+        }
+        bench::Target::Ollama => {
+            let model = match model {
+                Some(m) => m,
+                None => bench::ollama::local_models(ollama_port)?
+                    .first()
+                    .cloned()
+                    .context("Ollama has no local models; run `ollama pull <model>` first")?,
+            };
+            (
+                bench::ollama::measure(ollama_port, &model, prompt, max_tokens, repeats)?,
+                "Ollama",
+            )
+        }
+        bench::Target::Auto => unreachable!("resolve never returns Auto"),
+    };
+
+    let median = bench::median_tps(&runs).context("no runs completed")?;
+
+    // Recorded before printing: a measurement that reaches the terminal and not the log is
+    // one that cannot replace an estimate later, which is the whole reason to take it.
+    let recorded = bench::record(&runs, &stamp());
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "engine": runs.first().map(|r| r.engine),
+                "model": runs.first().map(|r| r.model.clone()),
+                "median_tokens_per_sec": median,
+                "runs": runs,
+                "recorded_to": recorded.as_ref().ok().map(|p| p.display().to_string()),
+            }))?
+        );
+        return Ok(());
+    }
+
+    println!("{engine_name}: {}", runs[0].model);
+    println!("  {:>3}  {:>10}  {:>9}", "run", "tok/s", "tokens");
+    for (i, r) in runs.iter().enumerate() {
+        println!(
+            "  {:>3}  {:>10.2}  {:>9}",
+            i + 1,
+            r.tokens_per_sec,
+            r.completion_tokens
+        );
+    }
+    println!(
+        "
+  median {median:.2} tok/s"
+    );
+    if !runs[0].engine_timed {
+        // Say which clock produced the number. LM Studio's API reports no decode duration,
+        // so this includes prompt processing and HTTP overhead and reads slightly low.
+        println!("  wall clock, including prompt processing — this engine reports no decode time");
+    }
+    match &recorded {
+        Ok(path) => println!("  recorded to {}", path.display()),
+        Err(e) => println!("  not recorded: {e}"),
+    }
+    Ok(())
+}
+
+/// A UTC timestamp for the bench log.
+///
+/// Derived from the wall clock rather than a date crate: the log needs runs to be
+/// orderable and attributable, and seconds since the epoch does both without adding a
+/// dependency to a binary that otherwise has none at runtime.
+fn stamp() -> String {
+    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => format!("{}", d.as_secs()),
+        Err(_) => "0".to_string(),
+    }
 }
 
 fn cmd_engines(json: bool) -> Result<()> {
@@ -522,14 +678,18 @@ fn cmd_doctor(disk_sample: Option<PathBuf>, json: bool) -> Result<()> {
 }
 
 fn cmd_inspect(src: &Source, list_tensors: bool, json: bool) -> Result<()> {
-    let (g, fetched) = src.read_gguf()?;
+    let (shape, fetched) = src.read_shape()?;
+    // GGUF carries a format version and per-tensor dtypes that safetensors does not, so
+    // those lines appear only where they exist rather than being filled with a placeholder.
+    let gguf = (src.format() == sift_core::engine::Format::Gguf)
+        .then(|| src.read_gguf().map(|(g, _)| g))
+        .transpose()?;
 
     // Payload size is authoritative for remote files: the server's Content-Length covers
     // the whole file, but only the directory was read.
-    let payload = g.total_tensor_bytes();
+    let payload = shape.total_tensor_bytes();
 
     if json {
-        let shape = g.shape();
         let moe = model::infer_moe_shape(&shape).map(|m| {
             serde_json::json!({
                 "layers": m.moe_layers,
@@ -554,9 +714,10 @@ fn cmd_inspect(src: &Source, list_tensors: bool, json: bool) -> Result<()> {
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
                 "model": src.label(),
-                "gguf_version": g.version,
-                "architecture": g.architecture(),
-                "tensor_count": g.tensors.len(),
+                "format": src.format(),
+                "gguf_version": gguf.as_ref().map(|g| g.version),
+                "architecture": shape.architecture(),
+                "tensor_count": shape.tensors().len(),
                 "tensor_payload_bytes": payload,
                 "parameters": shape.total_parameters(),
                 "bits_per_weight": shape.bits_per_weight(),
@@ -565,11 +726,10 @@ fn cmd_inspect(src: &Source, list_tensors: bool, json: bool) -> Result<()> {
                 "bytes_read_over_http": fetched,
                 "moe": moe,
                 "kv_cache": kv,
-                "tensors": list_tensors.then(|| g.tensors.iter().map(|t| serde_json::json!({
+                "tensors": list_tensors.then(|| shape.tensors().iter().map(|t| serde_json::json!({
                     "name": t.name,
-                    "dtype": t.dtype.name(),
                     "dims": t.dims,
-                    "size_bytes": t.size_bytes(),
+                    "size_bytes": t.size_bytes,
                 })).collect::<Vec<_>>()),
             }))?
         );
@@ -577,12 +737,16 @@ fn cmd_inspect(src: &Source, list_tensors: bool, json: bool) -> Result<()> {
     }
 
     println!("{}", src.label());
-    println!("  gguf version     {}", g.version);
+    if let Some(g) = &gguf {
+        println!("  gguf version     {}", g.version);
+    } else {
+        println!("  format           safetensors");
+    }
     println!(
         "  architecture     {}",
-        g.architecture().unwrap_or("unknown")
+        shape.architecture().unwrap_or("unknown")
     );
-    println!("  tensors          {}", g.tensors.len());
+    println!("  tensors          {}", shape.tensors().len());
     println!("  tensor payload   {:.2} GiB", sift_core::gib(payload));
     match fetched {
         // Zero bytes over a remote source means the cached header was revalidated with a
@@ -599,7 +763,7 @@ fn cmd_inspect(src: &Source, list_tensors: bool, json: bool) -> Result<()> {
         None => println!("  read from disk   directory only, payload untouched"),
     }
 
-    match model::infer_moe_shape(&g.shape()) {
+    match model::infer_moe_shape(&shape) {
         Some(shape) => {
             println!("\nmixture of experts");
             println!("  moe layers       {}", shape.moe_layers);
@@ -618,8 +782,14 @@ fn cmd_inspect(src: &Source, list_tensors: bool, json: bool) -> Result<()> {
                 sift_core::gib(shape.total_expert_bytes())
             );
 
-            // Show the access pattern that motivates a repacked container.
-            if let Ok(r) = model::expert_ranges(&g, 0, 0) {
+            // Show the access pattern that motivates a repacked container. GGUF only:
+            // byte ranges are addressable within a file, and this is the format whose
+            // offsets we hold.
+            if let Ok(r) = gguf
+                .as_ref()
+                .context("expert ranges need a GGUF file")
+                .and_then(|g| Ok(model::expert_ranges(g, 0, 0)?))
+            {
                 println!(
                     "\n  layer 0 expert 0 spans 3 ranges, contiguous: {}",
                     if r.is_contiguous() {
@@ -635,16 +805,8 @@ fn cmd_inspect(src: &Source, list_tensors: bool, json: bool) -> Result<()> {
 
     if list_tensors {
         println!("\ntensors");
-        for t in &g.tensors {
-            println!(
-                "  {:<44} {:<8} {:>14?}  {:>12}",
-                t.name,
-                t.dtype.name(),
-                t.dims,
-                t.size_bytes()
-                    .map(|b| b.to_string())
-                    .unwrap_or_else(|| "?".into())
-            );
+        for t in shape.tensors() {
+            println!("  {:<52} {:>14?}  {:>12}", t.name, t.dims, t.size_bytes);
         }
     }
 
@@ -652,12 +814,12 @@ fn cmd_inspect(src: &Source, list_tensors: bool, json: bool) -> Result<()> {
 }
 
 fn cmd_plan(src: &Source, hit_rate: f64, json: bool) -> Result<()> {
-    let (g, _) = src.read_gguf()?;
-    let shape = model::infer_moe_shape(&g.shape())
-        .context("this model has no stacked expert tensors; planning targets MoE models")?;
+    let (model_shape, _) = src.read_shape()?;
+    let shape = model::infer_moe_shape(&model_shape)
+        .context("this model has no expert tensors; planning targets MoE models")?;
 
     // Everything that is not a routed expert is read on every token regardless of routing.
-    let trunk_bytes = g
+    let trunk_bytes = model_shape
         .total_tensor_bytes()
         .saturating_sub(shape.total_expert_bytes());
 
