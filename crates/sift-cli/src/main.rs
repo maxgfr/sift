@@ -749,9 +749,14 @@ fn cmd_doctor(disk_sample: Option<PathBuf>, json: bool) -> Result<()> {
                 best,
                 best * 1e9 / 1.1e9
             );
+            // Read against read. Streaming weights off disk is a read workload, so quoting
+            // the STREAM *copy* figure here compares two different rulers and understates
+            // the gap — it printed 10x on a machine where the honest ratio is 17x, and the
+            // README documents 19x from the read figure. Mixing rulers is the mistake this
+            // whole module exists to avoid; it should not survive in its own summary line.
             println!(
                 "  RAM is {:.0}x faster than this disk. That ratio is why residency matters.",
-                mem.gb_per_sec / best
+                read.gb_per_sec / best
             );
         } else {
             println!("\n  no trustworthy cold sample; every read hit the page cache.");
