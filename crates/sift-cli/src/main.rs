@@ -6,8 +6,20 @@ use sift_core::doctor::{self, MachineFacts};
 use sift_core::model;
 use std::path::PathBuf;
 
+mod fit;
 mod source;
 use source::Source;
+
+/// Memory a model may actually occupy on this machine.
+///
+/// Not physical RAM: the OS, the window server and the KV cache all take a share, and on
+/// Apple Silicon the GPU wired limit binds before physical RAM does. The 4 GiB reserve is
+/// an estimate — which is exactly why `sift doctor` measures rather than assuming.
+fn usable_ram(facts: &MachineFacts) -> u64 {
+    facts
+        .gpu_wired_limit_bytes
+        .unwrap_or_else(|| facts.ram_bytes.saturating_sub(4 * sift_core::GIB))
+}
 
 #[derive(Parser)]
 #[command(
@@ -50,6 +62,24 @@ enum Command {
         tensors: bool,
     },
 
+    /// Which quantization of a model should you download for this machine?
+    Fit {
+        /// A HuggingFace repo, e.g. `unsloth/Qwen3-30B-A3B-GGUF`.
+        repo: String,
+    },
+
+    /// Which engine should run this model, and what to type.
+    Route {
+        /// A .gguf path, an `org/repo`, an `org/repo:QUANT`, or a URL.
+        model: String,
+        /// Pick a quantization when `model` is a repo.
+        #[arg(long)]
+        quant: Option<String>,
+    },
+
+    /// List the inference engines installed on this machine.
+    Engines,
+
     /// Show what a model would cost per token, and the resulting speed ceilings.
     Plan {
         /// A .gguf path, an `org/repo`, an `org/repo:QUANT`, or a URL.
@@ -76,7 +106,93 @@ fn main() -> Result<()> {
             quant,
             hit_rate,
         } => cmd_plan(&Source::resolve(&model, quant.as_deref())?, hit_rate),
+        Command::Fit { repo } => cmd_fit(&repo),
+        Command::Route { model, quant } => cmd_route(&Source::resolve(&model, quant.as_deref())?),
+        Command::Engines => cmd_engines(),
     }
+}
+
+fn cmd_fit(repo: &str) -> Result<()> {
+    let facts = MachineFacts::collect();
+    let usable = usable_ram(&facts);
+    // Fewer iterations than `doctor` uses: this is one input among many, and the user is
+    // waiting on network round-trips anyway.
+    let mem = doctor::measure_memory_bandwidth(doctor::BANDWIDTH_BUF_BYTES, 3);
+    let installed = sift_core::engine::detect_installed();
+
+    println!(
+        "machine: {}, {:.1} GiB RAM, {:.1} GiB usable, {:.0} GB/s memory",
+        facts.model.as_deref().unwrap_or("unknown"),
+        sift_core::gib(facts.ram_bytes),
+        sift_core::gib(usable),
+        mem.gb_per_sec
+    );
+    println!("reading headers from {repo} without downloading…");
+
+    let cands = fit::evaluate(repo, mem.gb_per_sec * 1e9, usable)?;
+    fit::report(repo, &cands, usable, &installed)
+}
+
+fn cmd_route(src: &Source) -> Result<()> {
+    let (g, _) = src.read_gguf()?;
+    let facts = MachineFacts::collect();
+    let usable = usable_ram(&facts);
+    let installed = sift_core::engine::detect_installed();
+
+    let size = g.total_tensor_bytes();
+    let rec = sift_core::engine::route(size, sift_core::engine::Format::Gguf, usable, &installed);
+
+    println!("{}", src.label());
+    println!("  size             {:.2} GiB", sift_core::gib(size));
+    println!("  usable memory    {:.2} GiB", sift_core::gib(usable));
+
+    match &rec.engine {
+        Some(e) => {
+            println!(
+                "\n  use {} {}",
+                e.name,
+                if rec.installed {
+                    "(installed)"
+                } else {
+                    "(NOT installed)"
+                }
+            );
+            println!("  because {}", rec.reason);
+            if !rec.installed {
+                println!("  install: {}", e.install);
+            }
+        }
+        None => println!("\n  no suitable engine: {}", rec.reason),
+    }
+
+    // Naming what to avoid matters as much as naming what to use: an engine that thrashes
+    // looks like it is working, which is how people lose an afternoon.
+    if !rec.avoid.is_empty() {
+        println!("\n  installed, but do not use for this model:");
+        for (e, why) in &rec.avoid {
+            println!("    {:<12} {why}", e.name);
+        }
+    }
+    if !rec.also_suitable.is_empty() {
+        let names: Vec<&str> = rec.also_suitable.iter().map(|e| e.name).collect();
+        println!("\n  also suitable if installed: {}", names.join(", "));
+    }
+    Ok(())
+}
+
+fn cmd_engines() -> Result<()> {
+    let installed = sift_core::engine::detect_installed();
+    println!("known engines\n");
+    for e in sift_core::engine::ENGINES {
+        match installed.iter().find(|i| i.engine.id == e.id) {
+            Some(i) => println!("  [x] {:<12} {}", e.name, i.found_at.display()),
+            None => println!("  [ ] {:<12} {}", e.name, e.install),
+        }
+    }
+    println!("\n  Detection fails soft: a missing binary means `not found here`, never");
+    println!("  `not installed`. Install paths change, and asserting absence would be");
+    println!("  wrong in a way you could not debug.");
+    Ok(())
 }
 
 fn cmd_doctor(disk_sample: Option<PathBuf>, json: bool) -> Result<()> {
@@ -265,8 +381,8 @@ fn cmd_inspect(src: &Source, list_tensors: bool) -> Result<()> {
                 shape.activation_ratio() * 100.0
             );
             println!(
-                "  one expert       {:.2} MiB (gate + up + down)",
-                sift_core::mib(shape.bytes_per_expert)
+                "  one expert       {:.2} MiB mean (gate + up + down)",
+                sift_core::mib(shape.mean_bytes_per_expert())
             );
             println!(
                 "  expert weights   {:.2} GiB total",

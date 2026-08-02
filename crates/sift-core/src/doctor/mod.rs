@@ -282,6 +282,32 @@ pub fn measure_sequential_read(
     })
 }
 
+/// Buffer size that reliably escapes the last-level cache.
+///
+/// This has to clear far more than an L3. Apple's System Level Cache sits behind the CPU
+/// caches and is reported at ~96 MiB on M4 Max; AMD X3D parts carry 96–128 MiB of L3, and
+/// server chips reach 384 MiB. A 256 MiB buffer is under 3× an Apple SLC — close enough
+/// that the measurement is partly cache bandwidth, which reads as an implausibly fast
+/// machine.
+///
+/// 512 MiB is over 5× the largest consumer LLC, and [`bandwidth_escapes_cache`] checks
+/// empirically rather than trusting this constant.
+pub const BANDWIDTH_BUF_BYTES: usize = 512 << 20;
+
+/// Whether a bandwidth measurement has genuinely escaped the cache.
+///
+/// Run the kernel at two sizes: if the larger one is materially slower, the smaller was
+/// still partly served by cache. A tool that publishes bandwidth numbers should be able to
+/// prove it measured memory.
+pub fn bandwidth_escapes_cache() -> (MemorySample, MemorySample, bool) {
+    let small = measure_memory_bandwidth(BANDWIDTH_BUF_BYTES / 2, 3);
+    let large = measure_memory_bandwidth(BANDWIDTH_BUF_BYTES, 3);
+    // Within 5% means the plateau has been reached.
+    let ratio = large.gb_per_sec / small.gb_per_sec.max(f64::MIN_POSITIVE);
+    let escaped = ratio > 0.95;
+    (small, large, escaped)
+}
+
 /// Measure memory bandwidth, STREAM-copy style.
 ///
 /// This sets the ceiling for resident-mode decode. A model that fits in RAM cannot

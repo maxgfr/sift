@@ -14,6 +14,7 @@
 //! - [`io`] — the cold tier: explicit reads that bypass the page cache.
 
 pub mod doctor;
+pub mod engine;
 pub mod hub;
 pub mod io;
 pub mod model;

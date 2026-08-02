@@ -26,19 +26,38 @@ pub struct MoeShape {
     pub experts_per_layer: u64,
     /// Experts activated per token per layer (top-k).
     pub experts_per_token: u64,
-    /// Bytes for one expert's three projections.
-    pub bytes_per_expert: u64,
+    /// Total bytes of routed-expert weights across every MoE layer.
+    ///
+    /// Summed per layer rather than extrapolated from one, because dynamic quantizations
+    /// give different layers different precision.
+    pub total_expert_bytes: u64,
 }
 
 impl MoeShape {
+    /// Mean bytes for one expert's three projections.
+    ///
+    /// An average across layers, so it is a description rather than a basis for
+    /// arithmetic. Use [`Self::expert_bytes_per_token`] for traffic.
+    pub fn mean_bytes_per_expert(&self) -> u64 {
+        let experts = self.experts_per_layer * self.moe_layers as u64;
+        if experts == 0 {
+            return 0;
+        }
+        self.total_expert_bytes / experts
+    }
+
     /// Bytes of routed-expert weights read per token, assuming every access misses.
+    ///
+    /// Scales the whole model's expert bytes by the activation ratio. This is the number a
+    /// naive `bandwidth / file_size` model gets wrong by the sparsity factor — roughly 16×
+    /// on a 128-expert top-8 model.
     pub fn expert_bytes_per_token(&self) -> u64 {
-        self.bytes_per_expert * self.experts_per_token * self.moe_layers as u64
+        (self.total_expert_bytes as f64 * self.activation_ratio()) as u64
     }
 
     /// Total bytes of routed-expert weights in the whole model.
     pub fn total_expert_bytes(&self) -> u64 {
-        self.bytes_per_expert * self.experts_per_layer * self.moe_layers as u64
+        self.total_expert_bytes
     }
 
     /// Fraction of expert weights touched by a single token.
@@ -64,7 +83,7 @@ impl MoeShape {
 pub fn infer_moe_shape(g: &Gguf) -> Option<MoeShape> {
     let mut moe_layers = 0u32;
     let mut experts_per_layer = 0u64;
-    let mut bytes_per_expert = 0u64;
+    let mut total_expert_bytes = 0u64;
 
     for layer in 0..u32::MAX {
         let name = format!("blk.{layer}.ffn_gate_exps.weight");
@@ -73,21 +92,24 @@ pub fn infer_moe_shape(g: &Gguf) -> Option<MoeShape> {
 
         if experts_per_layer == 0 && t.dims.len() == 3 {
             experts_per_layer = t.dims[2];
+        }
 
-            // Sum the three projections rather than tripling gate: down is stored
-            // transposed and a model could in principle size it differently.
-            let mut total = 0u64;
-            for proj in ["gate", "up", "down"] {
-                let n = format!("blk.{layer}.ffn_{proj}_exps.weight");
-                if let Ok(s) = expert_slice(g, &n, 0) {
-                    total += s.len;
+        // Sum every layer, never extrapolate from layer 0. Dynamic quantizations —
+        // Unsloth's UD- family, and llama.cpp's own Q4_K_M convention — deliberately give
+        // different layers different precision. Measuring one layer and multiplying gives
+        // a per-token figure that can be *larger* for a smaller file, which is visibly
+        // absurd and destroys trust in every number beside it.
+        for proj in ["gate", "up", "down"] {
+            let n = format!("blk.{layer}.ffn_{proj}_exps.weight");
+            if let Some(t) = g.tensor(&n) {
+                if let Some(b) = t.size_bytes() {
+                    total_expert_bytes += b;
                 }
             }
-            bytes_per_expert = total;
         }
     }
 
-    if moe_layers == 0 || experts_per_layer == 0 || bytes_per_expert == 0 {
+    if moe_layers == 0 || experts_per_layer == 0 || total_expert_bytes == 0 {
         return None;
     }
 
@@ -97,7 +119,7 @@ pub fn infer_moe_shape(g: &Gguf) -> Option<MoeShape> {
         moe_layers,
         experts_per_layer,
         experts_per_token,
-        bytes_per_expert,
+        total_expert_bytes,
     })
 }
 
@@ -112,7 +134,7 @@ mod tests {
             moe_layers: 48,
             experts_per_layer: 128,
             experts_per_token: 8,
-            bytes_per_expert: 884_736 * 3,
+            total_expert_bytes: 884_736 * 3 * 128 * 48,
         };
 
         assert!(
@@ -139,10 +161,51 @@ mod tests {
             moe_layers: 48,
             experts_per_layer: 128,
             experts_per_token: 8,
-            bytes_per_expert: 884_736 * 3,
+            total_expert_bytes: 884_736 * 3 * 128 * 48,
         };
         let ratio = shape.expert_bytes_per_token() as f64 / shape.total_expert_bytes() as f64;
         assert!((ratio - shape.activation_ratio()).abs() < 1e-9);
+    }
+
+    #[test]
+    fn per_token_traffic_never_exceeds_total_expert_bytes() {
+        // Regression. The first implementation measured one layer's expert size and
+        // multiplied by the layer count. On a dynamically quantized model — where Unsloth
+        // deliberately gives layers different precision — that produced a per-token figure
+        // *larger for a smaller file*: UD-IQ1_S (9.04 GB) reported 2.596 GB/token while
+        // Q3_K_M (14.71 GB) reported 0.934. Visibly absurd, and it discredits every number
+        // printed beside it.
+        //
+        // Summing per layer makes the invariant structural: a token cannot read more
+        // expert bytes than the model contains.
+        let shape = MoeShape {
+            moe_layers: 48,
+            experts_per_layer: 128,
+            experts_per_token: 8,
+            total_expert_bytes: 17_000_000_000,
+        };
+        assert!(
+            shape.expert_bytes_per_token() < shape.total_expert_bytes(),
+            "a token cannot read more than the whole model"
+        );
+        assert!(shape.expert_bytes_per_token() > 0);
+    }
+
+    #[test]
+    fn mean_expert_size_is_reported_but_not_used_for_traffic() {
+        let shape = MoeShape {
+            moe_layers: 2,
+            experts_per_layer: 4,
+            experts_per_token: 2,
+            total_expert_bytes: 800,
+        };
+        assert_eq!(shape.mean_bytes_per_expert(), 100, "800 over 8 experts");
+        // Traffic comes from the activation ratio, not from mean x count x layers.
+        assert_eq!(
+            shape.expert_bytes_per_token(),
+            400,
+            "half the experts, so half"
+        );
     }
 
     #[test]
@@ -151,7 +214,7 @@ mod tests {
             moe_layers: 0,
             experts_per_layer: 0,
             experts_per_token: 0,
-            bytes_per_expert: 0,
+            total_expert_bytes: 0,
         };
         assert_eq!(shape.activation_ratio(), 0.0, "must not divide by zero");
     }
