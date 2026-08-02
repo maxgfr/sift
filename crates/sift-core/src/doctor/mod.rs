@@ -304,17 +304,30 @@ pub fn measure_memory_bandwidth(bytes: usize, iterations: usize) -> MemorySample
 /// one accumulator is a serial dependency chain, so it reports memory *latency* rather
 /// than bandwidth. On an M5 that read 40 GB/s where the bus delivers three times as much.
 ///
-/// Two fixes, both necessary:
+/// Three fixes, all necessary:
 ///
 /// - **Several accumulators per thread**, so loads issue in parallel instead of queueing
 ///   behind one add.
 /// - **Several threads.** One core cannot saturate an Apple Silicon memory bus. The same
 ///   machine reads 40 GB/s on one thread and 123 GB/s on six.
+/// - **A clock that runs inside the work.** See below; this is the one that took longest to
+///   find, because the number it produces is not merely wrong, it is impossible.
 ///
-/// What that buys is a number that means something. LM Studio decoding Qwen3.5-9B on this
-/// M5 achieves 118.1 GB/s effective, against 125 GB/s measured here — **94% of the
-/// ceiling.** Against the old single-threaded copy figure the same engine looked like it
-/// was running at 138% of the machine, which is not a calibration, it is a broken ruler.
+/// # The clock has to be held by a thread that is doing the work
+///
+/// This function used to release a barrier, call `Instant::now()` on the main thread, and
+/// treat that as the start of the parallel region. On an idle machine that reads fine. It
+/// also reported **372 GB/s on a bus that tops out near 153**, run to run, from the same
+/// binary — because the main thread has nothing to do at the barrier and the OS is free to
+/// deschedule it for several milliseconds while ten worker threads saturate memory. Those
+/// milliseconds fall outside the timed window, and the whole window is only ~12 ms.
+///
+/// Each worker now times its own loop, and the sample takes the **slowest** of them: that
+/// is the wall clock of the parallel region as measured from inside it, and choosing the
+/// maximum means scheduling noise can only ever understate the machine.
+///
+/// The lesson generalises to the rest of this module. A wrong number here is not caught by
+/// any test that asks whether the code runs — only by asking whether the answer is possible.
 pub fn measure_read_bandwidth(bytes: usize, iterations: usize) -> MemorySample {
     let threads = std::thread::available_parallelism()
         .map(|n| n.get())
@@ -329,12 +342,18 @@ pub fn measure_read_bandwidth(bytes: usize, iterations: usize) -> MemorySample {
     // outstanding requests at a time.
     //
     // `seed` is what makes repeated sweeps honest. Reading the same immutable slice into
-    // the same accumulators is loop-invariant, so LLVM will happily hoist the whole sweep
-    // out of the repeat loop and time a single pass as if it were `iterations` of them.
-    // That is not a subtle few percent: it reported 369 GB/s on a machine whose bus tops
-    // out near 153. Threading the previous result in makes each pass depend on the last.
+    // the same accumulators is loop-invariant, so LLVM will happily hoist the sweep out of
+    // the repeat loop and time one pass as if it were `iterations` of them. **Every**
+    // accumulator is seeded from it, not just the first: seeding one and leaving three at
+    // zero leaves three quarters of the work invariant and hoistable, which is the same
+    // bug wearing a smaller number.
     fn sweep(slice: &[u64], seed: u64) -> u64 {
-        let (mut a, mut b, mut c, mut d) = (seed, 0u64, 0u64, 0u64);
+        let (mut a, mut b, mut c, mut d) = (
+            seed,
+            seed ^ 0x9e37_79b9_7f4a_7c15,
+            seed.rotate_left(17),
+            !seed,
+        );
         for q in slice.chunks_exact(4) {
             a = a.wrapping_add(q[0]);
             b = b.wrapping_add(q[1]);
@@ -344,35 +363,55 @@ pub fn measure_read_bandwidth(bytes: usize, iterations: usize) -> MemorySample {
         a ^ b ^ c ^ d
     }
 
-    // Spawn first, hold at a barrier, then start the clock. Thread creation and the
-    // first-touch page faults are real work, and timing them reports a slower machine than
-    // the one you have — the first sample of an unwarmed run came in 40% low.
-    let barrier = std::sync::Barrier::new(threads + 1);
-    let seconds = std::thread::scope(|scope| {
-        for t in 0..threads {
-            let start = t * chunk;
-            let end = if t == threads - 1 { n } else { start + chunk };
-            let slice = &src[start..end];
-            let barrier = &barrier;
-            scope.spawn(move || {
-                // One untimed pass: faults every page in and lets the CPU reach its
-                // steady-state clock before anything is measured.
-                let mut acc = sweep(slice, 0);
-                barrier.wait();
-                for _ in 0..iterations {
-                    acc = sweep(std::hint::black_box(slice), acc);
-                }
-                std::hint::black_box(acc);
-            });
-        }
-        // Released only once every thread has finished its warm-up pass, so the clock
-        // starts on a warm buffer at a steady clock speed.
-        barrier.wait();
-        Instant::now()
-    });
-    // The scope joins every thread before returning, so this is the full wall-clock of the
-    // timed region.
-    let seconds = seconds.elapsed().as_secs_f64();
+    // One pass of the whole measurement: warm up, then time `iterations` sweeps in every
+    // thread and take the slowest, which is the wall clock of the parallel region.
+    //
+    // The barrier covers the workers only. Thread creation and first-touch page faults are
+    // real work, and timing them reports a slower machine than the one you have — the first
+    // sample of an unwarmed run came in 40% low — so every thread warms up before any of
+    // them starts a clock.
+    let sample = || -> f64 {
+        let barrier = std::sync::Barrier::new(threads);
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..threads)
+                .map(|t| {
+                    let start = t * chunk;
+                    let end = if t == threads - 1 { n } else { start + chunk };
+                    let slice = &src[start..end];
+                    let barrier = &barrier;
+                    scope.spawn(move || {
+                        // One untimed pass: faults every page in and lets the CPU reach its
+                        // steady-state clock before anything is measured.
+                        let mut acc = sweep(slice, 0);
+                        barrier.wait();
+                        let started = Instant::now();
+                        for _ in 0..iterations {
+                            acc = sweep(std::hint::black_box(slice), acc);
+                        }
+                        let elapsed = started.elapsed();
+                        std::hint::black_box(acc);
+                        elapsed
+                    })
+                })
+                .collect();
+
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("bandwidth worker panicked"))
+                .max()
+                .unwrap_or_default()
+                .as_secs_f64()
+        })
+    };
+
+    // Median of three, because one sample is one roll of the scheduler. The timed region is
+    // ~12 ms; a background process waking inside it drags that sample down, and a single
+    // low read halves every tok/s figure the tool prints from it. Three costs 25 ms more
+    // and cannot be moved by one outlier. The buffer is allocated once and reused, so the
+    // repeats measure memory rather than the allocator.
+    let mut samples = [sample(), sample(), sample()];
+    samples.sort_by(|a, b| a.partial_cmp(b).expect("a duration is never NaN"));
+    let seconds = samples[1];
 
     // Read-only: one pass over the buffer per iteration, per thread's share.
     let total_bytes = (n * std::mem::size_of::<u64>()) as u64 * iterations as u64;
