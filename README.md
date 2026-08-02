@@ -1,155 +1,168 @@
 # sift
 
-**Compile the model to the machine.**
+**Will this model fit and run fast on your machine? Answered before you download it.**
 
-Every local-inference tool works the same way: a publisher picks a quantization, you
-download that file, you find out how fast it runs, and if it's too slow you download a
-different one. The model knows nothing about your machine.
+```console
+$ sift fit unsloth/Qwen3-30B-A3B-GGUF
+machine: Mac17,2, 16.0 GiB RAM, 12.0 GiB usable, 89 GB/s memory
+reading headers from unsloth/Qwen3-30B-A3B-GGUF without downloading…
 
-That is why the same failure keeps appearing. Cross your RAM limit and throughput falls
-off a cliff — llama.cpp thrashes, and streaming engines report drops like 0.63 → 0.07
-tok/s *while their cache hit rate improves*. The OS pages behind your back and the engine
-has no say.
+  quant               size     fits    GB/token  est tok/s
+  UD-IQ1_S         9.04 GB      yes       1.427         22  moe
+  Q2_K            11.26 GB    tight       1.399         22  moe
+  Q3_K_M          14.71 GB    tight       1.753         18  moe
+  Q4_K_M          18.56 GB       no       2.095   disk-bound  moe
+  Q8_0            32.48 GB       no       3.600   disk-bound  moe
+```
 
-`sift` inverts it: **you declare your machine and your target, and it decides what stays
-resident.** The resident-set size becomes a number you set, not one that emerges from
-kernel paging behaviour.
+Twenty-five quantizations evaluated. **Nothing downloaded.**
 
-> **Status: early.** The measurement and model-inspection layers work and are tested. The
-> inference engine is not written yet. Numbers below are real measurements from this
-> repository's own tools; nothing here is projected or copied from a marketing page.
+Today that answer costs an hour: pull 18 GB, find out it's too slow, delete, guess again.
 
-## Not another Ollama
+## No bundled model list
 
-| | Ollama / LM Studio | `sift` |
-|---|---|---|
-| You give it | a quant file you picked | your machine and a target |
-| Model fits in RAM | fast — **use them** | comparable at best |
-| Model is ~1.2× your RAM | thrashes | the whole point |
-| Model is 3× your RAM | refuses | runs |
-| Choosing the quant | guess, download, retry | measured and compiled |
-| Resident set size | emergent | a number you set |
-| Shape | app / daemon | library first, CLI on top |
+`sift` reads the **real GGUF header of the real file at the real URL** over HTTP range
+requests. A model uploaded ten minutes ago works exactly like one from last year.
 
-If `sift` loses to LM Studio on a model that fits, that goes in this README as a table
-row. The claim is about the case they cannot serve; overclaiming past it would destroy the
-only thing this project has.
+Measured on a 17.28 GiB model: **15 MiB read, 0.0848% of the file.**
 
-## What works today
+This matters because the alternative — shipping a catalog — rots. The most popular tool in
+this space compiles a model list into its binary, and its top user complaint is that it
+recommends two-year-old models as perfect matches.
+
+## Not a runtime. A companion to yours.
+
+`sift` never runs a model. It tells you which one to get and which engine should run it.
+
+```console
+$ sift route ~/.sift/models/olmoe-q4km.gguf
+  size             3.92 GiB
+  usable memory    12.00 GiB
+  use LM Studio (installed)
+  because it fits in memory
+```
+
+Routing knows what to **avoid**, not just what to use — an engine that thrashes looks like
+it's working, which is how people lose an afternoon:
+
+```console
+  installed, but do not use for this model:
+    LM Studio    will load, then page against the OS and slow to a crawl
+```
+
+Adding an engine is a row in a table (`crates/sift-core/src/engine.rs`), not a code change.
+That's deliberate: the runtime landscape churns, and absorbing churn has to be trivial.
+
+## Why not a website?
+
+Browsers cannot measure your machine. The Device Memory API deliberately anonymizes what
+it reports to prevent fingerprinting — one popular web tool tells a 24 GB M4 Pro it has
+8 GB of VRAM.
+
+`sift` runs a real memory-bandwidth probe and a real cold-disk read. That is the difference
+between an estimate and an answer, and it cannot be done from a browser tab.
+
+## Why you might not want sift
+
+- **You only use LM Studio and only run models that fit.** Its built-in compatibility
+  badges are good enough. Use those.
+- **You already know your hardware and want VRAM arithmetic.** A web calculator is a form
+  and needs no install.
+- **You want a curated shortlist without thinking.** [llmfit](https://github.com/AlexsJones/llmfit)
+  ships one and has a nice TUI.
+- **You want the memory estimate and nothing else.**
+  [gguf-parser-go](https://github.com/gpustack/gguf-parser-go) does remote GGUF parsing
+  well, and did it first. `sift` differs by measuring your machine instead of asking you to
+  type in your FLOPS and memory bandwidth, and by recommending an engine.
+
+## Install
+
+```sh
+brew install maxgfr/tap/sift
+```
+
+Or `cargo build --release` — Rust 1.85+, no runtime dependencies beyond `curl`.
+
+## Commands
 
 ```
-sift doctor  [--disk-sample FILE]   measure RAM, memory bandwidth, cold disk, GPU limit
-sift inspect MODEL [--tensors]      read a model's shape without loading its weights
-sift plan    MODEL [--hit-rate R]   per-token traffic and the resulting speed ceilings
-sift-bench probe | models           what's installed, and which regime each model is in
+sift fit <hf-repo>              which quantization to download, and why
+sift route <model>              which engine should run it
+sift inspect <path|hf-repo>     model shape, local or remote, no download
+sift plan <model>               per-token traffic and speed ceilings
+sift doctor [--disk-sample F]   measure this machine
+sift engines                    which runtimes are installed here
 ```
+
+`<model>` accepts a path, `org/repo`, `org/repo:QUANT`, or a URL.
 
 ## Measured on an Apple M5, 16 GB
 
-Produced by `sift doctor` on `Mac17,2`. Reproduce with the command, don't take the table.
+Reproduce with the commands; don't take the table.
 
-**Read granularity dominates.** Same total volume, cold, varying only block size:
+**LM Studio baseline** (`sift-bench baseline`), Qwen3.5-9B Q4_K_M resident on MLX-NAX:
+**20.91 tok/s** median, under 1% spread across runs. A dense model re-reads every weight
+per token, so that's ~128 GB/s effective against the M5's 153.6 GB/s ceiling — about **83%
+of what the memory bus can physically deliver.**
+
+That number is why `sift` doesn't try to be a runtime. There is almost no headroom in
+kernel work.
+
+**Read granularity costs 9×.** Same volume, cold, varying only block size:
 
 | block | 1 thread | 8 threads |
 |---|---|---|
 | 64 KiB | **0.75 GB/s** | 3.19 GB/s |
-| 1 MiB | 4.03 | 7.26 |
-| 4 MiB | 6.82 | 10.26 |
-| 12 MiB | 6.92 | 16.70 |
+| 12 MiB | 6.92 GB/s | 16.70 GB/s |
 
-A **9× penalty** for reading in small pieces rather than large ones. This reproduces
-Apple's *LLM in a Flash* result on current hardware, and it is the entire argument for
-laying experts out contiguously: in stock GGUF, using one expert costs three reads
-scattered across the file.
-
-Memory streams at **~95 GB/s** on this machine, against ~6.9 GB/s from cold disk. **RAM is
-roughly 14× faster than the SSD**, and that single ratio governs every design decision
-here.
-
-### Baseline: LM Studio, and why kernels are not the lever
-
-Measured with `sift-bench baseline` against LM Studio's own server, MLX-NAX runtime,
-Qwen3.5-9B Q4_K_M (6.10 GiB, dense, fully resident), 128 tokens per run after a discarded
-warm-up:
-
-| run | seconds | tok/s |
-|---|---|---|
-| 1 | 6.15 | 20.80 |
-| 2 | 6.12 | 20.93 |
-| 3 | 6.12 | 20.91 |
-
-**Median 20.91 tok/s**, and the spread across runs is under 1%.
-
-A dense model re-reads every weight per token, so ~6.1 GB moves each token. At 20.91 tok/s
-that is roughly **128 GB/s of effective bandwidth against the M5's 153.6 GB/s ceiling** —
-LM Studio is running at ~83% of what the memory bus can physically deliver.
-
-That is the most useful thing we have measured, and it is inconvenient: **there is almost
-no headroom in kernel optimisation.** A faster matmul cannot help when the bus is the
-limit. The only remaining lever is to move *fewer bytes per token* — which is what MoE
-sparsity (a token touches 6–12% of expert weights) and speculative decoding actually do.
-
-It also sets an honest expectation: on a dense model that fits, `sift` will not beat LM
-Studio, and this README will keep saying so.
+RAM measures ~95 GB/s against ~6.9 GB/s from cold disk — **RAM is roughly 14× faster than
+the SSD**, and that ratio is why "does it fit" is the question that matters.
 
 ### On honest disk numbers
 
-`F_NOCACHE` prevents *new* caching but cannot evict pages already resident, so a file the
-machine touched recently reads at memory speed and looks like a spectacular SSD. `sift
-doctor` flags any sample above 20 GB/s as a page-cache hit and excludes it, and warns when
-a sweep has warmed its own sample. Cold-read discipline is not optional: at least one
-established project in this space discarded four of its own published results after
-discovering it had measured RAM.
+`F_NOCACHE` prevents *new* caching but cannot evict resident pages, so a file the machine
+touched recently reads at memory speed and looks like a spectacular SSD. `sift doctor`
+flags any sample above 20 GB/s as a page-cache hit and excludes it, and warns when a sweep
+has warmed its own sample.
 
-## Design
+At least one established project in this space discarded four of its own published results
+after finding it had measured RAM.
 
-Three ideas, each answering a measurement rather than an intuition.
+## Accuracy
 
-**1. Bits should follow access cost, not just importance.** Uniform quantization spends
-bits evenly; importance-aware quantization spends them where they matter. Both miss half
-the equation — a weight in RAM is free to store, a weight on SSD costs 14× to move. So the
-always-resident trunk gets high precision, hot experts get more bits than a uniform quant
-would give them, and the cold tail — precisely the weights that cost bandwidth — gets
-squeezed. At equal total size this can beat a uniform quant.
+The tok/s figures from `sift fit` are **estimates**: measured memory bandwidth times an
+efficiency factor (80% dense, 35% MoE). They are labelled as estimates everywhere they
+appear.
 
-**2. Never let the OS decide.** Pin what fits with a measured margin, serve the rest
-through explicit `pread` with `F_NOCACHE` so the cold tier cannot grow into the pinned set.
+What `sift` gets right that a naive `bandwidth / file_size` model does not: **MoE sparsity**.
+A 30B-A3B model reads about 3B parameters per token, not 30B. Getting this wrong is a ~16×
+error on a 128-expert top-8 model, and it is a live open issue in a competing tool.
 
-**3. The cache floor is not what it looks like.** Below one token's working set, a
-demand-only expert cache holds nothing. Running the *next* layer's router on the *current*
-layer's hidden state means an expert only has to survive one attention rather than one
-whole token, which is what makes a small resident footprint viable at all. It is exact by
-construction: the real router still decides, so logits are unchanged.
+A predicted-versus-measured table is the next thing this README needs. Until it exists,
+treat the estimates as ordering hints rather than promises.
+
+## Status
+
+Early, and honest about it. See [TODO.md](TODO.md) for what is deliberately *not* built.
+
+- Works and tested: measurement, GGUF reading (local and remote), MoE traffic, routing.
+- macOS only for now. Linux and Windows are planned; the measurement layer uses Darwin
+  syscalls today.
+- 80 tests, clippy clean.
 
 ## Prior art
 
-This is a crowded field and none of it is ours. Named credit, because the measurements
-below shaped the design more than any paper did:
+Named because a router that pretends to be the only tool is not trustworthy as a router.
 
-- **Apple, *LLM in a Flash*** (arXiv:2312.11514) — windowing, row-column bundling, and the
-  read-granularity result this repo reproduces.
-- **[flash-moe](https://github.com/danveloper/flash-moe)** — ~90 documented experiments on
-  Apple Silicon, most of them negative, with reasons. Including: SSD DMA and GPU compute
-  contend for the same memory controller, so prefetch during GPU work nets zero.
-- **[WASTE](https://github.com/sqliteai/waste)** — Kimi K3 (2.78 T) on a 64 GB MacBook,
-  and a `LEARNED.md` that preserves wrong beliefs next to their refutations.
-- **[colibri](https://github.com/JustVugg/colibri)**,
-  **[moe-stream](https://github.com/GOBA-AI-Labs/moe-stream)**,
-  **[mbolt](https://github.com/doramirdor/mbolt)** — expert streaming, three-mode
-  residency, and profile-guided expert layout respectively.
-- **[moe-offload-findings](https://github.com/GaelicThunder/moe-offload-findings)** — nine
-  measured results, six of them negative, that removed more from this design than they
-  added.
-
-## Building
-
-```sh
-cargo build --release
-cargo test
-```
-
-Requires Rust 1.85+. macOS is the primary target; the measurement layer is Unix-portable.
+- [gguf-parser-go](https://github.com/gpustack/gguf-parser-go) — remote GGUF header
+  parsing, and it did it first.
+- [llmfit](https://github.com/AlexsJones/llmfit) — hardware detection and model scoring.
+- [LM Studio](https://lmstudio.ai), [Ollama](https://ollama.com),
+  [llama.cpp](https://github.com/ggml-org/llama.cpp),
+  [colibri](https://github.com/JustVugg/colibri) — the engines this recommends.
+- Apple's *[LLM in a Flash](https://arxiv.org/abs/2312.11514)* — the read-granularity
+  result reproduced above.
 
 ## Licence
 
-MIT OR Apache-2.0, at your option.
+MIT.

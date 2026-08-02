@@ -109,7 +109,7 @@ pub fn evaluate(repo: &str, mem_bytes_per_sec: f64, usable_ram: u64) -> Result<V
         });
     }
 
-    out.sort_by(|a, b| a.size_bytes.cmp(&b.size_bytes));
+    out.sort_by_key(|c| c.size_bytes);
     Ok(out)
 }
 
