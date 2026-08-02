@@ -321,6 +321,80 @@ fn build(
     }
 }
 
+/// The candidate `report` would recommend, if any.
+///
+/// Shared by both output paths so the human table and the JSON document can never
+/// disagree about which quantization to download.
+pub fn recommended(cands: &[Candidate]) -> Option<&Candidate> {
+    cands
+        .iter()
+        .filter(|c| c.regime != Regime::Oversized)
+        .max_by_key(|c| c.rank())
+}
+
+/// Emit the same evaluation as [`report`], as one JSON document on stdout.
+pub fn report_json(
+    repo: &str,
+    cands: &[Candidate],
+    facts: &sift_core::doctor::MachineFacts,
+    usable_ram: u64,
+    memory_gb_per_sec: f64,
+    context_tokens: u64,
+) -> Result<()> {
+    let rows: Vec<_> = cands
+        .iter()
+        .map(|c| {
+            serde_json::json!({
+                "quant": c.label,
+                "size_bytes": c.size_bytes,
+                "kv_cache_bytes": c.kv_bytes,
+                "footprint_bytes": c.footprint_bytes(),
+                "regime": c.regime,
+                "bits_per_weight": c.bits_per_weight,
+                // Named `below_quality_floor` rather than `damaged` so the field says what
+                // was measured, not what to conclude from it.
+                "below_quality_floor": !c.meets_quality_floor(),
+                "bytes_per_token": c.traffic.total(),
+                "is_moe": c.is_moe,
+                "shard_count": c.shard_count,
+                // Null rather than 0 when disk-bound: a consumer that plots this must not
+                // read "we did not estimate" as "zero tokens per second".
+                "estimated_tokens_per_sec": (!c.est_tok_s.is_nan()).then_some(c.est_tok_s),
+                "download_arg": c.download_arg,
+            })
+        })
+        .collect();
+
+    let best = recommended(cands);
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "repo": repo,
+            "machine": {
+                "model": facts.model,
+                "ram_bytes": facts.ram_bytes,
+                "usable_memory_bytes": usable_ram,
+                "measured_memory_gb_per_sec": memory_gb_per_sec,
+                "accel_memory": facts.accel_memory,
+            },
+            "context_tokens": context_tokens,
+            "quality_floor_bits_per_weight": QUALITY_FLOOR_BPW,
+            "candidates": rows,
+            "recommended": best.map(|c| serde_json::json!({
+                "quant": c.label,
+                "download_arg": c.download_arg,
+                "below_quality_floor": !c.meets_quality_floor(),
+            })),
+            "estimates": {
+                "dense_efficiency": DENSE_EFFICIENCY,
+                "moe_efficiency": MOE_EFFICIENCY,
+                "note": "tokens per second are estimates from measured memory bandwidth, not measurements",
+            },
+        }))?
+    );
+    Ok(())
+}
+
 /// Print the table and a recommendation.
 pub fn report(
     repo: &str,
@@ -397,10 +471,7 @@ pub fn report(
 
     // Rank on quality first, size never. See `Candidate::rank`: on Qwen3-30B-A3B, picking
     // the largest file that fits elects a 1-bit quant over a 3-bit one barely larger.
-    let best = cands
-        .iter()
-        .filter(|c| c.regime != Regime::Oversized)
-        .max_by_key(|c| c.rank());
+    let best = recommended(cands);
 
     match best {
         Some(c) => {

@@ -84,6 +84,9 @@ enum Command {
         /// Also print every tensor.
         #[arg(long)]
         tensors: bool,
+        /// Emit JSON instead of a human-readable report.
+        #[arg(long)]
+        json: bool,
     },
 
     /// Which quantization of a model should you download for this machine?
@@ -97,6 +100,9 @@ enum Command {
         /// is true and useless. Raise it to see what your actual workload costs.
         #[arg(long, default_value_t = DEFAULT_CONTEXT_TOKENS)]
         ctx: u64,
+        /// Emit JSON instead of a human-readable report.
+        #[arg(long)]
+        json: bool,
     },
 
     /// Which engine should run this model, and what to type.
@@ -106,10 +112,17 @@ enum Command {
         /// Pick a quantization when `model` is a repo.
         #[arg(long)]
         quant: Option<String>,
+        /// Emit JSON instead of a human-readable report.
+        #[arg(long)]
+        json: bool,
     },
 
     /// List the inference engines installed on this machine.
-    Engines,
+    Engines {
+        /// Emit JSON instead of a human-readable report.
+        #[arg(long)]
+        json: bool,
+    },
 
     /// Show what a model would cost per token, and the resulting speed ceilings.
     Plan {
@@ -121,6 +134,9 @@ enum Command {
         /// Expert-cache hit rate to assume, 0.0 to 1.0.
         #[arg(long, default_value_t = 0.0)]
         hit_rate: f64,
+        /// Emit JSON instead of a human-readable report.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -131,19 +147,23 @@ fn main() -> Result<()> {
             model,
             quant,
             tensors,
-        } => cmd_inspect(&Source::resolve(&model, quant.as_deref())?, tensors),
+            json,
+        } => cmd_inspect(&Source::resolve(&model, quant.as_deref())?, tensors, json),
         Command::Plan {
             model,
             quant,
             hit_rate,
-        } => cmd_plan(&Source::resolve(&model, quant.as_deref())?, hit_rate),
-        Command::Fit { repo, ctx } => cmd_fit(&repo, ctx),
-        Command::Route { model, quant } => cmd_route(&Source::resolve(&model, quant.as_deref())?),
-        Command::Engines => cmd_engines(),
+            json,
+        } => cmd_plan(&Source::resolve(&model, quant.as_deref())?, hit_rate, json),
+        Command::Fit { repo, ctx, json } => cmd_fit(&repo, ctx, json),
+        Command::Route { model, quant, json } => {
+            cmd_route(&Source::resolve(&model, quant.as_deref())?, json)
+        }
+        Command::Engines { json } => cmd_engines(json),
     }
 }
 
-fn cmd_fit(repo: &str, context_tokens: u64) -> Result<()> {
+fn cmd_fit(repo: &str, context_tokens: u64, json: bool) -> Result<()> {
     let facts = MachineFacts::collect();
     let usable = usable_ram(&facts);
     // Fewer iterations than `doctor` uses: this is one input among many, and the user is
@@ -151,20 +171,29 @@ fn cmd_fit(repo: &str, context_tokens: u64) -> Result<()> {
     let mem = doctor::measure_memory_bandwidth(doctor::BANDWIDTH_BUF_BYTES, 3);
     let installed = sift_core::engine::detect_installed();
 
-    println!(
-        "machine: {}, {:.1} GiB RAM, {:.1} GiB usable, {:.0} GB/s memory",
-        facts.model.as_deref().unwrap_or("unknown"),
-        sift_core::gib(facts.ram_bytes),
-        sift_core::gib(usable),
-        mem.gb_per_sec
-    );
-    println!("reading headers from {repo} without downloading…");
+    // Progress chatter goes to stderr under --json, so stdout stays a single parseable
+    // document. A CLI that another tool shells out to must not interleave the two.
+    if json {
+        eprintln!("reading headers from {repo} without downloading…");
+    } else {
+        println!(
+            "machine: {}, {:.1} GiB RAM, {:.1} GiB usable, {:.0} GB/s memory",
+            facts.model.as_deref().unwrap_or("unknown"),
+            sift_core::gib(facts.ram_bytes),
+            sift_core::gib(usable),
+            mem.gb_per_sec
+        );
+        println!("reading headers from {repo} without downloading…");
+    }
 
     let cands = fit::evaluate(repo, mem.gb_per_sec * 1e9, usable, context_tokens)?;
+    if json {
+        return fit::report_json(repo, &cands, &facts, usable, mem.gb_per_sec, context_tokens);
+    }
     fit::report(repo, &cands, usable, &installed, context_tokens)
 }
 
-fn cmd_route(src: &Source) -> Result<()> {
+fn cmd_route(src: &Source, json: bool) -> Result<()> {
     let (g, _) = src.read_gguf()?;
     let facts = MachineFacts::collect();
     let usable = usable_ram(&facts);
@@ -172,6 +201,39 @@ fn cmd_route(src: &Source) -> Result<()> {
 
     let size = g.total_tensor_bytes();
     let rec = sift_core::engine::route(size, sift_core::engine::Format::Gguf, usable, &installed);
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "model": src.label(),
+                "size_bytes": size,
+                "usable_memory_bytes": usable,
+                "regime": sift_core::engine::Regime::classify(size, usable),
+                "engine": rec.engine.as_ref().map(|e| serde_json::json!({
+                    "id": e.id,
+                    "name": e.name,
+                    "installed": rec.installed,
+                    "install": e.install,
+                })),
+                "reason": rec.reason,
+                // Named separately from `engine` because "do not use this one" is a
+                // distinct claim from "use that one", and a consumer acting on only the
+                // first would still send someone at an engine that thrashes.
+                "avoid": rec.avoid.iter().map(|(e, why)| serde_json::json!({
+                    "id": e.id,
+                    "name": e.name,
+                    "why": why,
+                })).collect::<Vec<_>>(),
+                "also_suitable": rec.also_suitable.iter().map(|e| serde_json::json!({
+                    "id": e.id,
+                    "name": e.name,
+                    "install": e.install,
+                })).collect::<Vec<_>>(),
+            }))?
+        );
+        return Ok(());
+    }
 
     println!("{}", src.label());
     println!("  size             {:.2} GiB", sift_core::gib(size));
@@ -211,8 +273,38 @@ fn cmd_route(src: &Source) -> Result<()> {
     Ok(())
 }
 
-fn cmd_engines() -> Result<()> {
+fn cmd_engines(json: bool) -> Result<()> {
     let installed = sift_core::engine::detect_installed();
+
+    if json {
+        let engines: Vec<_> = sift_core::engine::ENGINES
+            .iter()
+            .map(|e| {
+                let found = installed.iter().find(|i| i.engine.id == e.id);
+                serde_json::json!({
+                    "id": e.id,
+                    "name": e.name,
+                    "formats": e.formats,
+                    "oversized": e.oversized,
+                    "sweet_spot": e.sweet_spot,
+                    "install": e.install,
+                    "found": found.is_some(),
+                    "found_at": found.map(|i| i.found_at.display().to_string()),
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "engines": engines,
+                // Consumers should not read `found: false` as "absent". Detection probes
+                // known install paths, and those change.
+                "detection": "best effort; false means not found here, never not installed",
+            }))?
+        );
+        return Ok(());
+    }
+
     println!("known engines\n");
     for e in sift_core::engine::ENGINES {
         match installed.iter().find(|i| i.engine.id == e.id) {
@@ -389,12 +481,60 @@ fn cmd_doctor(disk_sample: Option<PathBuf>, json: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_inspect(src: &Source, list_tensors: bool) -> Result<()> {
+fn cmd_inspect(src: &Source, list_tensors: bool, json: bool) -> Result<()> {
     let (g, fetched) = src.read_gguf()?;
 
     // Payload size is authoritative for remote files: the server's Content-Length covers
     // the whole file, but only the directory was read.
     let payload = g.total_tensor_bytes();
+
+    if json {
+        let shape = g.shape();
+        let moe = model::infer_moe_shape(&shape).map(|m| {
+            serde_json::json!({
+                "layers": m.moe_layers,
+                "experts_per_layer": m.experts_per_layer,
+                "experts_per_token": m.experts_per_token,
+                "activation_ratio": m.activation_ratio(),
+                "mean_bytes_per_expert": m.mean_bytes_per_expert(),
+                "total_expert_bytes": m.total_expert_bytes(),
+                "expert_bytes_per_token": m.expert_bytes_per_token(),
+            })
+        });
+        let kv = model::infer_kv_shape(&shape).map(|k| {
+            serde_json::json!({
+                "layers": k.layers,
+                "kv_heads": k.kv_heads,
+                "head_dim": k.head_dim,
+                "train_context": k.train_context,
+                "bytes_at_4096_f16": k.bytes_at(4096, model::KV_F16_BYTES),
+            })
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "model": src.label(),
+                "gguf_version": g.version,
+                "architecture": g.architecture(),
+                "tensor_count": g.tensors.len(),
+                "tensor_payload_bytes": payload,
+                "parameters": shape.total_parameters(),
+                "bits_per_weight": shape.bits_per_weight(),
+                // The headline claim, as a measurement rather than a promise. Null for a
+                // local file, where nothing was transferred at all.
+                "bytes_read_over_http": fetched,
+                "moe": moe,
+                "kv_cache": kv,
+                "tensors": list_tensors.then(|| g.tensors.iter().map(|t| serde_json::json!({
+                    "name": t.name,
+                    "dtype": t.dtype.name(),
+                    "dims": t.dims,
+                    "size_bytes": t.size_bytes(),
+                })).collect::<Vec<_>>()),
+            }))?
+        );
+        return Ok(());
+    }
 
     println!("{}", src.label());
     println!("  gguf version     {}", g.version);
@@ -467,7 +607,7 @@ fn cmd_inspect(src: &Source, list_tensors: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_plan(src: &Source, hit_rate: f64) -> Result<()> {
+fn cmd_plan(src: &Source, hit_rate: f64, json: bool) -> Result<()> {
     let (g, _) = src.read_gguf()?;
     let shape = model::infer_moe_shape(&g.shape())
         .context("this model has no stacked expert tensors; planning targets MoE models")?;
@@ -481,6 +621,31 @@ fn cmd_plan(src: &Source, hit_rate: f64) -> Result<()> {
         expert_bytes: shape.expert_bytes_per_token(),
         trunk_bytes,
     };
+
+    if json {
+        let mem = doctor::measure_memory_bandwidth(256 << 20, 4);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "model": src.label(),
+                "hit_rate": hit_rate,
+                "per_token_bytes": {
+                    "routed_experts": traffic.expert_bytes,
+                    "always_active": trunk_bytes,
+                    "total": traffic.total(),
+                },
+                "measured_memory_gb_per_sec": mem.gb_per_sec,
+                "ceilings_tokens_per_sec": {
+                    "resident": traffic.tokens_per_sec(mem.gb_per_sec * 1e9, hit_rate),
+                    "streamed_typical_nvme": traffic.tokens_per_sec(6.15e9, hit_rate),
+                },
+                // Stated in the payload, not only in the prose, so a consumer that never
+                // reads the human output cannot mistake a roofline for a prediction.
+                "note": "roofline ceilings, not predictions; real MoE decode lands at 25-35% of them",
+            }))?
+        );
+        return Ok(());
+    }
 
     println!("{}", src.label());
     println!("\nper-token weight traffic");
