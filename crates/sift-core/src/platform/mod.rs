@@ -17,14 +17,23 @@
 //! - **How much memory has this process actually used?** Used to check a measurement did
 //!   not quietly balloon.
 //!
-//! # What is deliberately not abstracted
+//! # Two quantities that are never added together
 //!
-//! Accelerator memory. `gpu_wired_limit_bytes` is an Apple concept — a ceiling on unified
-//! memory the GPU may wire. There is no honest Linux or Windows equivalent to fill it
-//! with, so those platforms report [`AccelMemory::Unknown`] and the caller falls back to
-//! `RAM − reserve`. Reporting a guess here is exactly the mistake that makes competing
-//! tools untrustworthy: one of them maps every GPU below 8 GB onto an 8 GB tier and then
-//! compares it against benchmark data recorded on 8 GB hardware.
+//! Accelerator memory is one word for two different things, and conflating them is the
+//! mistake that makes competing tools untrustworthy — one of them maps every GPU below
+//! 8 GB onto an 8 GB tier and then compares it against benchmark data recorded on 8 GB
+//! hardware.
+//!
+//! - **A ceiling on host memory.** Apple's `iogpu.wired_limit_mb`: unified memory, so the
+//!   limit binds what a model may occupy *in RAM*. [`AccelMemory::host_ceiling_bytes`]
+//!   returns it, and `fits` is computed against it.
+//! - **A discrete pool beside host memory.** NVIDIA and AMD VRAM. It is not a ceiling on
+//!   anything the host allocates, and adding it to RAM would describe a machine nobody
+//!   owns. [`AccelMemory::vram_bytes`] returns it, `doctor` prints it, and nothing else
+//!   reads it — deliberately, until offload is modelled rather than guessed at.
+//!
+//! The type keeps them apart so the split survives contact with a future caller: there is
+//! no accessor that returns "the accelerator's memory" without saying which kind.
 
 use std::path::Path;
 
@@ -71,30 +80,51 @@ pub struct MachineFacts {
     pub accel_memory: AccelMemory,
 }
 
-/// What we know about the memory ceiling an accelerator imposes.
+/// What we know about this machine's accelerator memory.
 ///
-/// Three states, not two, because "we did not look" and "we looked and there is no limit"
-/// lead to different advice, and collapsing them into `None` would let the tool imply a
-/// measurement it never made.
+/// Four states, not two, because "we did not look", "we looked and there is no limit" and
+/// "there is a separate pool that is not a limit at all" lead to different advice.
+/// Collapsing them into `Option<u64>` would let the tool imply a measurement it never made,
+/// or — worse — add a graphics card's VRAM to a laptop's RAM and call the sum usable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum AccelMemory {
-    /// A hard ceiling the platform reports, in bytes. On macOS this is
+    /// A hard ceiling on host memory the platform reports, in bytes. On macOS this is
     /// `iogpu.wired_limit_mb`, which binds well before physical RAM does.
     Limited { bytes: u64 },
     /// The platform defines such a ceiling but it is unset, so an OS default applies —
     /// itself below physical RAM. macOS only.
     PlatformDefault,
-    /// This platform exposes no ceiling we can read. Callers must fall back to RAM minus a
-    /// reserve, and should say so rather than implying a measurement.
+    /// A discrete accelerator with its own memory, which is **not** a ceiling on host
+    /// memory. Reported so the user knows `fits` is conservative on this machine, and
+    /// named so they can check the detection.
+    Discrete { bytes: u64, vendor: &'static str },
+    /// Nothing found. Callers fall back to RAM minus a reserve, and should say so rather
+    /// than implying a measurement.
     Unknown,
 }
 
 impl AccelMemory {
-    /// The ceiling in bytes, when one is actually known.
-    pub fn bytes(self) -> Option<u64> {
+    /// The ceiling on **host** memory, when the platform imposes one.
+    ///
+    /// `None` for [`AccelMemory::Discrete`], and that is the whole point of the split: a
+    /// 24 GB card on a 16 GB machine does not let a 20 GB model fit in RAM. Deciding what
+    /// an engine can offload to a discrete GPU is a different calculation — one that
+    /// depends on the engine, the layer split and the KV cache location — and until `sift`
+    /// models it, saying nothing is the honest answer.
+    pub fn host_ceiling_bytes(self) -> Option<u64> {
         match self {
             AccelMemory::Limited { bytes } => Some(bytes),
+            _ => None,
+        }
+    }
+
+    /// Memory belonging to a discrete accelerator, where one was found.
+    ///
+    /// Informational. Nothing in the fit arithmetic reads this.
+    pub fn vram_bytes(self) -> Option<u64> {
+        match self {
+            AccelMemory::Discrete { bytes, .. } => Some(bytes),
             _ => None,
         }
     }
@@ -172,8 +202,35 @@ mod tests {
     fn an_unknown_accelerator_ceiling_yields_no_bytes() {
         // The distinction this guards: `Unknown` must never be mistaken for a measured 0,
         // which would make every model look oversized.
-        assert_eq!(AccelMemory::Unknown.bytes(), None);
-        assert_eq!(AccelMemory::PlatformDefault.bytes(), None);
-        assert_eq!(AccelMemory::Limited { bytes: 42 }.bytes(), Some(42));
+        assert_eq!(AccelMemory::Unknown.host_ceiling_bytes(), None);
+        assert_eq!(AccelMemory::PlatformDefault.host_ceiling_bytes(), None);
+        assert_eq!(
+            AccelMemory::Limited { bytes: 42 }.host_ceiling_bytes(),
+            Some(42)
+        );
+    }
+
+    #[test]
+    fn discrete_vram_is_never_offered_as_a_host_memory_ceiling() {
+        // The failure this prevents: a 24 GB card on a 16 GB machine reporting that a 20 GB
+        // model fits in RAM. Discrete memory is a separate pool, so it answers the VRAM
+        // question and refuses the host one.
+        let card = AccelMemory::Discrete {
+            bytes: 24 * crate::GIB,
+            vendor: "nvidia",
+        };
+        assert_eq!(card.host_ceiling_bytes(), None, "VRAM is not host memory");
+        assert_eq!(card.vram_bytes(), Some(24 * crate::GIB));
+    }
+
+    #[test]
+    fn an_apple_wired_limit_is_not_reported_as_vram() {
+        // The mirror image: unified memory the GPU may wire is host memory, so it must not
+        // appear as a separate pool that could be added to it.
+        let apple = AccelMemory::Limited {
+            bytes: 12 * crate::GIB,
+        };
+        assert_eq!(apple.vram_bytes(), None);
+        assert_eq!(AccelMemory::Unknown.vram_bytes(), None);
     }
 }

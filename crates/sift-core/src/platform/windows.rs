@@ -26,7 +26,9 @@ use std::path::Path;
 
 use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_NO_BUFFERING, FILE_FLAG_RANDOM_ACCESS};
 use windows_sys::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
-use windows_sys::Win32::System::Registry::{RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ};
+use windows_sys::Win32::System::Registry::{
+    RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_QWORD, RRF_RT_REG_SZ,
+};
 use windows_sys::Win32::System::SystemInformation::{
     GetSystemInfo, GlobalMemoryStatusEx, MEMORYSTATUSEX, SYSTEM_INFO,
 };
@@ -42,10 +44,78 @@ pub fn machine_facts() -> MachineFacts {
             .map(|n| n.get())
             .unwrap_or(1),
         model: system_product_name(),
-        // No equivalent of the Apple wired limit. Discrete VRAM via DXGI is a different
-        // quantity — not a ceiling on host memory — so claiming it here would mislead.
-        accel_memory: AccelMemory::Unknown,
+        // Never `Limited`: Windows has no equivalent of the Apple wired limit, and what the
+        // display driver reports is a separate pool. `AccelMemory` keeps the two apart.
+        accel_memory: discrete_vram(),
     }
+}
+
+/// The display-adapter class key. This GUID is fixed by Windows and has not changed since
+/// NT; every graphics driver registers a numbered subkey under it.
+const DISPLAY_CLASS_KEY: &str =
+    "SYSTEM\\CurrentControlSet\\Control\\Class\\{4d36e968-e325-11ce-bfc1-08002be10318}";
+
+/// Adapters to look at. Numbered from `0000`, densely, and eight is well past any real
+/// machine — the point of a bound is that a corrupt registry cannot spin here.
+const MAX_ADAPTERS: u32 = 8;
+
+/// Dedicated video memory, as the display driver recorded it.
+///
+/// # Why the registry and not DXGI
+///
+/// `IDXGIAdapter3::QueryVideoMemoryInfo` is the documented interface and reports live
+/// budget as well as capacity. Reaching it from `windows-sys` means driving COM vtables by
+/// hand — unsafe code that no CI runner here can exercise, since GitHub's Windows images
+/// have no discrete GPU. `HardwareInformation.qwMemorySize` is a plain QWORD written by the
+/// driver, read through the same `RegGetValueW` this file already uses for the machine
+/// model, and its failure mode is a missing value rather than a bad pointer.
+///
+/// The older `HardwareInformation.MemorySize` is deliberately not consulted: it is a DWORD
+/// and truncates on any card of 4 GB or more, which is every card worth reporting.
+fn discrete_vram() -> AccelMemory {
+    let best = (0..MAX_ADAPTERS)
+        .filter_map(|i| {
+            reg_qword(
+                &format!("{DISPLAY_CLASS_KEY}\\{i:04}"),
+                "HardwareInformation.qwMemorySize",
+            )
+        })
+        .filter(|&b| b > 0)
+        // The largest adapter, not the sum: two cards are two pools, and a laptop with
+        // switchable graphics lists both its integrated and its discrete part.
+        .max();
+
+    match best {
+        Some(bytes) => AccelMemory::Discrete {
+            bytes,
+            vendor: "display driver",
+        },
+        None => AccelMemory::Unknown,
+    }
+}
+
+/// Read a `REG_QWORD` from `HKEY_LOCAL_MACHINE`.
+fn reg_qword(subkey: &str, value: &str) -> Option<u64> {
+    let subkey = wide(subkey);
+    let value = wide(value);
+    let mut data: u64 = 0;
+    let mut size = std::mem::size_of::<u64>() as u32;
+
+    // SAFETY: both strings are NUL-terminated wide buffers that outlive the call, and
+    // `data`/`size` are live locals of exactly the size the flag promises the value is.
+    // `RRF_RT_REG_QWORD` makes the call fail rather than write a differently-typed value.
+    let rc = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            subkey.as_ptr(),
+            value.as_ptr(),
+            RRF_RT_REG_QWORD,
+            std::ptr::null_mut(),
+            &mut data as *mut u64 as *mut std::ffi::c_void,
+            &mut size,
+        )
+    };
+    (rc == 0 && size as usize == std::mem::size_of::<u64>()).then_some(data)
 }
 
 pub fn page_size() -> usize {
@@ -179,4 +249,48 @@ fn system_product_name() -> Option<String> {
 /// NUL-terminated UTF-16, as every `W` entry point expects.
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn adapter_subkeys_are_zero_padded_to_four_digits() {
+        // Windows writes `0000`, `0001`. Formatting `{i}` instead would look right in a
+        // review and match nothing on a real machine.
+        assert!(format!("{DISPLAY_CLASS_KEY}\\{:04}", 0).ends_with("\\0000"));
+        assert!(format!("{DISPLAY_CLASS_KEY}\\{:04}", 7).ends_with("\\0007"));
+    }
+
+    #[test]
+    fn reading_a_value_that_is_not_there_yields_nothing_rather_than_zero() {
+        // Runs on every Windows machine, including CI runners with no discrete GPU: the
+        // point is that an absent key is reported as absent, never as a card with no
+        // memory.
+        assert_eq!(
+            reg_qword(
+                "SYSTEM\\CurrentControlSet\\Control\\Class\\{4d36e968-e325-11ce-bfc1-08002be10318}",
+                "sift.NoSuchValue"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn a_string_value_is_refused_rather_than_reinterpreted_as_a_number() {
+        // `RRF_RT_REG_QWORD` is what stops eight bytes of UTF-16 being read as a memory
+        // size. `SystemProductName` is a REG_SZ that exists on every machine.
+        assert_eq!(
+            reg_qword("HARDWARE\\DESCRIPTION\\System\\BIOS", "SystemProductName"),
+            None
+        );
+    }
+
+    #[test]
+    fn detection_never_reports_a_host_memory_ceiling() {
+        // Whatever this machine has, Windows must not produce `Limited`: that variant means
+        // "the OS caps what a model may hold in RAM", which is an Apple concept.
+        assert_eq!(discrete_vram().host_ceiling_bytes(), None);
+    }
 }
