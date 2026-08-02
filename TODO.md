@@ -80,8 +80,14 @@ Roughly in order of how much they improve the answer.
 
 ### Polish
 
-- [ ] Cache fetched headers in `~/.sift/cache/` keyed by ETag. A `fit` sweep currently
-      re-reads on every invocation and takes ~2 minutes for 25 quants.
+- [x] Cache fetched headers in `~/.sift/cache/` keyed by ETag. Validated, never expiring:
+      a `304 Not Modified` proves the bytes on disk are the bytes on the server, which
+      matters here because the whole claim is reading the *real* header of the *real* file.
+      The trap was which validator to send — HuggingFace redirects to a signed CDN URL
+      whose `etag` describes an object that expires and whose signature encodes the byte
+      range, so sending it back gets the whole body again. `x-linked-etag` on the 302 is
+      the file's stable hash and answers 304 before the redirect is even followed.
+      A repeated sweep drops from 3.42s to 0.68s.
 - [x] Parallelise the `fit` sweep. Eight workers over a shared queue: 72 files in 22
       seconds, against a serial run that had not finished after five minutes.
 - [ ] Safetensors support, so non-GGUF repos are not a dead end.
@@ -100,5 +106,6 @@ Things currently shipped that are known to be imperfect, recorded rather than hi
   engine, so treat it as a calibration point rather than a validated constant.
 - **Ollama detection matches `~/.ollama`**, a data directory, so it can report Ollama as
   present after an uninstall. Fails soft by design, but it is a false positive.
-- **The `fit` sweep caches nothing.** It is parallel now, but a second run re-reads every
-  header. The ETag cache below is what fixes that.
+- **The header cache never evicts.** Entries are small and validated, so a stale one
+  cannot produce a wrong answer, but `~/.sift/cache/` grows without bound. `SIFT_NO_CACHE`
+  disables it; there is no `sift cache clear` yet.

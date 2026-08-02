@@ -51,17 +51,26 @@ pub struct RemoteFile {
     total: Option<u64>,
     /// Bytes actually transferred, so callers can prove we did not download the model.
     fetched: u64,
+    /// Cached prefix from a previous run, awaiting validation.
+    ///
+    /// Held rather than used until the server confirms it: the tool's claim is that it
+    /// reads the real header of the real file, and serving an unvalidated cache would
+    /// undercut the reason to use it.
+    cached: Option<crate::cache::Entry>,
 }
 
 impl RemoteFile {
     /// Open a remote file. No bytes are fetched until the first read.
     pub fn new(url: impl Into<String>) -> Self {
+        let url = url.into();
+        let cached = crate::cache::load(&url);
         Self {
-            url: url.into(),
+            url,
             buf: Vec::new(),
             pos: 0,
             total: None,
             fetched: 0,
+            cached,
         }
     }
 
@@ -106,10 +115,34 @@ impl RemoteFile {
         // this happens once or twice, and a single contiguous prefix is far easier to
         // reason about than a set of possibly-overlapping windows.
         let end = want.saturating_sub(1);
-        let (body, total) = curl_range(&self.url, 0, end)?;
-        self.fetched += body.len() as u64;
-        self.total = total.or(self.total);
-        self.buf = body;
+
+        // Offer the cached ETag only when the cached prefix would actually satisfy this
+        // read. A 304 on a shorter prefix would prove the file is unchanged and still leave
+        // us without the bytes.
+        let validator = self
+            .cached
+            .as_ref()
+            .filter(|c| c.body.len() as u64 >= want)
+            .map(|c| c.etag.clone());
+
+        let res = curl_range(&self.url, 0, end, validator.as_deref())?;
+
+        if res.status == 304 {
+            // The server confirmed the bytes on disk are the bytes it has. Not counted as
+            // fetched, because nothing was.
+            let entry = self.cached.take().expect("a 304 needs a validator");
+            self.total = entry.total.or(self.total);
+            self.buf = entry.body;
+            return Ok(());
+        }
+
+        self.fetched += res.body.len() as u64;
+        self.total = res.total.or(self.total);
+        crate::cache::store(&self.url, &res.body, res.total, res.etag.as_deref());
+        // A fresh body supersedes whatever was cached, so a later `ensure` for more bytes
+        // does not offer a validator for content we have already replaced.
+        self.cached = None;
+        self.buf = res.body;
         Ok(())
     }
 }
@@ -175,21 +208,45 @@ impl Seek for RemoteFile {
     }
 }
 
-/// Fetch `[start, end]` inclusive. Returns the body and the total size when the server
-/// reports one via `Content-Range`.
-fn curl_range(url: &str, start: u64, end: u64) -> io::Result<(Vec<u8>, Option<u64>)> {
+/// One HTTP response.
+pub(crate) struct Fetched {
+    /// Status of the final response, after redirects. 304 means the validator matched.
+    pub status: u16,
+    pub body: Vec<u8>,
+    /// Total file size from `Content-Range`, when the server reports one.
+    pub total: Option<u64>,
+    /// The `ETag` to send back next time.
+    pub etag: Option<String>,
+}
+
+/// Fetch `[start, end]` inclusive, optionally conditional on an ETag.
+///
+/// `--fail` is deliberately absent when a validator is sent: it turns any non-2xx into an
+/// error, and 304 is the answer we are hoping for. Status is checked here instead.
+fn curl_range(url: &str, start: u64, end: u64, if_none_match: Option<&str>) -> io::Result<Fetched> {
+    let range = format!("{start}-{end}");
+    let mut args: Vec<String> = vec![
+        "-sSL".into(),
+        "--max-time".into(),
+        "60".into(),
+        "-D".into(),
+        "-".into(), // headers to stdout, ahead of the body
+        "-r".into(),
+        range,
+    ];
+    match if_none_match {
+        Some(etag) => {
+            args.push("-H".into());
+            args.push(format!("If-None-Match: {etag}"));
+        }
+        // Without a validator there is no status worth keeping other than success, so let
+        // curl reject errors itself and report its own diagnostics.
+        None => args.push("--fail".into()),
+    }
+    args.push(url.to_string());
+
     let out = Command::new("curl")
-        .args([
-            "-sSL",
-            "--fail",
-            "--max-time",
-            "60",
-            "-D",
-            "-", // headers to stdout, ahead of the body
-            "-r",
-            &format!("{start}-{end}"),
-            url,
-        ])
+        .args(&args)
         .output()
         .map_err(|e| io::Error::other(format!("running curl: {e}")))?;
 
@@ -206,7 +263,58 @@ fn curl_range(url: &str, start: u64, end: u64) -> io::Result<(Vec<u8>, Option<u6
     }
 
     let (headers, body) = split_headers(&out.stdout);
-    Ok((body, parse_content_range_total(&headers)))
+    let status = parse_status(&headers).unwrap_or(200);
+
+    if status >= 400 {
+        return Err(io::Error::other(format!("fetching {url}: HTTP {status}")));
+    }
+
+    Ok(Fetched {
+        status,
+        body,
+        total: parse_content_range_total(&headers),
+        etag: parse_etag(&headers),
+    })
+}
+
+/// Status code of the final response.
+///
+/// Redirects put several status lines in the dump, so this takes the last one — the first
+/// would report the 302 rather than what actually answered.
+fn parse_status(headers: &str) -> Option<u16> {
+    headers
+        .lines()
+        .rfind(|l| l.starts_with("HTTP/"))
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|c| c.parse().ok())
+}
+
+/// The validator to send back as `If-None-Match`, kept verbatim.
+///
+/// **`x-linked-etag` in preference to `etag`**, and the distinction is the difference
+/// between a cache that works and one that never hits. HuggingFace answers a file request
+/// with a 302 to a signed CDN URL and carries the file's stable content hash in
+/// `x-linked-etag`. The CDN's own `etag` describes an object behind a URL that expires and
+/// whose signature has the byte range baked into it, so it is worthless as a validator for
+/// a later request.
+///
+/// Sending the CDN etag back to huggingface.co is answered with a fresh 302 and the whole
+/// body again; sending the linked etag is answered `304 Not Modified` before the redirect
+/// is even followed.
+///
+/// Quotes and any `W/` weak marker are preserved: the value goes back out byte for byte,
+/// and normalising it here would break the match.
+fn parse_etag(headers: &str) -> Option<String> {
+    let find = |name: &str| {
+        let prefix = format!("{name}:");
+        headers
+            .lines()
+            .rfind(|l| l.to_ascii_lowercase().starts_with(&prefix))
+            .and_then(|l| l.split_once(':'))
+            .map(|(_, v)| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    };
+    find("x-linked-etag").or_else(|| find("etag"))
 }
 
 /// Split a curl `-D -` response into header text and body bytes.
@@ -326,5 +434,57 @@ mod tests {
         let mut f = RemoteFile::new("https://example.invalid/x.gguf");
         assert_eq!(f.read(&mut []).expect("empty read"), 0);
         assert_eq!(f.bytes_fetched(), 0);
+    }
+}
+
+#[cfg(test)]
+mod etag_tests {
+    use super::*;
+
+    /// A real HuggingFace exchange: a 302 carrying the stable hash, then the CDN's 206.
+    const HF_HEADERS: &str = "HTTP/2 302 \r\n\
+x-linked-etag: \"8c310f1435a1222338fd2d3d974975be9cd908180b644bab0c2a94da1ac32f3f\"\r\n\
+location: https://us.aws.cdn.hf.co/xet-bridge-us/signed?Expires=1785686539\r\n\
+\r\n\
+HTTP/2 206 \r\n\
+etag: \"7ff148f83a88d5645abb8352cec4fa6fee204846ae3866297f06c983dad8a997\"\r\n\
+content-range: bytes 0-1023/4213512672\r\n\
+\r\n";
+
+    #[test]
+    fn the_stable_linked_etag_wins_over_the_cdn_one() {
+        // The CDN etag describes an object behind a signed URL that expires and whose
+        // signature encodes the byte range, so sending it back gets a fresh 302 and the
+        // whole body again. The linked etag gets a 304 before the redirect is followed.
+        let etag = parse_etag(HF_HEADERS).expect("an etag");
+        assert!(etag.contains("8c310f14"), "took the CDN etag: {etag}");
+        assert!(etag.starts_with('"') && etag.ends_with('"'), "quotes kept");
+    }
+
+    #[test]
+    fn a_plain_etag_is_used_when_there_is_no_linked_one() {
+        let headers = "HTTP/1.1 200 OK\r\netag: \"abc123\"\r\n\r\n";
+        assert_eq!(parse_etag(headers).as_deref(), Some("\"abc123\""));
+    }
+
+    #[test]
+    fn absent_or_empty_etags_are_none_rather_than_an_empty_string() {
+        // An empty validator would be sent as `If-None-Match: ` and match nothing, turning
+        // every request into a cache miss that still paid for the header.
+        assert_eq!(parse_etag("HTTP/1.1 200 OK\r\n\r\n"), None);
+        assert_eq!(parse_etag("HTTP/1.1 200 OK\r\netag:   \r\n\r\n"), None);
+    }
+
+    #[test]
+    fn the_final_status_is_taken_not_the_redirect() {
+        // Reading the first status line would report 302 for every ranged fetch and the
+        // 304 path would never trigger.
+        assert_eq!(parse_status(HF_HEADERS), Some(206));
+        assert_eq!(parse_status("HTTP/2 304 \r\n\r\n"), Some(304));
+    }
+
+    #[test]
+    fn the_total_size_still_comes_from_the_content_range() {
+        assert_eq!(parse_content_range_total(HF_HEADERS), Some(4_213_512_672));
     }
 }

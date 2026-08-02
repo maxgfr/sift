@@ -585,6 +585,10 @@ fn cmd_inspect(src: &Source, list_tensors: bool, json: bool) -> Result<()> {
     println!("  tensors          {}", g.tensors.len());
     println!("  tensor payload   {:.2} GiB", sift_core::gib(payload));
     match fetched {
+        // Zero bytes over a remote source means the cached header was revalidated with a
+        // conditional request and the server answered 304. Worth saying outright: "0.00 MiB
+        // read" is true but reads like a bug.
+        Some(0) => println!("  read over HTTP   nothing — cached header still current (304)"),
         // The headline claim of this tool, stated as a measurement rather than a promise.
         Some(bytes) => println!(
             "  read over HTTP   {:.2} MiB of a {:.2} GiB model ({:.4}%)",
