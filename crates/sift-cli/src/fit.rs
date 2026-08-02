@@ -122,78 +122,119 @@ pub fn evaluate(
     let files = hub::list_gguf(repo)?;
     let (whole, sets) = hub::group_shards(&files);
 
-    let mut out = Vec::new();
+    // Everything to evaluate, as one list, so the workers below need no per-kind logic.
+    let work: Vec<Work> = whole
+        .iter()
+        .map(Work::Whole)
+        .chain(sets.iter().map(Work::Split))
+        .collect();
 
-    for f in &whole {
-        // A file whose header we cannot read is skipped with a note rather than guessed
-        // at: a wrong row in this table is worse than a missing one.
-        let g = match read_header(repo, &f.path) {
-            Ok(g) => g,
-            Err(e) => {
-                eprintln!("  skipped {}: {e}", f.quant_label());
-                continue;
-            }
-        };
-        let shape = g.shape();
-        let size = f.size.unwrap_or_else(|| shape.total_tensor_bytes());
-        out.push(build(
-            f.quant_label(),
-            f.path.clone(),
-            size,
-            &shape,
-            mem_bytes_per_sec,
-            usable_ram,
-            context_tokens,
-        ));
-    }
+    // The sweep is entirely network-bound — 25 quantizations meant 25 serial round-trips,
+    // and a fully split repo like Qwen3-235B is 72 of them. Threads spend their lives
+    // blocked on a socket, so the useful count is set by politeness to the hub rather than
+    // by cores; 8 is enough to hide latency without looking like a scraper.
+    let workers = work.len().clamp(1, 8);
 
-    for set in &sets {
-        // Read every part, not just the first. Each shard carries only its own slice of
-        // the tensor directory, so asking part 1 for the model's size or expert layout
-        // gives an answer that is confidently a third of the truth.
-        if !set.is_complete() {
-            eprintln!(
-                "  skipped {}: {} of {} shards present in the repo",
-                set.base.quant_label(),
-                set.parts.len(),
-                set.expected
-            );
-            continue;
-        }
+    let queue = std::sync::Mutex::new(work.into_iter());
+    let out = std::sync::Mutex::new(Vec::new());
 
-        let mut parts = Vec::with_capacity(set.parts.len());
-        let mut failed = None;
-        for p in &set.parts {
-            match read_header(repo, &p.path) {
-                Ok(g) => parts.push(g),
-                Err(e) => {
-                    failed = Some(format!("{}: {e}", p.path));
-                    break;
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| loop {
+                let Some(item) = queue.lock().expect("queue lock").next() else {
+                    return;
+                };
+                if let Some(c) =
+                    evaluate_one(repo, &item, mem_bytes_per_sec, usable_ram, context_tokens)
+                {
+                    out.lock().expect("results lock").push(c);
                 }
-            }
+            });
         }
-        if let Some(why) = failed {
-            eprintln!("  skipped {}: {why}", set.base.quant_label());
-            continue;
-        }
+    });
 
-        let Some(shape) = model::ModelShape::sharded(&parts) else {
-            continue;
-        };
-        let size = set.size().unwrap_or_else(|| shape.total_tensor_bytes());
-        out.push(build(
-            set.base.quant_label(),
-            shard_glob(&set.base.path),
-            size,
-            &shape,
-            mem_bytes_per_sec,
-            usable_ram,
-            context_tokens,
-        ));
-    }
-
+    let mut out = out.into_inner().expect("results lock");
+    // Sort here rather than relying on arrival order, which is now nondeterministic.
     out.sort_by_key(|c| c.size_bytes);
     Ok(out)
+}
+
+/// One unit of work for the sweep.
+enum Work<'a> {
+    Whole(&'a hub::RepoFile),
+    Split(&'a hub::ShardSet),
+}
+
+/// Evaluate one quantization, whether it ships as one file or several.
+///
+/// Returns `None` when the headers could not be read, having said why on stderr. A wrong
+/// row in this table is worse than a missing one, so nothing is guessed at.
+fn evaluate_one(
+    repo: &str,
+    item: &Work,
+    mem_bytes_per_sec: f64,
+    usable_ram: u64,
+    context_tokens: u64,
+) -> Option<Candidate> {
+    match item {
+        Work::Whole(f) => {
+            let g = match read_header(repo, &f.path) {
+                Ok(g) => g,
+                Err(e) => {
+                    eprintln!("  skipped {}: {e}", f.quant_label());
+                    return None;
+                }
+            };
+            let shape = g.shape();
+            let size = f.size.unwrap_or_else(|| shape.total_tensor_bytes());
+            Some(build(
+                f.quant_label(),
+                f.path.clone(),
+                size,
+                &shape,
+                mem_bytes_per_sec,
+                usable_ram,
+                context_tokens,
+            ))
+        }
+        Work::Split(set) => {
+            if !set.is_complete() {
+                eprintln!(
+                    "  skipped {}: {} of {} shards present in the repo",
+                    set.base.quant_label(),
+                    set.parts.len(),
+                    set.expected
+                );
+                return None;
+            }
+
+            // Read every part, not just the first. Each shard carries only its own slice
+            // of the tensor directory, so asking part 1 for the model's size or expert
+            // layout gives an answer that is confidently a third of the truth.
+            let mut parts = Vec::with_capacity(set.parts.len());
+            for p in &set.parts {
+                match read_header(repo, &p.path) {
+                    Ok(g) => parts.push(g),
+                    Err(e) => {
+                        eprintln!("  skipped {}: {}: {e}", set.base.quant_label(), p.path);
+                        return None;
+                    }
+                }
+            }
+
+            let shape = model::ModelShape::sharded(&parts)?;
+            let size = set.size().unwrap_or_else(|| shape.total_tensor_bytes());
+            Some(build(
+                set.base.quant_label(),
+                shard_glob(&set.base.path),
+                size,
+                &shape,
+                mem_bytes_per_sec,
+                usable_ram,
+                context_tokens,
+            ))
+        }
+    }
 }
 
 /// A `--include` pattern matching every part of a split model.
