@@ -1,6 +1,6 @@
 [package]
 name = "sift-core"
-description = "Weight-residency engine for running large MoE models in a bounded RAM budget"
+description = "Read a GGUF model's header without downloading it, measure the machine, and estimate what will fit and how fast"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -16,8 +16,23 @@ anyhow.workspace = true
 thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-libc.workspace = true
 memmap2.workspace = true
+
+# `libc` covers every Unix; Windows has no equivalent single crate, so the handful of
+# Win32 entry points the measurement layer needs come from the official bindings. Both are
+# compile-time only — the built binary still has no runtime dependency beyond `curl`.
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Registry",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+] }
 
 [dev-dependencies]
 tempfile = "3"

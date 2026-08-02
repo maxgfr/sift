@@ -20,7 +20,6 @@
 
 use std::fs::File;
 use std::io;
-use std::os::unix::io::AsRawFd;
 use std::path::Path;
 
 /// Page size assumed when aligning buffers. Apple Silicon uses 16 KiB pages, not 4 KiB.
@@ -41,14 +40,7 @@ pub const DEST_ALIGN: usize = 2 * 1024 * 1024;
 /// alignment requirements downstream (Metal's `newBufferWithBytesNoCopy`) are expressed
 /// in real pages.
 pub fn page_size() -> usize {
-    // SAFETY: `sysconf` with a valid name has no preconditions and cannot fail in a way
-    // that matters here; a negative return is handled below.
-    let v = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-    if v > 0 {
-        v as usize
-    } else {
-        ASSUMED_PAGE_SIZE
-    }
+    crate::platform::page_size()
 }
 
 /// How the kernel should treat the page cache for a given file handle.
@@ -67,10 +59,18 @@ pub enum CachePolicy {
 
 /// A weights file opened for explicit positional reads.
 ///
-/// Reads go through `pread`, which takes `&self` and ignores the file cursor, so a single
-/// handle can be shared across threads without synchronisation.
+/// # One handle per thread
+///
+/// Unix `pread` ignores the file cursor, so sharing a handle across threads is safe
+/// there. **Windows `seek_read` moves it**, so two threads on one handle would silently
+/// read each other's offsets and report a throughput figure from a pattern nobody asked
+/// for. Rather than make that difference a `cfg` the caller has to remember, every
+/// concurrent reader here gets its own handle via [`Self::try_clone`]. It costs one
+/// `open` per thread and removes the class of bug entirely.
 pub struct WeightFile {
     file: File,
+    path: std::path::PathBuf,
+    policy: CachePolicy,
     len: u64,
 }
 
@@ -84,24 +84,27 @@ impl WeightFile {
     /// the single most common way to publish a wrong number — you end up measuring RAM.
     /// Use a file the machine has not touched, or reboot.
     pub fn open(path: impl AsRef<Path>, policy: CachePolicy) -> io::Result<Self> {
-        let file = File::open(path.as_ref())?;
+        let path = path.as_ref().to_path_buf();
+        let file = match policy {
+            CachePolicy::Uncached => crate::platform::open_uncached(&path)?,
+            CachePolicy::Cached => crate::platform::open_cached(&path)?,
+        };
         let len = file.metadata()?.len();
+        Ok(Self {
+            file,
+            path,
+            policy,
+            len,
+        })
+    }
 
-        if policy == CachePolicy::Uncached {
-            let fd = file.as_raw_fd();
-            // SAFETY: `fd` is a live descriptor owned by `file` for the duration of this
-            // call. Both commands take an int argument and only affect caching policy;
-            // failure is advisory, so the result is deliberately not propagated.
-            unsafe {
-                // Do not retain these pages in the unified buffer cache.
-                libc::fcntl(fd, libc::F_NOCACHE, 1);
-                // Disable kernel readahead. Once we schedule our own reads, readahead
-                // competes with us and spends bandwidth on a pattern it mispredicts.
-                libc::fcntl(fd, libc::F_RDAHEAD, 0);
-            }
-        }
-
-        Ok(Self { file, len })
+    /// Open a second, independent handle to the same file under the same policy.
+    ///
+    /// Not `File::try_clone`: that duplicates the descriptor, and a duplicate **shares the
+    /// underlying file pointer**, which is exactly what makes concurrent `seek_read`
+    /// unsafe on Windows. A fresh `open` is what gives each thread a cursor of its own.
+    pub fn try_clone(&self) -> io::Result<Self> {
+        Self::open(&self.path, self.policy)
     }
 
     /// Total file length in bytes.
@@ -116,11 +119,10 @@ impl WeightFile {
 
     /// Read exactly `buf.len()` bytes at `offset`.
     ///
-    /// Takes `&self`: `pread` does not touch the shared file cursor, so concurrent calls
-    /// on one handle are safe and are the intended usage.
+    /// Takes `&self` because a single-threaded caller needs no more. For concurrent
+    /// readers, give each thread its own [`Self::try_clone`] handle — see the type docs.
     pub fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
-        use std::os::unix::fs::FileExt;
-        self.file.read_exact_at(buf, offset)
+        crate::platform::read_exact_at(&self.file, buf, offset)
     }
 }
 
@@ -223,19 +225,68 @@ mod tests {
         f.write_all(&data).expect("write");
         f.flush().expect("flush");
 
-        let wf = WeightFile::open(f.path(), CachePolicy::Uncached).expect("open");
+        // Cached on purpose. What this test pins down — that a positional read does not
+        // advance a shared cursor — is orthogonal to caching, and the uncached path has
+        // sector-alignment requirements on Windows that would only obscure the point.
+        let wf = WeightFile::open(f.path(), CachePolicy::Cached).expect("open");
         assert_eq!(wf.len(), 8192);
 
-        // Read the same range twice: pread must not advance any shared cursor.
         let mut a = [0u8; 64];
         let mut b = [0u8; 64];
         wf.read_at(&mut a, 1024).expect("read a");
         wf.read_at(&mut b, 1024).expect("read b");
         assert_eq!(
             a, b,
-            "repeated pread at one offset must return identical bytes"
+            "repeated positional read at one offset must return identical bytes"
         );
         assert_eq!(a[..], data[1024..1088]);
+    }
+
+    #[test]
+    fn an_uncached_handle_reads_the_same_bytes_a_cached_one_does() {
+        // The cache policy must not change what comes back — only what the kernel retains.
+        // Offset, length and buffer are all sector-aligned, which is what the unbuffered
+        // path requires on Windows.
+        let mut f = tempfile::NamedTempFile::new().expect("temp file");
+        let data: Vec<u8> = (0..=255u8).cycle().take(64 * 1024).collect();
+        f.write_all(&data).expect("write");
+        f.flush().expect("flush");
+
+        let mut cached = AlignedBuf::new(4096);
+        let mut uncached = AlignedBuf::new(4096);
+        WeightFile::open(f.path(), CachePolicy::Cached)
+            .expect("open cached")
+            .read_at(cached.as_mut_slice(), 8192)
+            .expect("cached read");
+        WeightFile::open(f.path(), CachePolicy::Uncached)
+            .expect("open uncached")
+            .read_at(uncached.as_mut_slice(), 8192)
+            .expect("uncached read");
+
+        assert_eq!(cached.as_slice(), uncached.as_slice());
+        assert_eq!(cached.as_slice(), &data[8192..8192 + 4096]);
+    }
+
+    #[test]
+    fn a_cloned_handle_reads_independently_of_the_original() {
+        // Concurrent readers rely on this: each thread gets its own handle so that
+        // Windows' cursor-moving `seek_read` cannot corrupt a neighbour's offsets.
+        let mut f = tempfile::NamedTempFile::new().expect("temp file");
+        let data: Vec<u8> = (0..=255u8).cycle().take(16384).collect();
+        f.write_all(&data).expect("write");
+        f.flush().expect("flush");
+
+        let a = WeightFile::open(f.path(), CachePolicy::Cached).expect("open");
+        let b = a.try_clone().expect("clone");
+        assert_eq!(a.len(), b.len());
+
+        let mut from_a = [0u8; 32];
+        let mut from_b = [0u8; 32];
+        b.read_at(&mut from_b, 4096).expect("read b");
+        a.read_at(&mut from_a, 0).expect("read a");
+
+        assert_eq!(from_a[..], data[0..32], "b's read must not have moved a");
+        assert_eq!(from_b[..], data[4096..4128]);
     }
 
     #[test]

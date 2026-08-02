@@ -1,6 +1,6 @@
 [package]
 name = "sift-bench"
-description = "Benchmark harness comparing sift against LM Studio on the same machine"
+description = "Calibration harness: measure a real engine to check sift's estimates against"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

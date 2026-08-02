@@ -1,6 +1,6 @@
 [package]
 name = "sift-cli"
-description = "CLI for sift — run large MoE models in a bounded RAM budget"
+description = "Will this model fit and run fast on your machine? Answered before you download it"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
