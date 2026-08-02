@@ -81,6 +81,12 @@ between an estimate and an answer, and it cannot be done from a browser tab.
 brew install maxgfr/tap/sift
 ```
 
+macOS and Linux, Apple Silicon / arm64 / x86-64. Homebrew has a `sift` of its own — a grep
+alternative — so install it tap-qualified as above; the two cannot be linked at once.
+
+On Windows, take `sift-windows-x64.exe` from the
+[latest release](https://github.com/maxgfr/sift/releases/latest).
+
 Or `cargo build --release` — Rust 1.85+, no runtime dependencies beyond `curl`.
 
 ## Commands

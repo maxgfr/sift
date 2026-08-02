@@ -63,8 +63,11 @@ Roughly in order of how much they improve the answer.
       re-reads on every invocation and takes ~2 minutes for 25 quants.
 - [ ] Parallelise the `fit` sweep. It is entirely network-bound and entirely serial.
 - [ ] Safetensors support, so non-GGUF repos are not a dead end.
-- [ ] Homebrew formula in `maxgfr/homebrew-tap` plus a release workflow building
+- [x] Homebrew formula in `maxgfr/homebrew-tap` plus a release workflow building
       macOS/Linux/Windows binaries. Cron hour 19 UTC is free; 0–18 are taken.
+- [ ] Windows on ARM (`aarch64-pc-windows-msvc`). The `windows-11-arm` runner exists, so
+      this is one matrix row — held back only because nothing here has been run on that
+      hardware, and shipping an unverified binary is worse than shipping none.
 
 ## Known wrong
 
