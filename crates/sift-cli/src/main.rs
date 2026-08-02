@@ -678,14 +678,18 @@ fn cmd_doctor(disk_sample: Option<PathBuf>, json: bool) -> Result<()> {
 }
 
 fn cmd_inspect(src: &Source, list_tensors: bool, json: bool) -> Result<()> {
-    let (g, fetched) = src.read_gguf()?;
+    let (shape, fetched) = src.read_shape()?;
+    // GGUF carries a format version and per-tensor dtypes that safetensors does not, so
+    // those lines appear only where they exist rather than being filled with a placeholder.
+    let gguf = (src.format() == sift_core::engine::Format::Gguf)
+        .then(|| src.read_gguf().map(|(g, _)| g))
+        .transpose()?;
 
     // Payload size is authoritative for remote files: the server's Content-Length covers
     // the whole file, but only the directory was read.
-    let payload = g.total_tensor_bytes();
+    let payload = shape.total_tensor_bytes();
 
     if json {
-        let shape = g.shape();
         let moe = model::infer_moe_shape(&shape).map(|m| {
             serde_json::json!({
                 "layers": m.moe_layers,
@@ -710,9 +714,10 @@ fn cmd_inspect(src: &Source, list_tensors: bool, json: bool) -> Result<()> {
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
                 "model": src.label(),
-                "gguf_version": g.version,
-                "architecture": g.architecture(),
-                "tensor_count": g.tensors.len(),
+                "format": src.format(),
+                "gguf_version": gguf.as_ref().map(|g| g.version),
+                "architecture": shape.architecture(),
+                "tensor_count": shape.tensors().len(),
                 "tensor_payload_bytes": payload,
                 "parameters": shape.total_parameters(),
                 "bits_per_weight": shape.bits_per_weight(),
@@ -721,11 +726,10 @@ fn cmd_inspect(src: &Source, list_tensors: bool, json: bool) -> Result<()> {
                 "bytes_read_over_http": fetched,
                 "moe": moe,
                 "kv_cache": kv,
-                "tensors": list_tensors.then(|| g.tensors.iter().map(|t| serde_json::json!({
+                "tensors": list_tensors.then(|| shape.tensors().iter().map(|t| serde_json::json!({
                     "name": t.name,
-                    "dtype": t.dtype.name(),
                     "dims": t.dims,
-                    "size_bytes": t.size_bytes(),
+                    "size_bytes": t.size_bytes,
                 })).collect::<Vec<_>>()),
             }))?
         );
@@ -733,12 +737,16 @@ fn cmd_inspect(src: &Source, list_tensors: bool, json: bool) -> Result<()> {
     }
 
     println!("{}", src.label());
-    println!("  gguf version     {}", g.version);
+    if let Some(g) = &gguf {
+        println!("  gguf version     {}", g.version);
+    } else {
+        println!("  format           safetensors");
+    }
     println!(
         "  architecture     {}",
-        g.architecture().unwrap_or("unknown")
+        shape.architecture().unwrap_or("unknown")
     );
-    println!("  tensors          {}", g.tensors.len());
+    println!("  tensors          {}", shape.tensors().len());
     println!("  tensor payload   {:.2} GiB", sift_core::gib(payload));
     match fetched {
         // Zero bytes over a remote source means the cached header was revalidated with a
@@ -755,7 +763,7 @@ fn cmd_inspect(src: &Source, list_tensors: bool, json: bool) -> Result<()> {
         None => println!("  read from disk   directory only, payload untouched"),
     }
 
-    match model::infer_moe_shape(&g.shape()) {
+    match model::infer_moe_shape(&shape) {
         Some(shape) => {
             println!("\nmixture of experts");
             println!("  moe layers       {}", shape.moe_layers);
@@ -774,8 +782,14 @@ fn cmd_inspect(src: &Source, list_tensors: bool, json: bool) -> Result<()> {
                 sift_core::gib(shape.total_expert_bytes())
             );
 
-            // Show the access pattern that motivates a repacked container.
-            if let Ok(r) = model::expert_ranges(&g, 0, 0) {
+            // Show the access pattern that motivates a repacked container. GGUF only:
+            // byte ranges are addressable within a file, and this is the format whose
+            // offsets we hold.
+            if let Ok(r) = gguf
+                .as_ref()
+                .context("expert ranges need a GGUF file")
+                .and_then(|g| Ok(model::expert_ranges(g, 0, 0)?))
+            {
                 println!(
                     "\n  layer 0 expert 0 spans 3 ranges, contiguous: {}",
                     if r.is_contiguous() {
@@ -791,16 +805,8 @@ fn cmd_inspect(src: &Source, list_tensors: bool, json: bool) -> Result<()> {
 
     if list_tensors {
         println!("\ntensors");
-        for t in &g.tensors {
-            println!(
-                "  {:<44} {:<8} {:>14?}  {:>12}",
-                t.name,
-                t.dtype.name(),
-                t.dims,
-                t.size_bytes()
-                    .map(|b| b.to_string())
-                    .unwrap_or_else(|| "?".into())
-            );
+        for t in shape.tensors() {
+            println!("  {:<52} {:>14?}  {:>12}", t.name, t.dims, t.size_bytes);
         }
     }
 
@@ -808,12 +814,12 @@ fn cmd_inspect(src: &Source, list_tensors: bool, json: bool) -> Result<()> {
 }
 
 fn cmd_plan(src: &Source, hit_rate: f64, json: bool) -> Result<()> {
-    let (g, _) = src.read_gguf()?;
-    let shape = model::infer_moe_shape(&g.shape())
-        .context("this model has no stacked expert tensors; planning targets MoE models")?;
+    let (model_shape, _) = src.read_shape()?;
+    let shape = model::infer_moe_shape(&model_shape)
+        .context("this model has no expert tensors; planning targets MoE models")?;
 
     // Everything that is not a routed expert is read on every token regardless of routing.
-    let trunk_bytes = g
+    let trunk_bytes = model_shape
         .total_tensor_bytes()
         .saturating_sub(shape.total_expert_bytes());
 

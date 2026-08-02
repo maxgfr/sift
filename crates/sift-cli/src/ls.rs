@@ -70,7 +70,12 @@ fn collect_gguf(dir: &Path, source: &'static str, root: &Path, out: &mut Vec<Loc
                 walk(&path, source, root, depth + 1, out);
                 continue;
             }
-            if path.extension().is_none_or(|e| e != "gguf") {
+            // MLX models ship as safetensors and live in the same libraries, so a scan
+            // for `.gguf` alone reports a partial answer on any machine that has one.
+            let is_weights = path
+                .extension()
+                .is_some_and(|e| e == "gguf" || e == "safetensors");
+            if !is_weights {
                 continue;
             }
             // Vision projectors ship alongside a model and are not one. Listing them as
@@ -203,14 +208,21 @@ pub fn evaluate(
                 Ok(f) => f,
                 Err(e) => return errored(m, e.to_string()),
             };
-            let g = match model::Gguf::parse(&mut file) {
-                Ok(g) => g,
-                // Ollama blobs are not all GGUF, and a corrupt file is a real possibility.
-                // Saying so beats dropping the row silently.
-                Err(e) => return errored(m, e.to_string()),
+            // Ollama blobs are not all GGUF, and a corrupt file is a real possibility.
+            // Saying so beats dropping the row silently.
+            let shape = if m.path.extension().is_some_and(|e| e == "safetensors") {
+                match model::Safetensors::parse(&mut file) {
+                    // A bare safetensors file has no architecture metadata — that lives in
+                    // the repo's config.json — so the KV cache goes uncounted here.
+                    Ok(st) => model::ModelShape::new(Default::default(), st.tensors, 1),
+                    Err(e) => return errored(m, e.to_string()),
+                }
+            } else {
+                match model::Gguf::parse(&mut file) {
+                    Ok(g) => g.shape(),
+                    Err(e) => return errored(m, e.to_string()),
+                }
             };
-
-            let shape = g.shape();
             let (traffic, is_moe) = match model::infer_moe_shape(&shape) {
                 Some(moe) => (
                     TokenTraffic {
