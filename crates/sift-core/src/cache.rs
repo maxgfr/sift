@@ -123,6 +123,80 @@ fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
     std::fs::rename(&tmp, path)
 }
 
+/// What the cache is holding right now.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+pub struct Stats {
+    /// Cached headers. One entry is a body plus its metadata sidecar.
+    pub entries: u64,
+    /// Bytes on disk, both files counted.
+    pub bytes: u64,
+}
+
+/// Measure the cache directory.
+///
+/// Entries are counted by their metadata sidecars, since a body without one is unreadable
+/// and would otherwise be reported as something the cache can serve.
+pub fn stats() -> io::Result<Stats> {
+    match dir() {
+        Some(dir) => stats_in(&dir),
+        None => Ok(Stats::default()),
+    }
+}
+
+/// [`stats`] against an explicit directory.
+///
+/// The path is a parameter so this is testable against a fixture. A test that ran on
+/// `~/.sift/cache` would be measuring — and, for [`clear_in`], deleting — whatever the
+/// developer running it happened to have cached.
+fn stats_in(dir: &Path) -> io::Result<Stats> {
+    let mut s = Stats::default();
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        // Never created, or caching is off. Nothing held is not an error.
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Stats::default()),
+        Err(e) => return Err(e),
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if let Ok(meta) = entry.metadata() {
+            s.bytes += meta.len();
+        }
+        if path.extension().is_some_and(|e| e == "json") {
+            s.entries += 1;
+        }
+    }
+    Ok(s)
+}
+
+/// Delete every cached header, returning what was freed.
+///
+/// # Why this exists rather than an eviction policy
+///
+/// Entries are validated, never expired: a `304` proves a cached header is still the file
+/// on the server, so age alone is not evidence an entry is stale, and evicting on it would
+/// throw away entries that are provably current. What the cache lacks is not a policy but
+/// a bound — it grows with every distinct file inspected — and the honest fix for an
+/// unbounded store whose contents are all equally valid is a command that empties it.
+///
+/// Removes the directory itself, so a partially-written entry from an interrupted run goes
+/// with the rest rather than being skipped for having no sidecar.
+pub fn clear() -> io::Result<Stats> {
+    match dir() {
+        Some(dir) => clear_in(&dir),
+        None => Ok(Stats::default()),
+    }
+}
+
+/// [`clear`] against an explicit directory.
+fn clear_in(dir: &Path) -> io::Result<Stats> {
+    let freed = stats_in(dir)?;
+    match std::fs::remove_dir_all(dir) {
+        Ok(()) => Ok(freed),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Stats::default()),
+        Err(e) => Err(e),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -157,6 +231,51 @@ mod tests {
                 None => std::env::remove_var("SIFT_NO_CACHE"),
             }
         }
+    }
+
+    /// A cache directory holding `n` entries, plus one stray body from an interrupted run.
+    fn fixture(n: usize) -> tempfile::TempDir {
+        let d = tempfile::tempdir().expect("temp dir");
+        for i in 0..n {
+            std::fs::write(d.path().join(format!("{i:016x}.bin")), vec![0u8; 1024]).expect("body");
+            std::fs::write(d.path().join(format!("{i:016x}.json")), r#"{"etag":"x"}"#)
+                .expect("meta");
+        }
+        std::fs::write(d.path().join("deadbeef.bin"), vec![0u8; 512]).expect("orphan");
+        d
+    }
+
+    #[test]
+    fn entries_are_counted_by_what_can_actually_be_served() {
+        // A body whose sidecar never landed cannot be validated, so it is not an entry —
+        // but its bytes are still on the disk and must show in the size.
+        let d = fixture(3);
+        let s = stats_in(d.path()).expect("stats");
+        assert_eq!(s.entries, 3, "the orphaned body is not a servable entry");
+        assert_eq!(s.bytes, 3 * (1024 + 12) + 512, "but its bytes are counted");
+    }
+
+    #[test]
+    fn clearing_reports_what_it_freed_and_leaves_nothing_behind() {
+        let d = fixture(2);
+        let before = stats_in(d.path()).expect("stats");
+        let freed = clear_in(d.path()).expect("clear");
+        assert_eq!(freed, before, "the report is what was actually there");
+        assert_eq!(
+            stats_in(d.path()).expect("stats after"),
+            Stats::default(),
+            "including the orphan, which an entry-by-entry sweep would have skipped"
+        );
+    }
+
+    #[test]
+    fn clearing_an_absent_cache_is_not_an_error() {
+        // `sift cache clear` on a machine that has never fetched a header should say it
+        // freed nothing, not fail.
+        let d = tempfile::tempdir().expect("temp dir");
+        let missing = d.path().join("never-created");
+        assert_eq!(stats_in(&missing).expect("stats"), Stats::default());
+        assert_eq!(clear_in(&missing).expect("clear"), Stats::default());
     }
 
     #[test]

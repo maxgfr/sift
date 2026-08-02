@@ -16,7 +16,7 @@
 //! - **Never recommend something that will thrash.** One confidently wrong recommendation
 //!   costs more trust than ten correct ones earn.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Weight formats an engine can load.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -158,26 +158,11 @@ pub fn detect_installed() -> Vec<Installed> {
     let mut found = Vec::new();
 
     for engine in ENGINES {
-        let candidates: Vec<PathBuf> = match engine.id {
-            "lm-studio" => home
-                .iter()
-                .map(|h| h.join(".lmstudio/bin/lms"))
-                .chain(["/Applications/LM Studio.app".into()])
-                .collect(),
-            "ollama" => which("ollama")
-                .into_iter()
-                .chain(home.iter().map(|h| h.join(".ollama")))
-                .collect(),
-            "llama.cpp" => which("llama-server")
-                .into_iter()
-                .chain(which("llama-cli"))
-                .collect(),
-            "mlx" => which("mlx_lm.generate").into_iter().collect(),
-            "colibri" => which("colibri").into_iter().collect(),
-            _ => Vec::new(),
-        };
-
-        if let Some(path) = candidates.into_iter().find(|p| p.exists()) {
+        if let Some(path) = candidate_paths(engine.id, home.as_deref())
+            .unwrap_or_default()
+            .into_iter()
+            .find(|p| p.exists())
+        {
             found.push(Installed {
                 engine: engine.clone(),
                 found_at: path,
@@ -187,12 +172,68 @@ pub fn detect_installed() -> Vec<Installed> {
     found
 }
 
+/// Where each engine might be, most specific first.
+///
+/// **Every entry must be something that can run a model** — a binary or an application
+/// bundle — and never a data directory. `~/.ollama` was once on this list and is the reason
+/// the rule is written down: `ollama pull` creates it, uninstalling Ollama leaves it
+/// behind, and `sift` went on reporting an engine that was gone and routing models to it.
+/// Detection failing soft means an absent engine reads as "not found here"; it does not
+/// license reporting one that is not there.
+///
+/// Separated from [`detect_installed`] so the list itself is testable without a filesystem
+/// that happens to have these programs on it.
+///
+/// `None` means no rule exists for this id — distinct from `Some(vec![])`, which means
+/// there is a rule and this machine matched none of it. Without that distinction an engine
+/// added to [`ENGINES`] and forgotten here would be undetectable, and the only symptom
+/// would be `(NOT installed)` printed on a machine that has it.
+fn candidate_paths(id: &str, home: Option<&Path>) -> Option<Vec<PathBuf>> {
+    let paths: Vec<PathBuf> = match id {
+        "lm-studio" => home
+            .iter()
+            .map(|h| h.join(".lmstudio/bin/lms"))
+            .chain(["/Applications/LM Studio.app".into()])
+            .collect(),
+        "ollama" => which("ollama")
+            .into_iter()
+            .chain([
+                PathBuf::from("/Applications/Ollama.app"),
+                PathBuf::from("/usr/local/bin/ollama"),
+                PathBuf::from("/opt/homebrew/bin/ollama"),
+            ])
+            // Windows installs per-user, off `PATH` for processes that started before it.
+            // Absent elsewhere, so this simply drops out rather than needing a `cfg`.
+            .chain(local_app_data().map(|d| d.join("Programs/Ollama/ollama.exe")))
+            .collect(),
+        "llama.cpp" => which("llama-server")
+            .into_iter()
+            .chain(which("llama-cli"))
+            .collect(),
+        "mlx" => which("mlx_lm.generate").into_iter().collect(),
+        "colibri" => which("colibri").into_iter().collect(),
+        _ => return None,
+    };
+    Some(paths)
+}
+
 /// Locate an executable on `PATH`.
+///
+/// Also tries the `.exe` spelling, since Windows installers put the binary on `PATH` under
+/// a name this lookup would otherwise miss — the same false negative for every engine.
 fn which(bin: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     std::env::split_paths(&path)
-        .map(|d| d.join(bin))
+        .flat_map(|d| [d.join(bin), d.join(format!("{bin}.exe"))])
         .find(|p| p.is_file())
+}
+
+/// `%LOCALAPPDATA%`, where Windows installers put per-user programs.
+///
+/// Returns `None` elsewhere, so the Windows-only paths simply drop out of the candidate
+/// list on Unix rather than needing a `cfg` here.
+fn local_app_data() -> Option<PathBuf> {
+    std::env::var_os("LOCALAPPDATA").map(PathBuf::from)
 }
 
 /// A routing recommendation.
@@ -415,5 +456,60 @@ mod tests {
     fn at_least_one_engine_can_handle_oversized_models() {
         // If this ever fails, every oversized recommendation silently becomes "nothing".
         assert!(ENGINES.iter().any(|e| e.oversized == Oversized::Streams));
+    }
+
+    #[test]
+    fn a_data_directory_is_never_treated_as_an_installed_engine() {
+        // The regression this pins. `~/.ollama` holds pulled models; it survives an
+        // uninstall, and `ollama pull` on a machine that later removes Ollama leaves it
+        // there forever. Detecting on it reported an engine that could not run anything —
+        // and `route` then recommended it over one that was actually present.
+        let home = PathBuf::from("/home/someone");
+        let paths = candidate_paths("ollama", Some(&home)).expect("ollama has a rule");
+        assert!(
+            !paths.iter().any(|p| p.ends_with(".ollama")),
+            "a data directory is not an engine: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn every_candidate_path_is_something_that_can_run_a_model() {
+        // The general form of the rule, applied to every engine so a new row cannot
+        // reintroduce the same mistake under a different name. A runnable candidate is a
+        // binary or an application bundle — never a dotfile directory.
+        let home = PathBuf::from("/home/someone");
+        for engine in ENGINES {
+            for path in candidate_paths(engine.id, Some(&home)).unwrap_or_default() {
+                let name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or_default()
+                    .to_ascii_lowercase();
+                assert!(
+                    !name.starts_with('.'),
+                    "{}: {} is a data directory, not a program",
+                    engine.id,
+                    path.display()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_engine_in_the_registry_is_looked_for_somewhere() {
+        // A registry entry with no detection rule can never be reported as installed, so
+        // `route` would print "(NOT installed)" on a machine that has it and send the user
+        // to an install page for software they already run. Asserted on the rule existing
+        // rather than on paths being found, so the test says the same thing on a CI runner
+        // with none of these programs as on a developer machine with all of them.
+        let home = PathBuf::from("/home/someone");
+        for engine in ENGINES {
+            assert!(
+                candidate_paths(engine.id, Some(&home)).is_some(),
+                "{} is in the registry but nothing looks for it",
+                engine.id
+            );
+        }
+        assert_eq!(candidate_paths("not-an-engine", Some(&home)), None);
     }
 }
