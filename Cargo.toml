@@ -1,0 +1,40 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/sift-core",
+    "crates/sift-cli",
+    "crates/sift-bench",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/maxgfr/sift"
+homepage = "https://github.com/maxgfr/sift"
+authors = ["maxgfr"]
+
+[workspace.dependencies]
+sift-core = { path = "crates/sift-core", version = "0.1.0" }
+
+anyhow = "1"
+thiserror = "2"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+libc = "0.2"
+memmap2 = "0.9"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+
+# Benchmarks and doctor measurements are meaningless under a debug profile.
+# `cargo run --profile bench-fast` gives release codegen with debug symbols.
+[profile.bench-fast]
+inherits = "release"
+debug = true
+panic = "unwind"
