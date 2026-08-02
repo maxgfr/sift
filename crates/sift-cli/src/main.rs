@@ -28,13 +28,17 @@ const DEFAULT_CONTEXT_TOKENS: u64 = 4096;
 ///
 /// Three sources, in descending order of how much they are worth trusting:
 ///
-/// 1. A platform-reported accelerator ceiling. Hard, and it binds first where it exists.
+/// 1. A platform-reported ceiling on host memory. Hard, and it binds first where it exists.
 /// 2. What the OS says is available right now, which on Linux and Windows is a real
 ///    figure and accounts for whatever else is running.
 /// 3. Physical RAM minus a flat reserve. An estimate, and the weakest of the three —
 ///    which is exactly why `sift doctor` measures the machine rather than stopping here.
+///
+/// A discrete GPU's VRAM is **not** one of the three. It is a separate pool, not a ceiling
+/// on what the host may allocate, so adding it here would tell someone with a 24 GB card
+/// and 16 GB of RAM that a 20 GB model fits in memory. `doctor` reports it and says so.
 fn usable_ram(facts: &MachineFacts) -> u64 {
-    if let Some(ceiling) = facts.accel_memory.bytes() {
+    if let Some(ceiling) = facts.accel_memory.host_ceiling_bytes() {
         return ceiling;
     }
     let estimate = facts.ram_bytes.saturating_sub(OS_RESERVE_BYTES);
@@ -167,6 +171,16 @@ enum Command {
         json: bool,
     },
 
+    /// Inspect or empty the cache of fetched model headers.
+    Cache {
+        /// Delete every cached header.
+        #[arg(long)]
+        clear: bool,
+        /// Emit JSON instead of a human-readable report.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Show what a model would cost per token, and the resulting speed ceilings.
     Plan {
         /// A .gguf path, an `org/repo`, an `org/repo:QUANT`, or a URL.
@@ -223,7 +237,63 @@ fn main() -> Result<()> {
             json,
         ),
         Command::Engines { json } => cmd_engines(json),
+        Command::Cache { clear, json } => cmd_cache(clear, json),
     }
+}
+
+/// Report what the header cache holds, and empty it on request.
+///
+/// The cache is validated rather than expiring — a `304` proves an entry is still the file
+/// on the server — so nothing here evicts on age. What it needed was a bound and a way to
+/// see it, since `~/.sift/cache` otherwise grows quietly with every file ever inspected.
+fn cmd_cache(clear: bool, json: bool) -> Result<()> {
+    let dir = sift_core::cache::dir();
+    let stats = if clear {
+        sift_core::cache::clear().context("could not empty the cache")?
+    } else {
+        sift_core::cache::stats().context("could not read the cache")?
+    };
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "directory": dir.as_ref().map(|d| d.display().to_string()),
+                // Under `--clear` these are what was removed, not what remains. Named so a
+                // consumer cannot read one as the other.
+                "cleared": clear,
+                "entries": stats.entries,
+                "bytes": stats.bytes,
+                "enabled": dir.is_some(),
+            }))?
+        );
+        return Ok(());
+    }
+
+    match &dir {
+        Some(d) => println!("cache  {}", d.display()),
+        // The only way `dir()` is None with HOME set.
+        None => println!("cache  disabled by SIFT_NO_CACHE"),
+    }
+    if clear {
+        println!(
+            "  cleared {} entries, {:.2} MiB freed",
+            stats.entries,
+            sift_core::mib(stats.bytes)
+        );
+    } else {
+        println!(
+            "  {} entries, {:.2} MiB",
+            stats.entries,
+            sift_core::mib(stats.bytes)
+        );
+        println!(
+            "\n  Entries are validated by ETag, never expired: a 304 proves a cached header\n  \
+             is still the file on the server, so nothing here goes stale. Empty it with\n  \
+             `sift cache --clear` when you want the space back."
+        );
+    }
+    Ok(())
 }
 
 fn cmd_fit(repo: &str, context_tokens: u64, json: bool) -> Result<()> {
@@ -568,13 +638,27 @@ fn cmd_doctor(disk_sample: Option<PathBuf>, json: bool) -> Result<()> {
              {:>19}Raise with: sudo sysctl iogpu.wired_limit_mb=<MB>",
             "", ""
         ),
+        // Reported, and reported as a *separate pool*. Folding it into usable memory would
+        // be the mistake that has competing tools telling a 16 GB laptop with a 24 GB card
+        // that a 20 GB model fits in RAM.
+        AccelMemory::Discrete { bytes, vendor } => println!(
+            "  gpu vram         {:.1} GiB ({vendor})\n\
+             {:>19}Not counted toward `fits`: this is a separate pool, not a ceiling\n\
+             {:>19}on host memory. sift plans what fits in RAM, so on this machine it\n\
+             {:>19}is conservative for anything you offload to the card.",
+            sift_core::gib(bytes),
+            "",
+            "",
+            ""
+        ),
         // Say it plainly. A tool that silently substitutes a guess here is the reason
         // competing tools report a 4 GB card as an 8 GB one.
         AccelMemory::Unknown => println!(
-            "  accelerator      not measured on this platform.\n\
-             {:>19}sift is using host memory only; if you have a discrete GPU, its\n\
-             {:>19}VRAM is not accounted for and `fits` will be conservative.",
-            "", ""
+            "  accelerator      none found.\n\
+             {:>19}sift is using host memory only; if you have a discrete GPU that\n\
+             {:>19}was not detected, its VRAM is not accounted for and `fits` will\n\
+             {:>19}be conservative.",
+            "", "", ""
         ),
     }
 
@@ -829,7 +913,7 @@ fn cmd_plan(src: &Source, hit_rate: f64, json: bool) -> Result<()> {
     };
 
     if json {
-        let mem = doctor::measure_memory_bandwidth(256 << 20, 4);
+        let mem = doctor::measure_read_bandwidth(doctor::BANDWIDTH_BUF_BYTES, 3);
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
@@ -847,7 +931,8 @@ fn cmd_plan(src: &Source, hit_rate: f64, json: bool) -> Result<()> {
                 },
                 // Stated in the payload, not only in the prose, so a consumer that never
                 // reads the human output cannot mistake a roofline for a prediction.
-                "note": "roofline ceilings, not predictions; real MoE decode lands at 25-35% of them",
+                "note": "roofline ceilings, not predictions; measured MoE decode lands at \
+                         ~76% of the resident figure",
             }))?
         );
         return Ok(());
@@ -867,7 +952,11 @@ fn cmd_plan(src: &Source, hit_rate: f64, json: bool) -> Result<()> {
     );
     println!("  total cold       {:.3} GB", traffic.total() as f64 / 1e9);
 
-    let mem = doctor::measure_memory_bandwidth(256 << 20, 4);
+    // Read bandwidth, not the copy figure. Decode streams weights in and writes back a
+    // small activation, and a copy moves a byte each way — so a copy-based roofline is not
+    // merely conservative, it is below what an engine actually reaches. This line used to
+    // print 70 tok/s as the "ceiling" for a model LM Studio decodes at 129.
+    let mem = doctor::measure_read_bandwidth(doctor::BANDWIDTH_BUF_BYTES, 3);
     println!("\nceilings at hit rate {:.0}%", hit_rate * 100.0);
     println!(
         "  resident  @ {:>6.1} GB/s measured memory : {:>6.1} tok/s",
@@ -880,8 +969,10 @@ fn cmd_plan(src: &Source, hit_rate: f64, json: bool) -> Result<()> {
         traffic.tokens_per_sec(6.15e9, hit_rate)
     );
     println!(
-        "\n  These are roofline ceilings, not predictions. Real MoE decode lands at\n  \
-         25-35% of them because expert gather is scattered. Measure, do not assume."
+        "\n  These are roofline ceilings, not predictions. The one MoE model measured on a\n  \
+         real engine reached {:.0}% of the resident figure — `sift fit` applies that factor,\n  \
+         this command does not. Measure your own with `sift bench`.",
+        fit::MOE_EFFICIENCY * 100.0
     );
 
     Ok(())

@@ -23,9 +23,13 @@
 //!
 //! # Why results are persisted
 //!
-//! Two hand-set efficiency factors decide every tok/s figure `sift` prints. One is now
-//! calibrated and one is still a guess. A measurement kept only in a terminal scrollback
-//! cannot replace either, so every run is appended to `~/.sift/bench.jsonl`.
+//! Two hand-set efficiency factors decide every tok/s figure `sift` prints, and both are
+//! now fitted to runs taken here. A measurement kept only in a terminal scrollback cannot
+//! replace a constant later, so every run is appended to `~/.sift/bench.jsonl`.
+//!
+//! That log is what caught the larger of the two errors. The MoE factor was a guess of 0.28
+//! reasoned from "expert gather is scattered"; a single OLMoE run against it read 129 tok/s
+//! where the estimator said 46. See [`crate::fit::MOE_EFFICIENCY`].
 
 use anyhow::{bail, Context, Result};
 use std::path::PathBuf;

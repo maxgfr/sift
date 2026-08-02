@@ -41,6 +41,13 @@ pub struct Candidate {
     pub kv_bytes: u64,
     /// Files this quantization ships as. 1 for the ordinary case.
     pub shard_count: u32,
+    /// Weight format, carried per candidate rather than assumed for the repo.
+    ///
+    /// The engine recommendation depends on it: mlx-lm reads safetensors and llama.cpp does
+    /// not. Assuming GGUF here told anyone running `sift fit` on a safetensors repo to open
+    /// it with LM Studio, which cannot — a confidently wrong answer of exactly the kind
+    /// routing exists to prevent.
+    pub format: Format,
 }
 
 impl Candidate {
@@ -112,19 +119,48 @@ impl Candidate {
 /// single-threaded STREAM *copy*. Decode is read-dominated and one core cannot saturate an
 /// Apple Silicon bus, so that benchmark understated the machine and 0.80 was silently
 /// absorbing the error. See [`sift_core::doctor::measure_read_bandwidth`].
+///
+/// Re-measured when [`MOE_EFFICIENCY`] was calibrated: 21.11 tok/s, which reproduces the
+/// original 21.03 to within 0.4%, against a bandwidth reading of 135.4 GB/s that session —
+/// arithmetically 0.88. Left at 0.90, because the difference is smaller than the spread of
+/// the ruler itself: the same machine reads 135 GB/s idle and 115 GB/s with a model
+/// resident, and `fit` measures live, so a second digit here would be false precision.
 pub const DENSE_EFFICIENCY: f64 = 0.90;
 
 /// The same fraction for mixture-of-experts decode.
 ///
-/// **Not calibrated.** MoE decode is lower than dense because expert gather is scattered
-/// rather than streamed, but no MoE model has been measured on this machine, so this is
-/// a judgement carried forward.
+/// **Calibrated, and the calibration was the largest correction this tool has made.** LM
+/// Studio decoding OLMoE-1B-7B Q4_K_M on an M5: 129.10 tok/s median over three 415-token
+/// runs, 0.799 GB of weight traffic per token, so 103.1 GB/s effective against 135.4 GB/s
+/// of read bandwidth — median of seven runs, 132.1 to 136.0, machine idle — so **0.76 of
+/// the ceiling.**
 ///
-/// It has been rescaled to preserve the predictions the old copy-based basis produced —
-/// 0.35 of ~103 GB/s copy is 0.28 of ~128 GB/s read — so switching rulers did not silently
-/// move every MoE estimate. Rescaling a guess leaves a guess; it is marked as such wherever
-/// it is printed, and replacing it is the open half of the predicted-versus-measured work.
-pub const MOE_EFFICIENCY: f64 = 0.28;
+/// Taking it exposed a bug in the ruler first. `sift ls` was reporting 306 tok/s for the
+/// model measured here at 129, because [`sift_core::doctor::measure_read_bandwidth`] would
+/// intermittently return 372 GB/s on a bus that peaks near 153. Calibrating against that
+/// would have produced a confidently wrong constant, which is the argument for checking a
+/// prediction against a real engine rather than against a benchmark of your own.
+///
+/// The figure it replaces was 0.28, so every MoE estimate was low by 2.8×: `sift ls` called
+/// that model 46 tok/s where the engine delivers 129.
+///
+/// The guess was wrong because its premise was. "Expert gather is scattered, so MoE decode
+/// cannot stream" is true of the *addresses* and false of the *bytes*: one expert here is
+/// 3.81 MB of contiguous weights, and eight of them per layer is eight large sequential
+/// reads, not a random walk. Scattered megabytes stream at nearly the same rate as
+/// sequential ones. A model with far smaller experts would gather less efficiently, and
+/// this constant would then be optimistic — which is the honest limit of one data point.
+///
+/// Measured the same way as [`DENSE_EFFICIENCY`], against the same ruler in the same
+/// session, so the two are comparable: dense re-measured at 21.11 tok/s that day, 118.6
+/// GB/s effective, 0.88 of the same 135.4. MoE decode is therefore ~87% as efficient as
+/// dense on this machine, not ~31% as the old pair of constants claimed.
+///
+/// Both constants are fitted against `sift`'s own traffic model, which counts the token
+/// embedding table as read every token when only one row of it is. That bias is small
+/// (~7% here) and is absorbed by the constant rather than left to cancel by luck — which
+/// is also why these two numbers must always be re-derived together if that model changes.
+pub const MOE_EFFICIENCY: f64 = 0.76;
 
 /// Evaluate every quantization a repo offers, at a given context length.
 pub fn evaluate(
@@ -222,6 +258,7 @@ fn evaluate_one(
                 f.path.clone(),
                 size,
                 &shape,
+                format_of(&f.path),
                 mem_bytes_per_sec,
                 usable_ram,
                 context_tokens,
@@ -255,6 +292,7 @@ fn evaluate_one(
                 shard_glob(&set.base.path),
                 size,
                 &shape,
+                format_of(&set.base.path),
                 mem_bytes_per_sec,
                 usable_ram,
                 context_tokens,
@@ -342,12 +380,25 @@ fn fetch_config(repo: &str) -> Option<serde_json::Value> {
 ///
 /// Shared by the single-file and split paths so the two cannot drift. A split model that
 /// scored differently from the same weights in one file would be a bug nobody would spot.
+/// The weight format a repo file is in, from its extension.
+///
+/// The same rule `Source::format` applies, kept to one line here because the sweep sees
+/// repo paths rather than resolved sources.
+fn format_of(path: &str) -> Format {
+    if path.ends_with(".safetensors") {
+        Format::Safetensors
+    } else {
+        Format::Gguf
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build(
     label: String,
     download_arg: String,
     size: u64,
     shape: &model::ModelShape,
+    format: Format,
     mem_bytes_per_sec: f64,
     usable_ram: u64,
     context_tokens: u64,
@@ -403,6 +454,7 @@ fn build(
         is_moe,
         bits_per_weight: shape.bits_per_weight(),
         kv_bytes,
+        format,
     }
 }
 
@@ -560,10 +612,10 @@ pub fn report(
 
     match best {
         Some(c) => {
-            let format = Format::Gguf;
             // Route on the footprint, so an engine is not recommended for a model that
-            // only fits with an empty context.
-            let rec = engine::route(c.footprint_bytes(), format, usable_ram, installed);
+            // only fits with an empty context — and on the candidate's own format, so a
+            // safetensors repo is not sent to an engine that only reads GGUF.
+            let rec = engine::route(c.footprint_bytes(), c.format, usable_ram, installed);
             println!("\n  recommended: {}", c.label);
             if let Some(e) = &rec.engine {
                 println!("    engine     {} — {}", e.name, rec.reason);
@@ -600,7 +652,7 @@ pub fn report(
             let smallest = cands.first().context("no candidates")?;
             let rec = engine::route(
                 smallest.footprint_bytes(),
-                Format::Gguf,
+                smallest.format,
                 usable_ram,
                 installed,
             );
@@ -652,6 +704,7 @@ mod tests {
             // accounted for in whatever the caller passed.
             kv_bytes: 0,
             shard_count: 1,
+            format: Format::Gguf,
         }
     }
 
@@ -758,6 +811,90 @@ mod tests {
     }
 }
 
+/// The two efficiency constants, pinned to the measurements they came from.
+///
+/// Both are hand-set numbers that silently multiply every tok/s figure the tool prints, so
+/// each is held against the run it was fitted to. Anyone editing one has to come back here
+/// and say which measurement replaced it — which is the point, since the last time one of
+/// these moved on a hunch it shipped a 2.8× error for months.
+#[cfg(test)]
+mod calibration_tests {
+    use super::*;
+
+    /// Read bandwidth on the calibration machine, idle: median of seven runs spanning
+    /// 132.1 to 136.0 GB/s.
+    const MEASURED_READ_BYTES_PER_SEC: f64 = 135.4e9;
+
+    /// What `sift` predicts for a model of `bytes_per_token` at that bandwidth.
+    fn predicted(bytes_per_token: u64, efficiency: f64) -> f64 {
+        let traffic = TokenTraffic {
+            expert_bytes: 0,
+            trunk_bytes: bytes_per_token,
+        };
+        traffic.tokens_per_sec(MEASURED_READ_BYTES_PER_SEC * efficiency, 0.0)
+    }
+
+    #[test]
+    fn the_moe_factor_predicts_what_lm_studio_actually_did() {
+        // OLMoE-1B-7B Q4_K_M, LM Studio on an M5: 129.10 tok/s median over three runs of
+        // 415 tokens each, against 798,615,552 bytes of weight traffic per token as
+        // `sift plan` computes it.
+        let predicted = predicted(798_615_552, MOE_EFFICIENCY);
+        let measured = 129.10;
+        let error = (predicted - measured).abs() / measured;
+        assert!(
+            error < 0.05,
+            "predicted {predicted:.1} tok/s against a measured {measured:.1}: {:.1}% out",
+            error * 100.0
+        );
+    }
+
+    #[test]
+    fn the_dense_factor_still_predicts_the_run_it_was_fitted_to() {
+        // Qwen3.5-9B Q4_K_M, same machine, same engine: 21.03 tok/s when the factor was
+        // set, 21.11 when it was re-checked alongside the MoE measurement.
+        let predicted = predicted(5_616_076_800, DENSE_EFFICIENCY);
+        let error = (predicted - 21.07).abs() / 21.07;
+        assert!(
+            error < 0.05,
+            "predicted {predicted:.2} tok/s against a measured 21.07: {:.1}% out",
+            error * 100.0
+        );
+    }
+
+    #[test]
+    fn moe_decode_is_not_assumed_to_be_a_fraction_of_dense() {
+        // The premise behind the old 0.28 was that scattered expert gather cannot stream.
+        // Measurement says otherwise: one expert is megabytes of contiguous weights, and
+        // MoE lands within ~15% of dense efficiency rather than a third of it. This test
+        // exists so that reverting to a "MoE is much slower" intuition fails loudly.
+        //
+        // Checked at compile time rather than at test time: both operands are constants,
+        // so a violation should stop the build rather than wait for someone to run tests.
+        const {
+            assert!(
+                MOE_EFFICIENCY > DENSE_EFFICIENCY * 0.7,
+                "MoE efficiency is implausibly far below dense; the one measurement \
+                 taken says MoE reaches ~87% of it, not a third"
+            );
+            assert!(
+                MOE_EFFICIENCY <= DENSE_EFFICIENCY,
+                "scattered gather cannot beat streaming"
+            );
+        }
+    }
+
+    #[test]
+    fn neither_factor_claims_more_than_the_machine_has() {
+        // A factor above 1.0 would mean decode outruns the memory bus, which is not a
+        // calibration but a broken ruler — the exact failure that produced 369 GB/s in
+        // `doctor` and 138%-of-machine in the first dense fit.
+        for f in [DENSE_EFFICIENCY, MOE_EFFICIENCY] {
+            assert!(f > 0.0 && f <= 1.0, "efficiency {f} is not a fraction");
+        }
+    }
+}
+
 #[cfg(test)]
 mod download_tests {
     use super::*;
@@ -784,5 +921,50 @@ mod download_tests {
     #[test]
     fn a_base_path_without_a_known_extension_still_yields_a_usable_pattern() {
         assert_eq!(shard_glob("Model-Q8_0"), "--include \"Model-Q8_0-*\"");
+    }
+}
+
+#[cfg(test)]
+mod format_tests {
+    use super::*;
+    use sift_core::engine::Installed;
+
+    #[test]
+    fn a_safetensors_repo_is_not_routed_to_a_gguf_only_engine() {
+        // The bug this pins, found by running `sift fit allenai/OLMoE-1B-7B-0924-Instruct`
+        // on a real machine: the sweep hardcoded GGUF when routing, so a safetensors repo
+        // was answered with "use LM Studio", which cannot open one. `route` had already
+        // been taught to dispatch on format; `fit` had its own copy of the call and had
+        // not.
+        let installed: Vec<Installed> = engine::ENGINES
+            .iter()
+            .filter(|e| e.id == "lm-studio" || e.id == "mlx")
+            .map(|e| Installed {
+                engine: e.clone(),
+                found_at: "/test".into(),
+            })
+            .collect();
+
+        let rec = engine::route(4 << 30, Format::Safetensors, 12 << 30, &installed);
+        let chosen = rec.engine.as_ref().expect("something must be recommended");
+        assert!(
+            chosen.formats.contains(&Format::Safetensors),
+            "recommended {} which cannot read safetensors",
+            chosen.name
+        );
+    }
+
+    #[test]
+    fn format_comes_from_the_file_extension_not_the_repo() {
+        // A repo can hold both. Deciding once for the whole sweep would mislabel whichever
+        // kind is in the minority.
+        assert_eq!(
+            format_of("model-00001-of-00003.safetensors"),
+            Format::Safetensors
+        );
+        assert_eq!(format_of("Q4_K_M/Model-Q4_K_M.gguf"), Format::Gguf);
+        // Anything unrecognised stays GGUF, which is what the hub listing is overwhelmingly
+        // made of, and is the format every local engine reads.
+        assert_eq!(format_of("model.bin"), Format::Gguf);
     }
 }
