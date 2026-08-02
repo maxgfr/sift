@@ -24,7 +24,12 @@ use sift_core::model::{self, hf_url, RemoteFile, TokenTraffic};
 /// One evaluated quantization.
 pub struct Candidate {
     pub label: String,
-    pub file: String,
+    /// What to pass `huggingface-cli download` to get this quantization.
+    ///
+    /// A path for a single file, a `--include` glob for a split set. Naming one shard
+    /// would fetch a third of a model that then fails to load, which is a worse outcome
+    /// than no hint at all.
+    pub download_arg: String,
     pub size_bytes: u64,
     pub traffic: TokenTraffic,
     pub regime: Regime,
@@ -34,6 +39,8 @@ pub struct Candidate {
     pub bits_per_weight: Option<f64>,
     /// KV cache bytes at the context this evaluation assumed.
     pub kv_bytes: u64,
+    /// Files this quantization ships as. 1 for the ordinary case.
+    pub shard_count: u32,
 }
 
 impl Candidate {
@@ -175,8 +182,8 @@ pub fn evaluate(
         };
         let size = set.size().unwrap_or_else(|| shape.total_tensor_bytes());
         out.push(build(
-            format!("{} ({} parts)", set.base.quant_label(), set.parts.len()),
-            set.parts[0].path.clone(),
+            set.base.quant_label(),
+            shard_glob(&set.base.path),
             size,
             &shape,
             mem_bytes_per_sec,
@@ -187,6 +194,16 @@ pub fn evaluate(
 
     out.sort_by_key(|c| c.size_bytes);
     Ok(out)
+}
+
+/// A `--include` pattern matching every part of a split model.
+///
+/// Built from the set's base path, so `Q4_K_M/Model-Q4_K_M.gguf` becomes
+/// `--include "Q4_K_M/Model-Q4_K_M-*.gguf"`. Quoted because the shell would otherwise
+/// expand the glob against the local directory before the tool ever sees it.
+fn shard_glob(base_path: &str) -> String {
+    let stem = base_path.strip_suffix(".gguf").unwrap_or(base_path);
+    format!("--include \"{stem}-*.gguf\"")
 }
 
 /// Read one file's header over range requests, touching no payload.
@@ -202,7 +219,7 @@ fn read_header(repo: &str, path: &str) -> Result<sift_core::model::Gguf> {
 #[allow(clippy::too_many_arguments)]
 fn build(
     label: String,
-    file: String,
+    download_arg: String,
     size: u64,
     shape: &model::ModelShape,
     mem_bytes_per_sec: f64,
@@ -251,7 +268,8 @@ fn build(
 
     Candidate {
         label,
-        file,
+        download_arg,
+        shard_count: shape.shard_count,
         size_bytes: size,
         traffic,
         regime,
@@ -311,23 +329,28 @@ pub fn report(
             Some(b) => format!("{b:>6.2}"),
             None => format!("{:>6}", "?"),
         };
+        // Annotations go after the numbers, never inside the label: a label that grows to
+        // "UD-Q2_K_XL (2 parts)" overflows its column and unaligns every row below it.
+        let mut notes = vec![if c.is_moe { "moe" } else { "dense" }.to_string()];
+        if c.shard_count > 1 {
+            notes.push(format!("{} parts", c.shard_count));
+        }
+        if !c.meets_quality_floor() {
+            notes.push("damaged".to_string());
+        }
+
         println!(
-            "  {:<14} {:>6.2} GB {:>8} {} {:>11.3} {}  {}{}",
+            "  {:<14} {:>6.2} GB {:>8} {} {:>11.3} {}  {}",
             c.label,
             c.size_bytes as f64 / 1e9,
             fits,
             bpw,
-            c.traffic.total() as f64 / 1e9,
-            tps,
             // Worth showing: a MoE row's GB/token is far below its file size, and that gap
             // is the whole reason these models are fast. Hiding it makes the table look
             // like an arithmetic error.
-            if c.is_moe { "moe" } else { "dense" },
-            if c.meets_quality_floor() {
-                ""
-            } else {
-                "  damaged"
-            }
+            c.traffic.total() as f64 / 1e9,
+            tps,
+            notes.join(", ")
         );
     }
 
@@ -367,7 +390,10 @@ pub fn report(
                     ""
                 );
             }
-            println!("    download   huggingface-cli download {repo} {}", c.file);
+            println!(
+                "    download   huggingface-cli download {repo} {}",
+                c.download_arg
+            );
         }
         None => {
             println!(
@@ -415,7 +441,7 @@ mod tests {
         let size_bytes = (gb * 1e9) as u64;
         Candidate {
             label: label.into(),
-            file: format!("{label}.gguf"),
+            download_arg: format!("{label}.gguf"),
             size_bytes,
             traffic: TokenTraffic {
                 expert_bytes: 0,
@@ -428,6 +454,7 @@ mod tests {
             // The regime is supplied directly by these tests, so the cache is already
             // accounted for in whatever the caller passed.
             kv_bytes: 0,
+            shard_count: 1,
         }
     }
 
@@ -531,5 +558,24 @@ mod tests {
             candidate("F16", 60.0, Some(16.0), Regime::Oversized),
         ];
         assert_eq!(pick(&cands).label, "Q3_K_M");
+    }
+}
+
+#[cfg(test)]
+mod download_tests {
+    use super::*;
+
+    #[test]
+    fn a_split_model_downloads_every_part_not_just_the_first() {
+        // Naming one shard fetches a third of a model that then fails to load — worse
+        // than giving no hint at all.
+        let g = shard_glob("Q4_K_M/Qwen3-235B-A22B-Q4_K_M.gguf");
+        assert_eq!(g, "--include \"Q4_K_M/Qwen3-235B-A22B-Q4_K_M-*.gguf\"");
+        assert!(g.contains('"'), "must be quoted against shell expansion");
+    }
+
+    #[test]
+    fn a_base_path_without_the_extension_still_yields_a_usable_pattern() {
+        assert_eq!(shard_glob("Model-Q8_0"), "--include \"Model-Q8_0-*.gguf\"");
     }
 }
