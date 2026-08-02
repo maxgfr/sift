@@ -1,0 +1,35 @@
+name: pr-title
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+permissions:
+  contents: read
+
+jobs:
+  conventional:
+    runs-on: ubuntu-latest
+    steps:
+      # PRs land as squash commits, so the PR title *becomes* the commit subject on main
+      # and is the only thing semantic-release parses. A title without a conventional
+      # prefix produces "There are no relevant changes, so no new version is released" —
+      # a green run that ships nothing, which is the worst kind of failure because nobody
+      # goes looking. Caught here instead, where it is one edit to fix.
+      - name: Check the title is a conventional commit
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          if ! printf '%s' "$TITLE" | grep -qE '^(feat|fix|perf|refactor|docs|test|build|ci|chore|style|revert)(\([^)]+\))?!?: .+'; then
+            echo "PR title: $TITLE"
+            echo
+            echo "It must start with a conventional-commit type, because the squash commit"
+            echo "subject is what semantic-release reads to decide the next version."
+            echo
+            echo "  feat: ...      a new minor version"
+            echo "  fix: ...       a new patch version"
+            echo "  docs: ...      no release"
+            echo
+            exit 1
+          fi
+          echo "OK: $TITLE"

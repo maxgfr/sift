@@ -318,6 +318,42 @@ impl Gguf {
         self.tensors.iter().filter_map(TensorInfo::size_bytes).sum()
     }
 
+    /// Total weight count across every tensor.
+    ///
+    /// Counts only tensors whose byte size is computable, so it pairs with
+    /// [`Self::total_tensor_bytes`] over the same set — otherwise
+    /// [`Self::bits_per_weight`] would divide a partial numerator by a whole denominator
+    /// and understate precision.
+    pub fn total_parameters(&self) -> u64 {
+        self.tensors
+            .iter()
+            .filter(|t| t.size_bytes().is_some())
+            .map(TensorInfo::n_elems)
+            .sum()
+    }
+
+    /// Mean bits stored per weight, measured from this file's own tensor directory.
+    ///
+    /// The honest quality signal for a quantization, and deliberately **not** a lookup
+    /// table keyed on the filename. A table has to be taught every new quant family —
+    /// `IQ4_NL`, `MXFP4`, whatever Unsloth ships next month — and is wrong until someone
+    /// updates it. This arithmetic works on a quantization invented this morning, which is
+    /// the same reason the tool reads real headers instead of shipping a model catalog.
+    ///
+    /// It also captures what a name cannot: dynamic quantizations give different layers
+    /// different precision, so two files both labelled `Q4_K_M` genuinely differ. This
+    /// reports what each one actually stores.
+    ///
+    /// `None` when no tensor size is computable, which is the same condition under which
+    /// every other size figure here is unavailable.
+    pub fn bits_per_weight(&self) -> Option<f64> {
+        let params = self.total_parameters();
+        if params == 0 {
+            return None;
+        }
+        Some(self.total_tensor_bytes() as f64 * 8.0 / params as f64)
+    }
+
     /// Seek past the directory without reading payload.
     ///
     /// Exposed so callers can prove to themselves that opening a file did not fault in

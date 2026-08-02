@@ -21,19 +21,31 @@ Roughly in order of how much they improve the answer.
 
 ### Correctness
 
-- [ ] **Recommendation quality, not just size.** `fit` currently recommends the largest
-      file that fits, which on Qwen3-30B-A3B picks a 1-bit quant over a 3-bit one that is
-      barely larger. Size is a bad proxy for quality below ~3 bits. Needs a quality prior
-      per quant family, and probably a "smallest quant I would not warn you about" floor.
+- [x] **Recommendation quality, not just size.** Ranking is now quality-first: bits per
+      weight **measured from each file's own tensor directory**, not a lookup table keyed
+      on the filename. A table has to be taught every new quant family and is wrong until
+      someone updates it; this arithmetic works on a quantization invented this morning,
+      and it also catches what a name cannot — two files both labelled `Q4_K_M` genuinely
+      differ under dynamic quantization. Below 3.0 bpw a row is marked `damaged` and is
+      only recommended when nothing better fits, with a warning saying so.
+      On Qwen3-30B-A3B this moves the answer from `UD-IQ1_S` (2.37 bpw) to `Q3_K_M` (3.85).
 - [ ] **Predicted vs measured table.** The single most valuable thing this repo could
       publish. Run `sift fit`, then run the model, then record the error — including where
       the estimator is wrong. Every competitor publishes only flattering numbers.
-- [ ] **KV cache in the fit calculation.** Context length changes what fits, sometimes
-      decisively. Right now `fits` ignores it, which makes long-context users' answers
-      optimistic.
-- [ ] **Split-shard models.** Currently skipped entirely. Multi-part GGUFs are how the
-      largest models ship, so the tool is silent on exactly the cases where the question
-      is hardest.
+- [x] **KV cache in the fit calculation.** `fits` now weighs weights plus cache, sized
+      from the model's real attention geometry — `block_count`, `head_count_kv`, head
+      width — at a context you set with `--ctx` (4096 by default, roughly where engines
+      start). Decisively, not marginally: on a 16 GB machine Qwen3-30B-A3B UD-IQ1_S reads
+      `yes` at 4k and `no` at 64k, where 6.44 GB of f16 cache is more than half the budget.
+      Reading `head_count` instead of `head_count_kv` would overstate it 8x under
+      grouped-query attention, so there is a test pinning that.
+- [x] **Split-shard models.** Every part's header is read and merged through
+      `model::ModelShape`, because a shard carries only its own slice of the tensor
+      directory — asking part 1 for the model's size gives an answer confidently a third
+      of the truth. `unsloth/Qwen3-235B-A22B-GGUF` is 72 files, **none** of them whole:
+      19 complete shard sets that `sift` was previously silent on. An incomplete set is
+      reported rather than summed, since two of three shards add up to a plausible number
+      that is wrong by a third.
 
 ### Reach
 

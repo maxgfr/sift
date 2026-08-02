@@ -4,20 +4,44 @@
 
 ```console
 $ sift fit unsloth/Qwen3-30B-A3B-GGUF
-machine: Mac17,2, 16.0 GiB RAM, 12.0 GiB usable, 89 GB/s memory
+machine: Mac17,2, 16.0 GiB RAM, 12.0 GiB usable, 85 GB/s memory
 reading headers from unsloth/Qwen3-30B-A3B-GGUF without downloading…
 
-  quant               size     fits    GB/token  est tok/s
-  UD-IQ1_S         9.04 GB      yes       1.427         22  moe
-  Q2_K            11.26 GB    tight       1.399         22  moe
-  Q3_K_M          14.71 GB    tight       1.753         18  moe
-  Q4_K_M          18.56 GB       no       2.095   disk-bound  moe
-  Q8_0            32.48 GB       no       3.600   disk-bound  moe
+  fits assumes 4096 tokens of context: 0.40 GB of f16 KV cache, counted
+  alongside the weights. Change it with --ctx.
+
+  quant               size     fits    bpw    GB/token  est tok/s
+  UD-IQ1_S         9.04 GB      yes   2.37       1.427         21  moe  damaged
+  Q2_K            11.26 GB    tight   2.91       1.399         21  moe  damaged
+  Q3_K_M          14.71 GB    tight   3.85       1.753         14  moe
+  Q4_K_M          18.56 GB       no   4.86       2.095   disk-bound  moe
+  Q8_0            32.48 GB       no   8.51       3.600   disk-bound  moe
+
+  recommended: Q3_K_M
 ```
 
 Twenty-five quantizations evaluated. **Nothing downloaded.**
 
 Today that answer costs an hour: pull 18 GB, find out it's too slow, delete, guess again.
+
+## Two ways this table is not the obvious one
+
+**It does not recommend the biggest file that fits.** `UD-IQ1_S` is the only row marked
+`yes`, and it is the wrong answer: at 2.37 bits per weight the model is damaged. Bits per
+weight is *measured from each file's own tensor directory* rather than looked up from its
+name — so it is right about a quant family invented this morning, and it distinguishes two
+files both labelled `Q4_K_M` that a dynamic quantization made genuinely different.
+
+**`fits` counts the KV cache.** Raise the context and the answer changes, because it should:
+
+```console
+$ sift fit unsloth/Qwen3-30B-A3B-GGUF --ctx 65536
+  fits assumes 65536 tokens of context: 6.44 GB of f16 KV cache…
+  nothing here fits in 12.0 GiB of usable memory.
+```
+
+Same machine, same model, opposite advice. A tool that answers only the 4k question and
+does not say so is not being conservative, it is being wrong quietly.
 
 ## No bundled model list
 
@@ -92,7 +116,7 @@ Or `cargo build --release` — Rust 1.85+, no runtime dependencies beyond `curl`
 ## Commands
 
 ```
-sift fit <hf-repo>              which quantization to download, and why
+sift fit <hf-repo> [--ctx N]    which quantization to download, and why
 sift route <model>              which engine should run it
 sift inspect <path|hf-repo>     model shape, local or remote, no download
 sift plan <model>               per-token traffic and speed ceilings
@@ -151,14 +175,15 @@ treat the estimates as ordering hints rather than promises.
 
 Early, and honest about it. See [TODO.md](TODO.md) for what is deliberately *not* built.
 
-- Works and tested: measurement, GGUF reading (local and remote), MoE traffic, routing.
+- Works and tested: measurement, GGUF reading (local and remote, single-file and split),
+  MoE traffic, KV cache sizing, quality-first recommendation, routing.
 - macOS, Linux and Windows. The measurement layer has a real implementation per OS behind
   one seam, so nothing outside `sift_core::platform` carries a `cfg`.
 - Accelerator memory is only read on macOS, where `iogpu.wired_limit_mb` is a hard ceiling
   on host memory. Discrete VRAM is a different quantity and is **not** counted, so `fits`
   is conservative on a Linux or Windows box with a dedicated GPU. `sift doctor` says so
   rather than substituting a guess.
-- 88 tests, clippy clean on all three.
+- 107 tests, clippy clean on all three.
 
 ## Prior art
 

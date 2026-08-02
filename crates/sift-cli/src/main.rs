@@ -13,6 +13,12 @@ use source::Source;
 /// Memory reserved for the OS when nothing better is known.
 const OS_RESERVE_BYTES: u64 = 4 * sift_core::GIB;
 
+/// Context length `fit` sizes the KV cache for unless told otherwise.
+///
+/// Roughly where engines start. Deliberately not the model's trained maximum: sizing for
+/// Qwen3's 262k would report that nothing fits, which is true and useless as advice.
+const DEFAULT_CONTEXT_TOKENS: u64 = 4096;
+
 /// Memory a model may actually occupy on this machine.
 ///
 /// Not physical RAM: the OS, the compositor and the KV cache all take a share, and on
@@ -84,6 +90,13 @@ enum Command {
     Fit {
         /// A HuggingFace repo, e.g. `unsloth/Qwen3-30B-A3B-GGUF`.
         repo: String,
+        /// Context length to size the KV cache for, in tokens.
+        ///
+        /// Defaults to 4096, which is roughly what engines start at. Not the model's
+        /// trained maximum: sizing for 262k would report that almost nothing fits, which
+        /// is true and useless. Raise it to see what your actual workload costs.
+        #[arg(long, default_value_t = DEFAULT_CONTEXT_TOKENS)]
+        ctx: u64,
     },
 
     /// Which engine should run this model, and what to type.
@@ -124,13 +137,13 @@ fn main() -> Result<()> {
             quant,
             hit_rate,
         } => cmd_plan(&Source::resolve(&model, quant.as_deref())?, hit_rate),
-        Command::Fit { repo } => cmd_fit(&repo),
+        Command::Fit { repo, ctx } => cmd_fit(&repo, ctx),
         Command::Route { model, quant } => cmd_route(&Source::resolve(&model, quant.as_deref())?),
         Command::Engines => cmd_engines(),
     }
 }
 
-fn cmd_fit(repo: &str) -> Result<()> {
+fn cmd_fit(repo: &str, context_tokens: u64) -> Result<()> {
     let facts = MachineFacts::collect();
     let usable = usable_ram(&facts);
     // Fewer iterations than `doctor` uses: this is one input among many, and the user is
@@ -147,8 +160,8 @@ fn cmd_fit(repo: &str) -> Result<()> {
     );
     println!("reading headers from {repo} without downloading…");
 
-    let cands = fit::evaluate(repo, mem.gb_per_sec * 1e9, usable)?;
-    fit::report(repo, &cands, usable, &installed)
+    let cands = fit::evaluate(repo, mem.gb_per_sec * 1e9, usable, context_tokens)?;
+    fit::report(repo, &cands, usable, &installed, context_tokens)
 }
 
 fn cmd_route(src: &Source) -> Result<()> {
@@ -402,7 +415,7 @@ fn cmd_inspect(src: &Source, list_tensors: bool) -> Result<()> {
         None => println!("  read from disk   directory only, payload untouched"),
     }
 
-    match model::infer_moe_shape(&g) {
+    match model::infer_moe_shape(&g.shape()) {
         Some(shape) => {
             println!("\nmixture of experts");
             println!("  moe layers       {}", shape.moe_layers);
@@ -456,7 +469,7 @@ fn cmd_inspect(src: &Source, list_tensors: bool) -> Result<()> {
 
 fn cmd_plan(src: &Source, hit_rate: f64) -> Result<()> {
     let (g, _) = src.read_gguf()?;
-    let shape = model::infer_moe_shape(&g)
+    let shape = model::infer_moe_shape(&g.shape())
         .context("this model has no stacked expert tensors; planning targets MoE models")?;
 
     // Everything that is not a routed expert is read on every token regardless of routing.
