@@ -131,12 +131,14 @@ sift engines                    which runtimes are installed here
 Reproduce with the commands; don't take the table.
 
 **LM Studio baseline** (`sift-bench baseline`), Qwen3.5-9B Q4_K_M resident on MLX-NAX:
-**20.91 tok/s** median, under 1% spread across runs. A dense model re-reads every weight
-per token, so that's ~128 GB/s effective against the M5's 153.6 GB/s ceiling — about **83%
-of what the memory bus can physically deliver.**
+**21.03 tok/s** median, under 1% spread across runs. A dense model re-reads every weight
+per token, so that's 118.1 GB/s effective against 119–136 GB/s of measured read bandwidth —
+about **90% of what this machine actually delivers**, and ~77% of the M5's 153.6 GB/s
+paper figure.
 
-That number is why `sift` doesn't try to be a runtime. There is almost no headroom in
-kernel work.
+That gap between measured and paper bandwidth is itself the argument for measuring. And
+90% of the real ceiling is why `sift` doesn't try to be a runtime: there is almost no
+headroom left in kernel work.
 
 **Read granularity costs 9×.** Same volume, cold, varying only block size:
 
@@ -158,18 +160,46 @@ has warmed its own sample.
 At least one established project in this space discarded four of its own published results
 after finding it had measured RAM.
 
-## Accuracy
+## Accuracy: predicted versus measured
 
-The tok/s figures from `sift fit` are **estimates**: measured memory bandwidth times an
-efficiency factor (80% dense, 35% MoE). They are labelled as estimates everywhere they
-appear.
+Every tool in this space publishes flattering numbers. Here is the one that matters, and
+the two ways this one was wrong before it was right.
+
+| model | predicted | measured | error |
+|---|---|---|---|
+| Qwen3.5-9B Q4_K_M, dense, LM Studio on M5 | 21 tok/s | **21.03 tok/s** | under 1% |
+
+One model, one machine, one engine. That is a calibration point, not a validation — but it
+is a real one, and getting it took discarding two measurements that looked fine.
+
+**The first ruler measured the wrong access pattern.** `sift` sized the ceiling with a
+STREAM *copy*. Decode streams weights in and writes back a small activation; a copy moves a
+byte each way. The efficiency factor of 0.80 was silently absorbing that mismatch.
+
+**The second ruler measured latency, not bandwidth.** The obvious fix — sum a buffer
+single-threaded — reported 40 GB/s on a machine whose bus delivers three times that. One
+accumulator is a serial dependency chain, and one core cannot saturate an Apple Silicon
+bus. Four accumulators across all cores reads 119–136 GB/s.
+
+Then the loop got fast enough to be impossible: **369 GB/s**, on a bus that tops out near
+153. Reading the same immutable buffer into the same accumulators is loop-invariant, so
+LLVM hoisted the whole sweep out and timed one pass as if it were four. Each pass now
+depends on the last, and `sift doctor` refuses any figure above 1200 GB/s outright.
+
+With an honest ruler, LM Studio decodes at **118.1 GB/s effective against 119–136 GB/s
+measured** — around 90% of the machine, which is now the dense efficiency factor.
+
+**The MoE factor is not calibrated.** It was rescaled to preserve the predictions the old
+basis gave, so switching rulers did not silently move every MoE estimate — but rescaling a
+guess leaves a guess. MoE rows are marked as estimates and this is the open half of the
+work.
 
 What `sift` gets right that a naive `bandwidth / file_size` model does not: **MoE sparsity**.
 A 30B-A3B model reads about 3B parameters per token, not 30B. Getting this wrong is a ~16×
 error on a 128-expert top-8 model, and it is a live open issue in a competing tool.
 
-A predicted-versus-measured table is the next thing this README needs. Until it exists,
-treat the estimates as ordering hints rather than promises.
+Treat MoE estimates as ordering hints. Treat the dense one as calibrated on exactly one
+machine.
 
 ## Status
 

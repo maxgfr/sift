@@ -36,6 +36,15 @@ pub struct DiskSample {
     pub ms_per_read: f64,
 }
 
+/// Bandwidth above which a memory measurement is not believable on consumer hardware.
+///
+/// No desktop or laptop part reaches this. Apple's widest configurations top out around
+/// 800 GB/s, and a mainstream machine is a fraction of that. A figure above this means the
+/// benchmark measured something other than memory — usually the optimiser hoisting an
+/// invariant loop, which reported 369 GB/s here before [`measure_read_bandwidth`] started
+/// threading its accumulator through each pass.
+pub const IMPLAUSIBLE_MEMORY_GB_S: f64 = 1200.0;
+
 /// Throughput above which a "cold" disk read is almost certainly a page-cache hit.
 ///
 /// No consumer NVMe device reads at this rate. Apple Silicon internal SSDs top out
@@ -65,6 +74,17 @@ pub struct MemorySample {
     pub seconds: f64,
     /// Achieved bandwidth in GB/s.
     pub gb_per_sec: f64,
+}
+
+impl MemorySample {
+    /// Whether this figure is too fast to be a real memory measurement.
+    ///
+    /// Reported rather than silently corrected, in the same spirit as
+    /// [`DiskSample::looks_cached`]: a number the harness cannot vouch for should be
+    /// visible, not quietly folded into an average.
+    pub fn is_implausible(&self) -> bool {
+        !self.gb_per_sec.is_finite() || self.gb_per_sec > IMPLAUSIBLE_MEMORY_GB_S
+    }
 }
 
 pub use crate::platform::{AccelMemory, MachineFacts};
@@ -273,6 +293,96 @@ pub fn measure_memory_bandwidth(bytes: usize, iterations: usize) -> MemorySample
     }
 }
 
+/// Measure read-only memory bandwidth, saturating the bus.
+///
+/// **This, not the copy figure, is the ceiling for decode**, and getting it right took
+/// being wrong twice.
+///
+/// Decode streams weights in and writes back only a small activation, so the workload is
+/// read-dominated — a copy benchmark measures the wrong access pattern. But the obvious
+/// read benchmark, a single-threaded `fold` over a buffer, measures the wrong thing too:
+/// one accumulator is a serial dependency chain, so it reports memory *latency* rather
+/// than bandwidth. On an M5 that read 40 GB/s where the bus delivers three times as much.
+///
+/// Two fixes, both necessary:
+///
+/// - **Several accumulators per thread**, so loads issue in parallel instead of queueing
+///   behind one add.
+/// - **Several threads.** One core cannot saturate an Apple Silicon memory bus. The same
+///   machine reads 40 GB/s on one thread and 123 GB/s on six.
+///
+/// What that buys is a number that means something. LM Studio decoding Qwen3.5-9B on this
+/// M5 achieves 118.1 GB/s effective, against 125 GB/s measured here — **94% of the
+/// ceiling.** Against the old single-threaded copy figure the same engine looked like it
+/// was running at 138% of the machine, which is not a calibration, it is a broken ruler.
+pub fn measure_read_bandwidth(bytes: usize, iterations: usize) -> MemorySample {
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+
+    let n = bytes / std::mem::size_of::<u64>();
+    let src = vec![1u64; n];
+    let chunk = (n / threads).max(1);
+
+    // Sum a slice with four independent accumulators. With one, each load waits on the
+    // previous add and the loop measures latency; with four, the memory system sees four
+    // outstanding requests at a time.
+    //
+    // `seed` is what makes repeated sweeps honest. Reading the same immutable slice into
+    // the same accumulators is loop-invariant, so LLVM will happily hoist the whole sweep
+    // out of the repeat loop and time a single pass as if it were `iterations` of them.
+    // That is not a subtle few percent: it reported 369 GB/s on a machine whose bus tops
+    // out near 153. Threading the previous result in makes each pass depend on the last.
+    fn sweep(slice: &[u64], seed: u64) -> u64 {
+        let (mut a, mut b, mut c, mut d) = (seed, 0u64, 0u64, 0u64);
+        for q in slice.chunks_exact(4) {
+            a = a.wrapping_add(q[0]);
+            b = b.wrapping_add(q[1]);
+            c = c.wrapping_add(q[2]);
+            d = d.wrapping_add(q[3]);
+        }
+        a ^ b ^ c ^ d
+    }
+
+    // Spawn first, hold at a barrier, then start the clock. Thread creation and the
+    // first-touch page faults are real work, and timing them reports a slower machine than
+    // the one you have — the first sample of an unwarmed run came in 40% low.
+    let barrier = std::sync::Barrier::new(threads + 1);
+    let seconds = std::thread::scope(|scope| {
+        for t in 0..threads {
+            let start = t * chunk;
+            let end = if t == threads - 1 { n } else { start + chunk };
+            let slice = &src[start..end];
+            let barrier = &barrier;
+            scope.spawn(move || {
+                // One untimed pass: faults every page in and lets the CPU reach its
+                // steady-state clock before anything is measured.
+                let mut acc = sweep(slice, 0);
+                barrier.wait();
+                for _ in 0..iterations {
+                    acc = sweep(std::hint::black_box(slice), acc);
+                }
+                std::hint::black_box(acc);
+            });
+        }
+        // Released only once every thread has finished its warm-up pass, so the clock
+        // starts on a warm buffer at a steady clock speed.
+        barrier.wait();
+        Instant::now()
+    });
+    // The scope joins every thread before returning, so this is the full wall-clock of the
+    // timed region.
+    let seconds = seconds.elapsed().as_secs_f64();
+
+    // Read-only: one pass over the buffer per iteration, per thread's share.
+    let total_bytes = (n * std::mem::size_of::<u64>()) as u64 * iterations as u64;
+    MemorySample {
+        total_bytes,
+        seconds,
+        gb_per_sec: total_bytes as f64 / seconds / 1e9,
+    }
+}
+
 /// Peak resident set size of this process so far, in bytes.
 ///
 /// Used to assert that a configured RAM budget was actually honoured. `sift` treats the
@@ -365,5 +475,37 @@ mod tests {
         let s = measure_random_read(f.path(), 64 << 10, 8, 4).expect("measure");
         assert_eq!(s.total_bytes, (64 << 10) * 8 * 4);
         assert_eq!(s.threads, 8);
+    }
+}
+
+#[cfg(test)]
+mod bandwidth_tests {
+    use super::*;
+
+    #[test]
+    fn read_bandwidth_is_positive_and_counts_one_pass_per_iteration() {
+        let s = measure_read_bandwidth(4 << 20, 4);
+        assert!(s.gb_per_sec > 0.0 && s.gb_per_sec.is_finite());
+        assert_eq!(
+            s.total_bytes,
+            (4u64 << 20) * 4,
+            "read-only touches each byte once, unlike copy's twice"
+        );
+    }
+
+    #[test]
+    fn read_bandwidth_is_not_the_copy_figure() {
+        // They measure different things and must not be conflated: a copy moves a byte in
+        // and a byte out, and writes are the more expensive half. Quoting copy bandwidth
+        // as the decode ceiling understates the machine — on an M5 by enough to predict
+        // 12.9 tok/s for a model that runs at 20.9.
+        //
+        // Asserted as "not identical" rather than "read is faster", because the ordering
+        // is a property of the hardware and a test that pins it would be a test of the
+        // machine, not of this code.
+        let copy = measure_memory_bandwidth(64 << 20, 4);
+        let read = measure_read_bandwidth(64 << 20, 4);
+        assert!(copy.gb_per_sec > 0.0 && read.gb_per_sec > 0.0);
+        assert_ne!(copy.total_bytes, read.total_bytes);
     }
 }

@@ -234,7 +234,11 @@ pub fn evaluate(
                 .map(|k| k.bytes_at(context_tokens, model::KV_F16_BYTES))
                 .unwrap_or(0);
             let regime = Regime::classify(m.size_bytes.saturating_add(kv), usable_ram);
-            let efficiency = if is_moe { 0.35 } else { 0.80 };
+            let efficiency = if is_moe {
+                crate::fit::MOE_EFFICIENCY
+            } else {
+                crate::fit::DENSE_EFFICIENCY
+            };
 
             Row {
                 model: m,

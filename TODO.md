@@ -5,9 +5,10 @@
 These are scope decisions, not gaps. They exist here so anyone landing on the repo can see
 the boundary without reading the source.
 
-- **An inference engine.** LM Studio runs Qwen3.5-9B on this machine at ~83% of the memory
-  bus. There is almost no headroom in kernel work, and the runtime landscape churns past
-  itself every quarter. `sift` recommends engines instead of becoming one.
+- **An inference engine.** LM Studio runs Qwen3.5-9B on this machine at ~90% of its
+  *measured* read bandwidth. There is almost no headroom in kernel work, and the runtime
+  landscape churns past itself every quarter. `sift` recommends engines instead of becoming
+  one.
 - **Downloading models.** `sift` prints the exact command for whichever tool owns the job.
   Nothing to maintain around resume, checksums, auth or LFS.
 - **A bundled model catalog.** The whole point is reading the real header of the real file.
@@ -29,9 +30,16 @@ Roughly in order of how much they improve the answer.
       differ under dynamic quantization. Below 3.0 bpw a row is marked `damaged` and is
       only recommended when nothing better fits, with a warning saying so.
       On Qwen3-30B-A3B this moves the answer from `UD-IQ1_S` (2.37 bpw) to `Q3_K_M` (3.85).
-- [ ] **Predicted vs measured table.** The single most valuable thing this repo could
-      publish. Run `sift fit`, then run the model, then record the error — including where
-      the estimator is wrong. Every competitor publishes only flattering numbers.
+- [x] **Predicted vs measured table.** Published in the README, dense half done: Qwen3.5-9B
+      Q4_K_M predicted 21 tok/s, measured 21.03 on LM Studio. Getting there meant throwing
+      away two measurements that looked fine — a STREAM copy that measured the wrong access
+      pattern, and a single-threaded read that measured latency and reported 40 GB/s on a
+      bus delivering three times that. Then a third that was impossible: 369 GB/s, from an
+      invariant loop the optimiser hoisted. All three are written up rather than hidden.
+- [ ] **Calibrate the MoE efficiency factor.** The open half. It was rescaled to preserve
+      the predictions the old copy-based basis gave, so switching rulers moved nothing
+      silently — but rescaling a guess leaves a guess. Needs an MoE model measured on a real
+      engine, the way the dense one was.
 - [x] **KV cache in the fit calculation.** `fits` now weighs weights plus cache, sized
       from the model's real attention geometry — `block_count`, `head_count_kv`, head
       width — at a context you set with `--ctx` (4096 by default, roughly where engines
@@ -61,19 +69,21 @@ Roughly in order of how much they improve the answer.
       `QueryVideoMemoryInfo` on Windows. Deliberately not faked in the meantime: those
       report discrete VRAM, which is not a ceiling on host memory the way Apple's wired
       limit is, so folding them into one number would be wrong rather than incomplete.
-- [ ] **`sift ls`** — every local model across LM Studio, Ollama, colibri and `~/.sift`,
-      with regime and predicted speed. One view across tools that do not know about each
-      other.
+- [x] **`sift ls`** — every local model across LM Studio, Ollama, colibri and `~/.sift`,
+      with regime and predicted speed. Ollama needed its manifests read rather than its
+      blob directory listed: the blobs are `sha256-<digest>` with no extension and no
+      indication of which is a model, which a projector and which a template.
 - [ ] **`sift bench`** — fold `sift-bench` into the main binary, drive Ollama as well as
       LM Studio, and persist results so measurements replace estimates over time.
-- [ ] **`--json` on every command.** Being the thing another tool shells out to is how a
-      CLI becomes a reference rather than a repo.
+- [x] **`--json` on every command.** Under `--json`, progress chatter goes to stderr so
+      stdout stays one parseable document.
 
 ### Polish
 
 - [ ] Cache fetched headers in `~/.sift/cache/` keyed by ETag. A `fit` sweep currently
       re-reads on every invocation and takes ~2 minutes for 25 quants.
-- [ ] Parallelise the `fit` sweep. It is entirely network-bound and entirely serial.
+- [x] Parallelise the `fit` sweep. Eight workers over a shared queue: 72 files in 22
+      seconds, against a serial run that had not finished after five minutes.
 - [ ] Safetensors support, so non-GGUF repos are not a dead end.
 - [x] Homebrew formula in `maxgfr/homebrew-tap` plus a release workflow building
       macOS/Linux/Windows binaries. Cron hour 19 UTC is free; 0–18 are taken.
@@ -85,9 +95,10 @@ Roughly in order of how much they improve the answer.
 
 Things currently shipped that are known to be imperfect, recorded rather than hidden.
 
-- **Efficiency factors are hand-set** (80% dense, 35% MoE) from a single machine's
-  measurements. They should come from `sift bench` data, per architecture.
+- **The MoE efficiency factor is still a guess** (28%). The dense one (90%) is now
+  calibrated against a real measurement on one machine — one machine, one model, one
+  engine, so treat it as a calibration point rather than a validated constant.
 - **Ollama detection matches `~/.ollama`**, a data directory, so it can report Ollama as
   present after an uninstall. Fails soft by design, but it is a false positive.
-- **The `fit` sweep warms nothing and caches nothing**, so it is slower than it needs to be
-  by roughly the number of quants.
+- **The `fit` sweep caches nothing.** It is parallel now, but a second run re-reads every
+  header. The ETag cache below is what fixes that.

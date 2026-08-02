@@ -101,16 +101,30 @@ impl Candidate {
     }
 }
 
-/// Fraction of the memory-bandwidth roofline that real decode achieves.
+/// Fraction of the measured read-bandwidth roofline that real dense decode achieves.
 ///
-/// Measured, not guessed: LM Studio on an M5 runs Qwen3.5-9B at 20.91 tok/s against
-/// ~128 GB/s of effective traffic on a 153.6 GB/s bus. Dense resident decode lands close to
-/// the roofline; MoE decode is lower because expert gather is scattered.
+/// **Calibrated against a measurement, and the calibration changed the number.** LM Studio
+/// decoding Qwen3.5-9B Q4_K_M on an M5: 21.03 tok/s median over three runs, 5.616 GB of
+/// weight traffic per token, so 118.1 GB/s effective. Read bandwidth measured on the same
+/// machine is 119–136 GB/s. That is ~0.90 of the ceiling, not the 0.80 this used to carry.
 ///
-/// This is the crudest part of the tool and it is labelled as such wherever it is printed.
-/// `sift bench` exists to replace it with measurement.
-const DENSE_EFFICIENCY: f64 = 0.80;
-const MOE_EFFICIENCY: f64 = 0.35;
+/// The old figure was not merely stale, it was measured against the wrong ruler: a
+/// single-threaded STREAM *copy*. Decode is read-dominated and one core cannot saturate an
+/// Apple Silicon bus, so that benchmark understated the machine and 0.80 was silently
+/// absorbing the error. See [`sift_core::doctor::measure_read_bandwidth`].
+pub const DENSE_EFFICIENCY: f64 = 0.90;
+
+/// The same fraction for mixture-of-experts decode.
+///
+/// **Not calibrated.** MoE decode is lower than dense because expert gather is scattered
+/// rather than streamed, but no MoE model has been measured on this machine, so this is
+/// a judgement carried forward.
+///
+/// It has been rescaled to preserve the predictions the old copy-based basis produced —
+/// 0.35 of ~103 GB/s copy is 0.28 of ~128 GB/s read — so switching rulers did not silently
+/// move every MoE estimate. Rescaling a guess leaves a guess; it is marked as such wherever
+/// it is printed, and replacing it is the open half of the predicted-versus-measured work.
+pub const MOE_EFFICIENCY: f64 = 0.28;
 
 /// Evaluate every quantization a repo offers, at a given context length.
 pub fn evaluate(

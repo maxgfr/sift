@@ -178,9 +178,11 @@ fn main() -> Result<()> {
 fn cmd_fit(repo: &str, context_tokens: u64, json: bool) -> Result<()> {
     let facts = MachineFacts::collect();
     let usable = usable_ram(&facts);
-    // Fewer iterations than `doctor` uses: this is one input among many, and the user is
-    // waiting on network round-trips anyway.
-    let mem = doctor::measure_memory_bandwidth(doctor::BANDWIDTH_BUF_BYTES, 3);
+    // Read bandwidth, not copy: decode streams weights in and writes back a small
+    // activation, so a copy benchmark measures the wrong access pattern. Fewer iterations
+    // than `doctor` uses — this is one input among many and the user is waiting on network
+    // round-trips anyway.
+    let mem = doctor::measure_read_bandwidth(doctor::BANDWIDTH_BUF_BYTES, 3);
     let installed = sift_core::engine::detect_installed();
 
     // Progress chatter goes to stderr under --json, so stdout stays a single parseable
@@ -288,7 +290,7 @@ fn cmd_route(src: &Source, json: bool) -> Result<()> {
 fn cmd_ls(context_tokens: u64, json: bool) -> Result<()> {
     let facts = MachineFacts::collect();
     let usable = usable_ram(&facts);
-    let mem = doctor::measure_memory_bandwidth(doctor::BANDWIDTH_BUF_BYTES, 3);
+    let mem = doctor::measure_read_bandwidth(doctor::BANDWIDTH_BUF_BYTES, 3);
 
     let models = ls::discover();
     let rows = ls::evaluate(models, mem.gb_per_sec * 1e9, usable, context_tokens);
@@ -345,6 +347,9 @@ fn cmd_doctor(disk_sample: Option<PathBuf>, json: bool) -> Result<()> {
 
     // 256 MiB per buffer, enough to overflow every cache level so we measure DRAM.
     let mem = doctor::measure_memory_bandwidth(256 << 20, 8);
+    // The read figure is the one that sets the decode ceiling; the copy figure is kept
+    // alongside it because seeing both is what makes the difference legible.
+    let read = doctor::measure_read_bandwidth(doctor::BANDWIDTH_BUF_BYTES, 4);
 
     let mut disk = Vec::new();
     if let Some(path) = &disk_sample {
@@ -375,7 +380,8 @@ fn cmd_doctor(disk_sample: Option<PathBuf>, json: bool) -> Result<()> {
                 "available_bytes": facts.available_bytes,
                 "accel_memory": facts.accel_memory,
             },
-            "memory": mem,
+            "memory_copy": mem,
+            "memory_read": read,
             "disk": disk,
         });
         println!("{}", serde_json::to_string_pretty(&out)?);
@@ -417,11 +423,23 @@ fn cmd_doctor(disk_sample: Option<PathBuf>, json: bool) -> Result<()> {
     }
 
     println!("\nmemory bandwidth");
+    println!("  read, all cores  {:.1} GB/s", read.gb_per_sec);
     println!("  STREAM copy      {:.1} GB/s", mem.gb_per_sec);
+    // Both are printed because the difference between them is what made the estimates
+    // wrong. Decode streams weights in and writes back a small activation, so the read
+    // figure is the ceiling; a copy moves a byte each way and a single-threaded one cannot
+    // saturate an Apple Silicon bus at all.
     println!(
         "  -> resident ceiling for a model reading 1.1 GB/token: {:.0} tok/s",
-        mem.gb_per_sec * 1e9 / 1.1e9
+        read.gb_per_sec * 1e9 / 1.1e9
     );
+    if read.is_implausible() || mem.is_implausible() {
+        println!(
+            "\n  warning: a figure above {:.0} GB/s is not a memory measurement. Something\n  \
+             other than the bus was timed — usually an invariant loop the optimiser lifted.",
+            sift_core::doctor::IMPLAUSIBLE_MEMORY_GB_S
+        );
+    }
 
     if disk.is_empty() {
         println!("\ndisk: not measured (pass --disk-sample <file>)");
