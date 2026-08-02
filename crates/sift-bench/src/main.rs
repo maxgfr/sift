@@ -1,16 +1,24 @@
-//! Head-to-head benchmark harness: `sift` versus LM Studio, on one machine.
+//! Calibration harness: measure a real engine so `sift`'s estimates can be checked.
 //!
-//! The thesis this repo defends is narrow and falsifiable, so the harness is built to
-//! *disprove* it as readily as confirm it. Runs are labelled by regime:
+//! `sift` does not run models, so this is not a competitor's benchmark — LM Studio is the
+//! **instrument**, not the opponent. `sift fit` prints a tok/s estimate derived from
+//! measured memory bandwidth times a hand-set efficiency factor; this harness produces the
+//! measured number that estimate must be held against.
 //!
-//! | regime | model vs RAM | expectation |
-//! |--------|--------------|-------------|
-//! | A      | fits easily  | LM Studio likely wins. Publish that. |
-//! | B      | ~1.2x RAM    | LM Studio thrashes; this is the claim |
-//! | C      | >2x RAM      | LM Studio cannot run it at all |
+//! Runs are labelled by regime, because a throughput figure without one is meaningless —
+//! the same engine is fast when a model is resident and collapses when it is not:
 //!
-//! A number without its regime is meaningless — the same engine is fast in A and slow in
-//! C — so every record carries one, and the reporter refuses to average across them.
+//! | regime | model vs RAM | what it measures |
+//! |--------|--------------|------------------|
+//! | A      | fits easily  | the resident ceiling: bandwidth-bound decode |
+//! | B      | ~1.2x RAM    | the paging cliff, where the estimate stops applying |
+//! | C      | >2x RAM      | disk-bound territory; most engines cannot run it at all |
+//!
+//! The reporter refuses to average across regimes for the same reason.
+//!
+//! Publishing where the estimator is *wrong* is the point. Every tool in this space
+//! publishes only flattering numbers, which is precisely why none of them can be trusted
+//! on the cases that matter.
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
@@ -23,7 +31,7 @@ const LMS_DEFAULT: &str = ".lmstudio/bin/lms";
 #[derive(Parser)]
 #[command(
     name = "sift-bench",
-    about = "Compare sift against LM Studio on this machine"
+    about = "Measure a real engine on this machine, to check sift's estimates against"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -38,7 +46,7 @@ enum Cmd {
     Probe,
     /// List models LM Studio has locally, with the regime each falls into here.
     Models,
-    /// Measure LM Studio's decode throughput. This is the baseline sift must beat.
+    /// Measure LM Studio's decode throughput. This is what `sift fit` is checked against.
     Baseline {
         /// Model id as LM Studio's server reports it. Defaults to whatever is loaded.
         #[arg(long)]
@@ -96,9 +104,9 @@ impl Regime {
 
     fn expectation(self) -> &'static str {
         match self {
-            Regime::A => "LM Studio likely wins — publish it",
-            Regime::B => "the claim: LM Studio thrashes here",
-            Regime::C => "LM Studio cannot run this at all",
+            Regime::A => "resident: this is where the estimate should hold",
+            Regime::B => "at the paging cliff: the estimate stops applying here",
+            Regime::C => "disk-bound: most engines cannot run this at all",
         }
     }
 }
@@ -126,11 +134,15 @@ fn lms_path() -> Result<PathBuf> {
 /// locates the paging cliff empirically instead of trusting a constant like this one.
 fn usable_ram_bytes() -> u64 {
     let facts = sift_core::doctor::MachineFacts::collect();
-    // If the GPU wired limit is set, it binds before physical RAM does.
-    if let Some(limit) = facts.gpu_wired_limit_bytes {
+    // Where a platform reports an accelerator ceiling, it binds before physical RAM does.
+    if let Some(limit) = facts.accel_memory.bytes() {
         return limit;
     }
-    facts.ram_bytes.saturating_sub(4 * sift_core::GIB)
+    let estimate = facts.ram_bytes.saturating_sub(4 * sift_core::GIB);
+    match facts.available_bytes {
+        Some(available) => estimate.min(available),
+        None => estimate,
+    }
 }
 
 fn main() -> Result<()> {

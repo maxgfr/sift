@@ -37,15 +37,18 @@ Roughly in order of how much they improve the answer.
 
 ### Reach
 
-- [ ] **Linux support.** `/proc/meminfo` (`MemAvailable`, never `MemFree`),
-      `posix_fadvise(DONTNEED)` after `fsync` for cold reads, NVML and amdgpu sysfs for
-      accelerator memory.
-- [ ] **Windows support.** `GlobalMemoryStatusEx` (not
-      `GetPhysicallyInstalledSystemMemory` — it reads SMBIOS and fails on VMs), DXGI
-      `QueryVideoMemoryInfo`, `FILE_FLAG_NO_BUFFERING`. Note `seek_read` moves the shared
-      file pointer, unlike Unix `pread`.
-- [ ] Structure both behind one trait with per-OS modules, so the rest of the crate never
-      sees a `cfg`.
+- [x] **Linux support.** `/proc/meminfo` (`MemAvailable`, never `MemFree`),
+      `posix_fadvise(DONTNEED)` after `fsync` for cold reads.
+- [x] **Windows support.** `GlobalMemoryStatusEx` (not
+      `GetPhysicallyInstalledSystemMemory` — it reads SMBIOS and fails on VMs),
+      `FILE_FLAG_NO_BUFFERING`. `seek_read` moves the shared file pointer, unlike Unix
+      `pread`, so every reader thread now holds its own handle.
+- [x] Structure both behind one seam with per-OS modules, so the rest of the crate never
+      sees a `cfg`. See `crates/sift-core/src/platform/`.
+- [ ] **Accelerator memory off macOS.** NVML and amdgpu sysfs on Linux, DXGI
+      `QueryVideoMemoryInfo` on Windows. Deliberately not faked in the meantime: those
+      report discrete VRAM, which is not a ceiling on host memory the way Apple's wired
+      limit is, so folding them into one number would be wrong rather than incomplete.
 - [ ] **`sift ls`** — every local model across LM Studio, Ollama, colibri and `~/.sift`,
       with regime and predicted speed. One view across tools that do not know about each
       other.

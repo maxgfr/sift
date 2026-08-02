@@ -13,8 +13,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # macOS is the primary target; Linux proves the measurement layer stays portable.
-        os: [macos-latest, ubuntu-latest]
+        # All three are real targets, not aspirations: the measurement layer has a
+        # per-OS implementation behind `sift_core::platform`, and each has its own way to
+        # be wrong. Windows in particular enforces at runtime what the others tolerate
+        # silently — unbuffered reads reject unaligned offsets outright — so a green
+        # Windows job is the strongest single signal that the read path is correct.
+        os: [macos-latest, ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5

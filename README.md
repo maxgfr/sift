@@ -146,9 +146,13 @@ treat the estimates as ordering hints rather than promises.
 Early, and honest about it. See [TODO.md](TODO.md) for what is deliberately *not* built.
 
 - Works and tested: measurement, GGUF reading (local and remote), MoE traffic, routing.
-- macOS only for now. Linux and Windows are planned; the measurement layer uses Darwin
-  syscalls today.
-- 80 tests, clippy clean.
+- macOS, Linux and Windows. The measurement layer has a real implementation per OS behind
+  one seam, so nothing outside `sift_core::platform` carries a `cfg`.
+- Accelerator memory is only read on macOS, where `iogpu.wired_limit_mb` is a hard ceiling
+  on host memory. Discrete VRAM is a different quantity and is **not** counted, so `fits`
+  is conservative on a Linux or Windows box with a dedicated GPU. `sift doctor` says so
+  rather than substituting a guess.
+- 88 tests, clippy clean on all three.
 
 ## Prior art
 

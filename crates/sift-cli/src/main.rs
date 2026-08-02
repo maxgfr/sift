@@ -2,7 +2,7 @@
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use sift_core::doctor::{self, MachineFacts};
+use sift_core::doctor::{self, AccelMemory, MachineFacts};
 use sift_core::model;
 use std::path::PathBuf;
 
@@ -10,15 +10,33 @@ mod fit;
 mod source;
 use source::Source;
 
+/// Memory reserved for the OS when nothing better is known.
+const OS_RESERVE_BYTES: u64 = 4 * sift_core::GIB;
+
 /// Memory a model may actually occupy on this machine.
 ///
-/// Not physical RAM: the OS, the window server and the KV cache all take a share, and on
-/// Apple Silicon the GPU wired limit binds before physical RAM does. The 4 GiB reserve is
-/// an estimate — which is exactly why `sift doctor` measures rather than assuming.
+/// Not physical RAM: the OS, the compositor and the KV cache all take a share, and on
+/// Apple Silicon the GPU wired limit binds before physical RAM does.
+///
+/// Three sources, in descending order of how much they are worth trusting:
+///
+/// 1. A platform-reported accelerator ceiling. Hard, and it binds first where it exists.
+/// 2. What the OS says is available right now, which on Linux and Windows is a real
+///    figure and accounts for whatever else is running.
+/// 3. Physical RAM minus a flat reserve. An estimate, and the weakest of the three —
+///    which is exactly why `sift doctor` measures the machine rather than stopping here.
 fn usable_ram(facts: &MachineFacts) -> u64 {
-    facts
-        .gpu_wired_limit_bytes
-        .unwrap_or_else(|| facts.ram_bytes.saturating_sub(4 * sift_core::GIB))
+    if let Some(ceiling) = facts.accel_memory.bytes() {
+        return ceiling;
+    }
+    let estimate = facts.ram_bytes.saturating_sub(OS_RESERVE_BYTES);
+    match facts.available_bytes {
+        // Take the lower of the two. Available memory can briefly exceed RAM minus the
+        // reserve on an idle machine, and advising against that headroom would tell
+        // someone a model fits when the first other application to start makes it not.
+        Some(available) => estimate.min(available),
+        None => estimate,
+    }
 }
 
 #[derive(Parser)]
@@ -227,7 +245,8 @@ fn cmd_doctor(disk_sample: Option<PathBuf>, json: bool) -> Result<()> {
                 "ram_bytes": facts.ram_bytes,
                 "page_bytes": facts.page_bytes,
                 "cpus": facts.cpus,
-                "gpu_wired_limit_bytes": facts.gpu_wired_limit_bytes,
+                "available_bytes": facts.available_bytes,
+                "accel_memory": facts.accel_memory,
             },
             "memory": mem,
             "disk": disk,
@@ -247,12 +266,25 @@ fn cmd_doctor(disk_sample: Option<PathBuf>, json: bool) -> Result<()> {
     );
     println!("  page size        {} KiB", facts.page_bytes / 1024);
     println!("  cpus             {}", facts.cpus);
-    match facts.gpu_wired_limit_bytes {
-        Some(b) => println!("  gpu wired limit  {:.1} GiB", sift_core::gib(b)),
-        None => println!(
+    if let Some(b) = facts.available_bytes {
+        println!("  available now    {:.1} GiB", sift_core::gib(b));
+    }
+    match facts.accel_memory {
+        AccelMemory::Limited { bytes } => {
+            println!("  gpu wired limit  {:.1} GiB", sift_core::gib(bytes))
+        }
+        AccelMemory::PlatformDefault => println!(
             "  gpu wired limit  unset -> macOS default, well below physical RAM.\n\
              {:>19}This, not your RAM, is what an 11 GB model hits first.\n\
              {:>19}Raise with: sudo sysctl iogpu.wired_limit_mb=<MB>",
+            "", ""
+        ),
+        // Say it plainly. A tool that silently substitutes a guess here is the reason
+        // competing tools report a 4 GB card as an 8 GB one.
+        AccelMemory::Unknown => println!(
+            "  accelerator      not measured on this platform.\n\
+             {:>19}sift is using host memory only; if you have a discrete GPU, its\n\
+             {:>19}VRAM is not accounted for and `fits` will be conservative.",
             "", ""
         ),
     }

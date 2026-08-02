@@ -67,101 +67,22 @@ pub struct MemorySample {
     pub gb_per_sec: f64,
 }
 
-/// What the machine reports about itself, before we measure anything.
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct MachineFacts {
-    /// Physical RAM in bytes.
-    pub ram_bytes: u64,
-    /// OS page size in bytes. 16 KiB on Apple Silicon.
-    pub page_bytes: usize,
-    /// Logical CPU count.
-    pub cpus: usize,
-    /// Hardware model identifier, e.g. `Mac17,2`.
-    pub model: Option<String>,
-    /// Maximum bytes the GPU may wire, from `iogpu.wired_limit_mb`.
-    ///
-    /// `None` means the sysctl is unset, in which case macOS applies an internal default
-    /// well below physical RAM. This is why an 11 GB model can fail to load on a 16 GB
-    /// machine: the limit, not the RAM, is what binds.
-    pub gpu_wired_limit_bytes: Option<u64>,
-}
+pub use crate::platform::{AccelMemory, MachineFacts};
 
-impl MachineFacts {
-    /// Collect what the OS will tell us without running any benchmark.
-    pub fn collect() -> Self {
-        Self {
-            ram_bytes: sysctl_u64("hw.memsize").unwrap_or(0),
-            page_bytes: crate::io::page_size(),
-            cpus: std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(1),
-            model: sysctl_string("hw.model"),
-            gpu_wired_limit_bytes: sysctl_u64("iogpu.wired_limit_mb")
-                .filter(|&mb| mb > 0)
-                .map(|mb| mb * 1024 * 1024),
-        }
-    }
-}
+/// Alignment every read offset is held to.
+///
+/// 4 KiB covers both common sector sizes (512 and 4096). Windows' unbuffered reads reject
+/// anything else outright; elsewhere it is simply the granularity worth measuring, since a
+/// read straddling a block boundary costs an I/O the caller did not ask for.
+///
+/// Note this constrains offsets only. Read *lengths* must also be a sector multiple under
+/// `FILE_FLAG_NO_BUFFERING`, which is the caller's business — every block size swept here
+/// is a power of two at or above 64 KiB.
+const OFFSET_ALIGN: u64 = 4096;
 
-/// Read an integer sysctl by name.
-fn sysctl_u64(name: &str) -> Option<u64> {
-    let cname = std::ffi::CString::new(name).ok()?;
-    let mut value: u64 = 0;
-    let mut size = std::mem::size_of::<u64>();
-    // SAFETY: `cname` is a valid NUL-terminated string; `value`/`size` are live locals of
-    // matching type and size. `sysctlbyname` writes at most `size` bytes into `value`.
-    let rc = unsafe {
-        libc::sysctlbyname(
-            cname.as_ptr(),
-            &mut value as *mut u64 as *mut libc::c_void,
-            &mut size,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    if rc != 0 {
-        return None;
-    }
-    // Some sysctls are 32-bit; a 4-byte read leaves the high half as written zeros.
-    Some(value)
-}
-
-/// Read a string sysctl by name.
-fn sysctl_string(name: &str) -> Option<String> {
-    let cname = std::ffi::CString::new(name).ok()?;
-    let mut size: usize = 0;
-    // SAFETY: querying with a null buffer asks for the required size; `size` is a live local.
-    let rc = unsafe {
-        libc::sysctlbyname(
-            cname.as_ptr(),
-            std::ptr::null_mut(),
-            &mut size,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    if rc != 0 || size == 0 {
-        return None;
-    }
-    let mut buf = vec![0u8; size];
-    // SAFETY: `buf` has exactly `size` bytes, which is what the previous call requested.
-    let rc = unsafe {
-        libc::sysctlbyname(
-            cname.as_ptr(),
-            buf.as_mut_ptr() as *mut libc::c_void,
-            &mut size,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    if rc != 0 {
-        return None;
-    }
-    buf.truncate(size);
-    while buf.last() == Some(&0) {
-        buf.pop();
-    }
-    String::from_utf8(buf).ok()
+/// Round down to the previous [`OFFSET_ALIGN`] boundary.
+fn align_down(v: u64) -> u64 {
+    v - (v % OFFSET_ALIGN)
 }
 
 /// Measure random-read throughput at one block size and thread count.
@@ -179,10 +100,13 @@ pub fn measure_random_read(
     threads: usize,
     reads_per_thread: usize,
 ) -> std::io::Result<DiskSample> {
-    let file = std::sync::Arc::new(WeightFile::open(path, CachePolicy::Uncached)?);
+    let file = WeightFile::open(path, CachePolicy::Uncached)?;
     let len = file.len();
 
-    let span = len.saturating_sub(block_bytes as u64);
+    // Offsets are held to a sector multiple. Windows rejects an unaligned unbuffered read
+    // outright, and on every other platform a read straddling a block boundary silently
+    // costs an extra I/O — so the sample would describe a pattern nobody asked to measure.
+    let span = (len.saturating_sub(block_bytes as u64) / OFFSET_ALIGN) * OFFSET_ALIGN;
     if span == 0 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -202,7 +126,11 @@ pub fn measure_random_read(
     let mut handles = Vec::with_capacity(threads);
 
     for t in 0..threads {
-        let file = std::sync::Arc::clone(&file);
+        // A handle of its own, not a shared one. Windows `seek_read` moves the file
+        // pointer, so threads sharing a handle would read each other's offsets and report
+        // throughput from a pattern nobody asked for. Opening per thread costs one syscall
+        // and is done before the barrier, so it stays outside the timed region.
+        let file = file.try_clone()?;
         let barrier = std::sync::Arc::clone(&barrier);
         handles.push(std::thread::spawn(move || -> std::io::Result<u64> {
             let mut buf = AlignedBuf::new(block_bytes);
@@ -210,8 +138,11 @@ pub fn measure_random_read(
             // A large odd stride walks the file without repeating quickly and without
             // degenerating into a sequential scan the readahead could predict. Each
             // thread starts a different fraction of the way in so they do not convoy.
-            let stride = block_bytes as u64 * 7 + 4096;
-            let mut off = (span / threads.max(1) as u64).wrapping_mul(t as u64) % span;
+            // Both are rounded to `OFFSET_ALIGN`, which keeps every offset a sector
+            // multiple however odd the caller's block size is.
+            let stride = align_down(block_bytes as u64 * 7 + OFFSET_ALIGN).max(OFFSET_ALIGN);
+            let start = (span / threads.max(1) as u64).wrapping_mul(t as u64) % span;
+            let mut off = align_down(start);
 
             // Allocation and first-touch of `buf` are done; wait for everyone.
             barrier.wait();
@@ -347,35 +278,13 @@ pub fn measure_memory_bandwidth(bytes: usize, iterations: usize) -> MemorySample
 /// Used to assert that a configured RAM budget was actually honoured. `sift` treats the
 /// budget as a hard ceiling, so this is a test assertion, not a diagnostic.
 pub fn peak_rss_bytes() -> u64 {
-    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
-    // SAFETY: `usage` is a live, correctly-typed local that `getrusage` fully initialises.
-    let rc = unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) };
-    if rc != 0 {
-        return 0;
-    }
-    // Darwin reports maxrss in bytes; Linux reports kilobytes.
-    #[cfg(target_os = "macos")]
-    {
-        usage.ru_maxrss as u64
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        usage.ru_maxrss as u64 * 1024
-    }
+    crate::platform::peak_rss_bytes()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write;
-
-    #[test]
-    fn machine_facts_are_sane() {
-        let f = MachineFacts::collect();
-        assert!(f.ram_bytes > 0, "physical RAM must be discoverable");
-        assert!(f.cpus >= 1);
-        assert!(f.page_bytes.is_power_of_two());
-    }
 
     #[test]
     fn memory_bandwidth_is_positive_and_finite() {
@@ -405,5 +314,56 @@ mod tests {
 
         let err = measure_random_read(f.path(), 1 << 20, 1, 1).expect_err("must reject");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn offsets_stay_sector_aligned_however_odd_the_inputs() {
+        // The invariant Windows enforces at runtime and every other platform pays for
+        // silently. Reproduced here as arithmetic so a regression fails on any OS rather
+        // than only in Windows CI.
+        //
+        // Deliberately awkward: a file length that is not a multiple of the alignment, and
+        // a block size that is not either.
+        let len: u64 = 1_048_576 + 1234;
+        let block: u64 = 5000;
+        let span = align_down(len.saturating_sub(block));
+        let stride = align_down(block * 7 + OFFSET_ALIGN).max(OFFSET_ALIGN);
+        assert!(span > 0);
+        assert_eq!(span % OFFSET_ALIGN, 0);
+        assert_eq!(stride % OFFSET_ALIGN, 0);
+
+        for threads in [1u64, 4, 8] {
+            for t in 0..threads {
+                let mut off = align_down((span / threads).wrapping_mul(t) % span);
+                for _ in 0..64 {
+                    assert_eq!(off % OFFSET_ALIGN, 0, "offset {off} lost its alignment");
+                    assert!(off < span, "offset {off} escaped the span");
+                    off = (off + stride) % span;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn align_down_never_rounds_up() {
+        assert_eq!(align_down(0), 0);
+        assert_eq!(align_down(1), 0);
+        assert_eq!(align_down(4095), 0);
+        assert_eq!(align_down(4096), 4096);
+        assert_eq!(align_down(4097), 4096);
+    }
+
+    #[test]
+    fn a_multi_threaded_read_gives_every_thread_its_own_handle() {
+        // Windows `seek_read` moves the file pointer, so a shared handle would have
+        // threads reading each other's offsets. The totals would still add up, which is
+        // what makes it dangerous — so assert the read actually succeeds under contention.
+        let mut f = tempfile::NamedTempFile::new().expect("temp file");
+        f.write_all(&vec![0xCDu8; 4 << 20]).expect("write");
+        f.flush().expect("flush");
+
+        let s = measure_random_read(f.path(), 64 << 10, 8, 4).expect("measure");
+        assert_eq!(s.total_bytes, (64 << 10) * 8 * 4);
+        assert_eq!(s.threads, 8);
     }
 }
