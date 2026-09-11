@@ -255,10 +255,9 @@ fn describe_curl_failure(stderr: &str) -> String {
         .and_then(|(_, tail)| tail.split_whitespace().next())
         .and_then(|code| code.parse::<u16>().ok());
     match status {
-        Some(401) | Some(404) => format!(
+        Some(code @ (401 | 404)) => format!(
             "no such repo on HuggingFace, or it is private or gated and needs \
-             authentication (HTTP {})",
-            status.unwrap_or(0)
+             authentication (HTTP {code})"
         ),
         Some(code) => format!("HuggingFace answered HTTP {code}"),
         None if stderr.is_empty() => {

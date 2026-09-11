@@ -364,6 +364,9 @@ fn read_shape(
 /// Matches the same way `route` and `inspect` pick a file: exact label first, then a
 /// substring so `Q4` finds `Q4_K_M`, case-insensitively throughout.
 pub fn narrow(cands: Vec<Candidate>, quant: &str) -> Result<Vec<Candidate>> {
+    if cands.is_empty() {
+        anyhow::bail!("no readable weight files in this repo to match `{quant}` against");
+    }
     let want = quant.to_ascii_uppercase();
     let exact: Vec<&Candidate> = cands
         .iter()

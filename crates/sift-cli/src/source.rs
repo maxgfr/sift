@@ -33,6 +33,26 @@ pub enum Source {
     },
 }
 
+/// Bytes that crossed the network to read a remote model's shape.
+///
+/// Kept in two figures because they answer two different questions. `header` is the part
+/// of the *model file* that was read, and zero means the cached header was revalidated
+/// with a `304`. `config` is the repo's `config.json`, a separate small document that is
+/// not part of the model at all, so folding it into the first figure would misreport a
+/// cached header as a partial read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Fetched {
+    pub header: u64,
+    pub config: u64,
+}
+
+impl Fetched {
+    /// Everything that crossed the network, for the headline figure.
+    pub fn total(self) -> u64 {
+        self.header + self.config
+    }
+}
+
 /// Split a `repo:QUANT` reference into its two halves.
 ///
 /// Splits on the last colon so a URL-ish repo name is not mangled, and refuses a suffix
@@ -41,7 +61,10 @@ pub enum Source {
 /// `org/repo:Q4_K_M` means.
 pub fn split_quant(reference: &str) -> (&str, Option<&str>) {
     match reference.rsplit_once(':') {
-        Some((repo, quant)) if !quant.is_empty() && !quant.contains('/') => (repo, Some(quant)),
+        // A trailing colon with nothing after it is a slip of the finger, not a
+        // quantization, and not part of the repo name either.
+        Some((repo, "")) => (repo, None),
+        Some((repo, quant)) if !quant.contains('/') => (repo, Some(quant)),
         _ => (reference, None),
     }
 }
@@ -150,7 +173,7 @@ impl Source {
     /// in the repo's `config.json`, so they are fetched when the reference named a repo and
     /// reported as unavailable — not guessed — for a bare file or URL, which has no way to
     /// locate that document.
-    pub fn read_shape(&self) -> Result<(sift_core::model::ModelShape, Option<u64>)> {
+    pub fn read_shape(&self) -> Result<(sift_core::model::ModelShape, Option<Fetched>)> {
         if self.format() == sift_core::engine::Format::Safetensors {
             let (st, facts, fetched) = match self {
                 Source::Local(p) => {
@@ -167,17 +190,24 @@ impl Source {
                     let mut f = RemoteFile::new(url.clone());
                     let st = sift_core::model::Safetensors::parse(&mut f)
                         .with_context(|| format!("reading {url}"))?;
-                    let mut bytes = f.bytes_fetched();
-                    // Counted in the bytes-read figure: "nothing was downloaded" is a
-                    // claim that should include every request made to back it.
-                    let facts = match repo.as_deref().and_then(hub::fetch_config) {
+                    // Counted, but separately from the header: "nothing was downloaded"
+                    // is a claim that should include every request made to back it, and
+                    // a 660-byte config must not turn a revalidated header into "0.00 MiB
+                    // of the model was read".
+                    let (facts, config) = match repo.as_deref().and_then(hub::fetch_config) {
                         Some((cfg, n)) => {
-                            bytes += n;
-                            sift_core::model::safetensors::facts_from_config(&cfg)
+                            (sift_core::model::safetensors::facts_from_config(&cfg), n)
                         }
-                        None => Default::default(),
+                        None => (Default::default(), 0),
                     };
-                    (st, facts, Some(bytes))
+                    (
+                        st,
+                        facts,
+                        Some(Fetched {
+                            header: f.bytes_fetched(),
+                            config,
+                        }),
+                    )
                 }
             };
             return Ok((
@@ -187,7 +217,10 @@ impl Source {
         }
 
         let (g, fetched) = self.read_gguf()?;
-        Ok((g.shape(), fetched))
+        Ok((
+            g.shape(),
+            fetched.map(|header| Fetched { header, config: 0 }),
+        ))
     }
 
     /// Read the model's GGUF tensor directory. Payload is never fetched.
@@ -222,7 +255,10 @@ impl Source {
 fn pick<'a>(files: &'a [RepoFile], quant: Option<&str>) -> Result<&'a RepoFile> {
     let whole: Vec<&RepoFile> = files.iter().filter(|f| !f.is_shard()).collect();
     if whole.is_empty() {
-        bail!("this repo only contains split shards, which cannot be inspected individually");
+        bail!(
+            "this repo only contains split shards, which cannot be inspected individually — \
+             `sift fit` sums the parts of a split model"
+        );
     }
 
     match quant {
@@ -359,6 +395,7 @@ mod tests {
             split_quant("https://example.com/a/b"),
             ("https://example.com/a/b", None)
         );
-        assert_eq!(split_quant("org/repo:"), ("org/repo:", None));
+        // A trailing colon is dropped rather than sent to the hub as part of the name.
+        assert_eq!(split_quant("org/repo:"), ("org/repo", None));
     }
 }

@@ -826,7 +826,11 @@ fn cmd_inspect(src: &Source, list_tensors: bool, json: bool) -> Result<()> {
                 "bits_per_weight": shape.bits_per_weight(),
                 // The headline claim, as a measurement rather than a promise. Null for a
                 // local file, where nothing was transferred at all.
-                "bytes_read_over_http": fetched,
+                "bytes_read_over_http": fetched.map(|f| f.total()),
+                // Of which the repo's `config.json`, for a safetensors repo. Split out so
+                // a consumer can tell "the header was cached" from "659 bytes of the model
+                // were read": the two are different claims.
+                "config_json_bytes_read_over_http": fetched.map(|f| f.config),
                 "moe": moe,
                 "kv_cache": kv,
                 "tensors": list_tensors.then(|| shape.tensors().iter().map(|t| serde_json::json!({
@@ -855,15 +859,25 @@ fn cmd_inspect(src: &Source, list_tensors: bool, json: bool) -> Result<()> {
         // Zero bytes over a remote source means the cached header was revalidated with a
         // conditional request and the server answered 304. Worth saying outright: "0.00 MiB
         // read" is true but reads like a bug.
-        Some(0) => println!("  read over HTTP   nothing — cached header still current (304)"),
+        Some(f) if f.header == 0 => {
+            println!("  read over HTTP   nothing — cached header still current (304)")
+        }
         // The headline claim of this tool, stated as a measurement rather than a promise.
-        Some(bytes) => println!(
+        Some(f) => println!(
             "  read over HTTP   {:.2} MiB of a {:.2} GiB model ({:.4}%)",
-            sift_core::mib(bytes),
+            sift_core::mib(f.header),
             sift_core::gib(payload),
-            bytes as f64 / payload.max(1) as f64 * 100.0
+            f.header as f64 / payload.max(1) as f64 * 100.0
         ),
         None => println!("  read from disk   directory only, payload untouched"),
+    }
+    // The config is not part of the model, so it gets its own line rather than inflating
+    // the figure above.
+    if let Some(f) = fetched.filter(|f| f.config > 0) {
+        println!(
+            "  config.json      {} bytes, for the architecture",
+            f.config
+        );
     }
 
     match model::infer_moe_shape(&shape) {
@@ -929,8 +943,9 @@ fn cmd_inspect(src: &Source, list_tensors: bool, json: bool) -> Result<()> {
             }
         }
         None => println!(
-            "\nkv cache         not sizeable: the metadata does not state layers, kv heads\n                 \
-             and head width, so `fit` counts weights only for this model"
+            "\nkv cache         not sizeable: layers, kv heads or head width are not stated —\n                 \
+             a bare safetensors file or URL has no config.json to read them from —\n                 \
+             so `fit` counts weights only for this model"
         ),
     }
 
