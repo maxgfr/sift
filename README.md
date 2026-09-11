@@ -120,7 +120,7 @@ Or `cargo build --release` — Rust 1.85+, no runtime dependencies beyond `curl`
 sift fit <hf-repo>[:QUANT] [--ctx N]   which quantization to download, and why
 sift ls [--ctx N]                      every local model, across every engine
 sift route <model>                     which engine should run it
-sift inspect <path|hf-repo>            model shape, local or remote, no download
+sift inspect <path|hf-repo>            model shape and KV cache, local or remote, no download
 sift plan <model>                      per-token traffic and speed ceilings
 sift bench [--engine E]                measure a real engine, and record it
 sift doctor [--disk-sample F]          measure this machine

@@ -906,6 +906,34 @@ fn cmd_inspect(src: &Source, list_tensors: bool, json: bool) -> Result<()> {
         None => println!("\ndense model (no stacked expert tensors)"),
     }
 
+    // The same facts `--json` reports under `kv_cache`, so the two views cannot disagree
+    // about whether the model's metadata was enough to size it. Shown at 4k, the context
+    // engines start at, with the trained maximum alongside because the two can differ by
+    // 64x and the cache scales linearly between them.
+    match model::infer_kv_shape(&shape) {
+        Some(kv) => {
+            println!("\nkv cache");
+            println!("  layers           {}", kv.layers);
+            println!("  kv heads         {}", kv.kv_heads);
+            println!("  head dim         {}", kv.head_dim);
+            println!(
+                "  at 4096 tokens   {:.2} GiB f16",
+                sift_core::gib(kv.bytes_at(4096, model::KV_F16_BYTES))
+            );
+            match kv.train_context {
+                Some(ctx) => println!(
+                    "  at trained max   {:.2} GiB f16 ({ctx} tokens)",
+                    sift_core::gib(kv.bytes_at(ctx, model::KV_F16_BYTES))
+                ),
+                None => println!("  trained context  not stated"),
+            }
+        }
+        None => println!(
+            "\nkv cache         not sizeable: the metadata does not state layers, kv heads\n                 \
+             and head width, so `fit` counts weights only for this model"
+        ),
+    }
+
     if list_tensors {
         println!("\ntensors");
         for t in shape.tensors() {
