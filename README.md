@@ -117,15 +117,15 @@ Or `cargo build --release` — Rust 1.85+, no runtime dependencies beyond `curl`
 ## Commands
 
 ```
-sift fit <hf-repo> [--ctx N]    which quantization to download, and why
-sift ls [--ctx N]               every local model, across every engine
-sift route <model>              which engine should run it
-sift inspect <path|hf-repo>     model shape, local or remote, no download
-sift plan <model>               per-token traffic and speed ceilings
-sift bench [--engine E]         measure a real engine, and record it
-sift doctor [--disk-sample F]   measure this machine
-sift engines                    which runtimes are installed here
-sift cache [--clear]            what the header cache holds, and empty it
+sift fit <hf-repo>[:QUANT] [--ctx N]   which quantization to download, and why
+sift ls [--ctx N]                      every local model, across every engine
+sift route <model>                     which engine should run it
+sift inspect <path|hf-repo>            model shape, local or remote, no download
+sift plan <model>                      per-token traffic and speed ceilings
+sift bench [--engine E]                measure a real engine, and record it
+sift doctor [--disk-sample F]          measure this machine
+sift engines                           which runtimes are installed here
+sift cache [--clear]                   what the header cache holds, and empty it
 ```
 
 `<model>` accepts a path, `org/repo`, `org/repo:QUANT`, or a URL, in GGUF **or
@@ -259,7 +259,7 @@ Early, and honest about it.
 - macOS, Linux, Windows x64 and Windows on ARM. The measurement layer has a real
   implementation per OS behind one seam, so nothing outside `sift_core::platform` carries a
   `cfg`, and all four run the full test suite in CI.
-- 144 tests, clippy clean on all four.
+- 157 tests, clippy clean on all four.
 
 ### Two kinds of accelerator memory, never added together
 

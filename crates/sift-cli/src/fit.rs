@@ -22,6 +22,7 @@ use sift_core::hub;
 use sift_core::model::{self, hf_url, RemoteFile, TokenTraffic};
 
 /// One evaluated quantization.
+#[derive(Debug)]
 pub struct Candidate {
     pub label: String,
     /// What to pass `huggingface-cli download` to get this quantization.
@@ -178,7 +179,7 @@ pub fn evaluate(
     let config = if files.iter().any(|f| f.is_safetensors())
         || sets.iter().any(|s| s.base.is_safetensors())
     {
-        fetch_config(repo)
+        hub::fetch_config(repo).map(|(cfg, _)| cfg)
     } else {
         None
     };
@@ -355,25 +356,44 @@ fn read_shape(
     model::ModelShape::sharded(&parts).context("no parts to merge")
 }
 
-/// Fetch a repo's `config.json`, which safetensors needs and GGUF does not.
+/// Keep only the candidates whose quantization matches `quant`.
 ///
-/// Absence is not an error: plenty of repos omit it, and the honest consequence is that
-/// the KV cache goes uncounted and `fit` says so.
-fn fetch_config(repo: &str) -> Option<serde_json::Value> {
-    let out = std::process::Command::new("curl")
-        .args([
-            "-sSL",
-            "--fail",
-            "--max-time",
-            "20",
-            &model::safetensors::hf_config_url(repo),
-        ])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
+/// `sift fit repo:Q4_K_M` asks a narrower question than `sift fit repo` — does *this* file
+/// fit, and at what speed — so the table shrinks to it rather than the suffix being sent to
+/// the hub as part of the repo name, which is what happened before and produced a `401`.
+/// Matches the same way `route` and `inspect` pick a file: exact label first, then a
+/// substring so `Q4` finds `Q4_K_M`, case-insensitively throughout.
+pub fn narrow(cands: Vec<Candidate>, quant: &str) -> Result<Vec<Candidate>> {
+    let want = quant.to_ascii_uppercase();
+    let exact: Vec<&Candidate> = cands
+        .iter()
+        .filter(|c| c.label.to_ascii_uppercase() == want)
+        .collect();
+    let keep: Vec<bool> = if exact.is_empty() {
+        cands
+            .iter()
+            .map(|c| c.label.to_ascii_uppercase().contains(&want))
+            .collect()
+    } else {
+        cands
+            .iter()
+            .map(|c| c.label.to_ascii_uppercase() == want)
+            .collect()
+    };
+
+    if !keep.iter().any(|&k| k) {
+        let available: Vec<&str> = cands.iter().map(|c| c.label.as_str()).collect();
+        anyhow::bail!(
+            "no quantization matching `{quant}` in this repo. Available: {}",
+            available.join(", ")
+        );
     }
-    serde_json::from_slice(&out.stdout).ok()
+
+    Ok(cands
+        .into_iter()
+        .zip(keep)
+        .filter_map(|(c, k)| k.then_some(c))
+        .collect())
 }
 
 /// Turn a model's shape into an evaluated candidate.
@@ -808,6 +828,49 @@ mod tests {
             candidate("F16", 60.0, Some(16.0), Regime::Oversized),
         ];
         assert_eq!(pick(&cands).label, "Q3_K_M");
+    }
+
+    fn labels(cands: &[Candidate]) -> Vec<&str> {
+        cands.iter().map(|c| c.label.as_str()).collect()
+    }
+
+    fn three_quants() -> Vec<Candidate> {
+        vec![
+            candidate("Q4_K_M", 18.0, Some(4.8), Regime::Fits),
+            candidate("Q4_K_S", 17.0, Some(4.5), Regime::Fits),
+            candidate("Q8_0", 32.0, Some(8.5), Regime::Oversized),
+        ]
+    }
+
+    #[test]
+    fn an_exact_quant_narrows_to_that_one_file() {
+        let kept = narrow(three_quants(), "Q4_K_M").unwrap();
+        assert_eq!(labels(&kept), ["Q4_K_M"]);
+    }
+
+    #[test]
+    fn a_partial_quant_keeps_every_match_rather_than_guessing_one() {
+        // `Q4` is ambiguous between two files here, and the table is the right place to
+        // show both — picking silently would hide the choice.
+        let kept = narrow(three_quants(), "q4").unwrap();
+        assert_eq!(labels(&kept), ["Q4_K_M", "Q4_K_S"]);
+    }
+
+    #[test]
+    fn an_exact_match_beats_a_substring_that_would_also_match() {
+        // `Q4_K_M` is also a substring of `UD-Q4_K_M`; the exact file wins outright.
+        let cands = vec![
+            candidate("UD-Q4_K_M", 19.0, Some(4.9), Regime::Fits),
+            candidate("Q4_K_M", 18.0, Some(4.8), Regime::Fits),
+        ];
+        assert_eq!(labels(&narrow(cands, "Q4_K_M").unwrap()), ["Q4_K_M"]);
+    }
+
+    #[test]
+    fn an_unknown_quant_lists_what_the_repo_actually_has() {
+        let err = narrow(three_quants(), "IQ2_XXS").unwrap_err().to_string();
+        assert!(err.contains("IQ2_XXS"), "{err}");
+        assert!(err.contains("Q4_K_M") && err.contains("Q8_0"), "{err}");
     }
 }
 

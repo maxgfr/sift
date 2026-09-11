@@ -23,7 +23,49 @@ pub enum Source {
     /// A file on this machine.
     Local(PathBuf),
     /// A URL, plus the repo and file it came from when known.
-    Remote { url: String, label: String },
+    Remote {
+        url: String,
+        label: String,
+        /// The `org/repo` this was resolved from, when it was. A safetensors file keeps
+        /// its architecture numbers in the repo's `config.json`, so knowing the repo is
+        /// what makes KV sizing possible for that format.
+        repo: Option<String>,
+    },
+}
+
+/// Split a `repo:QUANT` reference into its two halves.
+///
+/// Splits on the last colon so a URL-ish repo name is not mangled, and refuses a suffix
+/// containing `/`, which would mean the colon was part of something else. Shared by every
+/// command that takes a model reference, so `fit` and `route` cannot disagree about what
+/// `org/repo:Q4_K_M` means.
+pub fn split_quant(reference: &str) -> (&str, Option<&str>) {
+    match reference.rsplit_once(':') {
+        Some((repo, quant)) if !quant.is_empty() && !quant.contains('/') => (repo, Some(quant)),
+        _ => (reference, None),
+    }
+}
+
+/// Whether a reference that does not exist on disk was nonetheless meant as a path.
+///
+/// `org/repo` and `/models/x.gguf` both contain a slash; only the second should be answered
+/// with "no such file" rather than a network request that fails with an HTTP status. A
+/// weight-file extension, a leading `/`, `./`, `../` or `~`, or a Windows drive or UNC
+/// prefix all settle it.
+fn looks_like_path(reference: &str) -> bool {
+    let lower = reference.to_ascii_lowercase();
+    lower.ends_with(".gguf")
+        || lower.ends_with(".safetensors")
+        || reference.starts_with('/')
+        || reference.starts_with("./")
+        || reference.starts_with("../")
+        || reference.starts_with('~')
+        || reference.starts_with('\\')
+        || reference
+            .as_bytes()
+            .get(1)
+            .is_some_and(|&b| b == b':' && reference.as_bytes()[0].is_ascii_alphabetic())
+            && reference.len() > 2
 }
 
 impl Source {
@@ -46,14 +88,17 @@ impl Source {
                     .next()
                     .unwrap_or(reference)
                     .to_string(),
+                repo: None,
             });
         }
 
-        // `repo:QUANT` — split on the last colon so a URL-ish repo name is not mangled.
-        let (repo, inline_quant) = match reference.rsplit_once(':') {
-            Some((r, q)) if !q.contains('/') => (r, Some(q)),
-            _ => (reference, None),
-        };
+        // A path that does not exist is a typo, not a hub repo. Asking HuggingFace about
+        // `/models/x.gguf` produces a 404 that reads as a network problem.
+        if looks_like_path(reference) {
+            bail!("no such file: {reference}");
+        }
+
+        let (repo, inline_quant) = split_quant(reference);
         let wanted = quant.or(inline_quant);
 
         if !repo.contains('/') {
@@ -76,6 +121,7 @@ impl Source {
         Ok(Source::Remote {
             url: hf_url(repo, &chosen.path),
             label: format!("{repo}:{}", chosen.quant_label()),
+            repo: Some(repo.to_string()),
         })
     }
 
@@ -100,31 +146,42 @@ impl Source {
     /// which callers print, because "we did not download the model" is a claim that should
     /// come with evidence.
     ///
-    /// Architecture facts are only available for GGUF here. A safetensors file keeps them
-    /// in the repo's `config.json`, which a single-file reference has no way to locate —
-    /// so KV sizing is reported as unavailable rather than guessed.
+    /// GGUF carries its architecture facts in its own header. A safetensors file keeps them
+    /// in the repo's `config.json`, so they are fetched when the reference named a repo and
+    /// reported as unavailable — not guessed — for a bare file or URL, which has no way to
+    /// locate that document.
     pub fn read_shape(&self) -> Result<(sift_core::model::ModelShape, Option<u64>)> {
         if self.format() == sift_core::engine::Format::Safetensors {
-            let (st, fetched) = match self {
+            let (st, facts, fetched) = match self {
                 Source::Local(p) => {
                     let mut f = std::fs::File::open(p)
                         .with_context(|| format!("opening {}", p.display()))?;
                     (
                         sift_core::model::Safetensors::parse(&mut f)
                             .with_context(|| format!("reading {}", p.display()))?,
+                        Default::default(),
                         None,
                     )
                 }
-                Source::Remote { url, .. } => {
+                Source::Remote { url, repo, .. } => {
                     let mut f = RemoteFile::new(url.clone());
                     let st = sift_core::model::Safetensors::parse(&mut f)
                         .with_context(|| format!("reading {url}"))?;
-                    let bytes = f.bytes_fetched();
-                    (st, Some(bytes))
+                    let mut bytes = f.bytes_fetched();
+                    // Counted in the bytes-read figure: "nothing was downloaded" is a
+                    // claim that should include every request made to back it.
+                    let facts = match repo.as_deref().and_then(hub::fetch_config) {
+                        Some((cfg, n)) => {
+                            bytes += n;
+                            sift_core::model::safetensors::facts_from_config(&cfg)
+                        }
+                        None => Default::default(),
+                    };
+                    (st, facts, Some(bytes))
                 }
             };
             return Ok((
-                sift_core::model::ModelShape::new(Default::default(), st.tensors, 1),
+                sift_core::model::ModelShape::new(facts, st.tensors, 1),
                 fetched,
             ));
         }
@@ -253,5 +310,55 @@ mod tests {
     fn urls_are_passed_through() {
         let s = Source::resolve("https://example.com/a/model.gguf", None).unwrap();
         assert_eq!(s.label(), "model.gguf");
+    }
+
+    #[test]
+    fn a_missing_path_is_reported_as_missing_not_asked_of_the_hub() {
+        // `/nonexistent/x.gguf` contains a slash, which is all an `org/repo` needs. It must
+        // still be answered as a file that is not there, without a network request.
+        for reference in [
+            "/nonexistent/model.gguf",
+            "./missing.gguf",
+            "../missing/model.safetensors",
+            "~/models/missing.gguf",
+            "models/missing.gguf",
+            "org/repo.safetensors",
+            "C:\\models\\missing.gguf",
+        ] {
+            let err = Source::resolve(reference, None).unwrap_err().to_string();
+            assert!(
+                err.contains("no such file"),
+                "{reference} should be treated as a path: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_repo_reference_is_not_mistaken_for_a_path() {
+        assert!(!looks_like_path("unsloth/Qwen3-30B-A3B-GGUF"));
+        assert!(!looks_like_path("unsloth/Qwen3-30B-A3B-GGUF:Q4_K_M"));
+        assert!(!looks_like_path("Qwen/Qwen2.5-0.5B-Instruct"));
+    }
+
+    #[test]
+    fn an_inline_quant_is_split_off_the_repo() {
+        assert_eq!(
+            split_quant("unsloth/Qwen3-30B-A3B-GGUF:Q4_K_M"),
+            ("unsloth/Qwen3-30B-A3B-GGUF", Some("Q4_K_M"))
+        );
+        assert_eq!(
+            split_quant("unsloth/Qwen3-30B-A3B-GGUF"),
+            ("unsloth/Qwen3-30B-A3B-GGUF", None)
+        );
+    }
+
+    #[test]
+    fn a_colon_followed_by_a_slash_is_not_a_quant() {
+        // A URL-shaped string reaching here must survive intact.
+        assert_eq!(
+            split_quant("https://example.com/a/b"),
+            ("https://example.com/a/b", None)
+        );
+        assert_eq!(split_quant("org/repo:"), ("org/repo:", None));
     }
 }

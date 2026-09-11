@@ -98,6 +98,9 @@ enum Command {
     /// Which quantization of a model should you download for this machine?
     Fit {
         /// A HuggingFace repo, e.g. `unsloth/Qwen3-30B-A3B-GGUF`.
+        ///
+        /// An `org/repo:QUANT` suffix sizes a single quantization instead of the whole
+        /// repo, e.g. `unsloth/Qwen3-30B-A3B-GGUF:Q4_K_M`.
         repo: String,
         /// Context length to size the KV cache for, in tokens.
         ///
@@ -297,6 +300,11 @@ fn cmd_cache(clear: bool, json: bool) -> Result<()> {
 }
 
 fn cmd_fit(repo: &str, context_tokens: u64, json: bool) -> Result<()> {
+    // `fit repo:QUANT` asks about one quantization. The suffix is stripped here rather than
+    // reaching the hub: it used to be sent as part of the repo name, and HuggingFace answers
+    // a 401 for a repo that does not exist, so a valid request read as an auth failure.
+    let (repo, quant) = source::split_quant(repo);
+
     let facts = MachineFacts::collect();
     let usable = usable_ram(&facts);
     // Read bandwidth, not copy: decode streams weights in and writes back a small
@@ -322,6 +330,12 @@ fn cmd_fit(repo: &str, context_tokens: u64, json: bool) -> Result<()> {
     }
 
     let cands = fit::evaluate(repo, mem.gb_per_sec * 1e9, usable, context_tokens)?;
+    // Narrow after the sweep, not before it: the hub listing is what knows which labels
+    // exist, so an unmatched suffix can be answered with the ones that do.
+    let cands = match quant {
+        Some(q) => fit::narrow(cands, q)?,
+        None => cands,
+    };
     if json {
         return fit::report_json(repo, &cands, &facts, usable, mem.gb_per_sec, context_tokens);
     }

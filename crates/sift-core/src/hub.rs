@@ -206,14 +206,7 @@ pub fn list_weights(repo: &str) -> Result<Vec<RepoFile>, HubError> {
     if !out.status.success() {
         return Err(HubError::Request {
             repo: repo.to_string(),
-            detail: {
-                let e = String::from_utf8_lossy(&out.stderr);
-                if e.trim().is_empty() {
-                    "no such repo, or it is gated and needs authentication".into()
-                } else {
-                    e.trim().to_string()
-                }
-            },
+            detail: describe_curl_failure(&String::from_utf8_lossy(&out.stderr)),
         });
     }
 
@@ -248,6 +241,55 @@ pub fn list_weights(repo: &str) -> Result<Vec<RepoFile>, HubError> {
 
     files.sort_by_key(|f| f.size);
     Ok(files)
+}
+
+/// Turn curl's failure text into something a user can act on.
+///
+/// The hub answers `401` for a repo that does not exist as well as for one that is gated,
+/// so a raw `curl: (22) The requested URL returned error: 401` reads as an authentication
+/// problem to someone who merely mistyped a name. Name both possibilities.
+fn describe_curl_failure(stderr: &str) -> String {
+    let stderr = stderr.trim();
+    let status = stderr
+        .rsplit_once("returned error: ")
+        .and_then(|(_, tail)| tail.split_whitespace().next())
+        .and_then(|code| code.parse::<u16>().ok());
+    match status {
+        Some(401) | Some(404) => format!(
+            "no such repo on HuggingFace, or it is private or gated and needs \
+             authentication (HTTP {})",
+            status.unwrap_or(0)
+        ),
+        Some(code) => format!("HuggingFace answered HTTP {code}"),
+        None if stderr.is_empty() => {
+            "no such repo, or it is gated and needs authentication".to_string()
+        }
+        None => stderr.to_string(),
+    }
+}
+
+/// Fetch a repo's `config.json`, which safetensors needs and GGUF does not.
+///
+/// Absence is not an error: plenty of repos omit it, and the honest consequence is that
+/// the KV cache goes uncounted and the caller says so. Returns the parsed document and how
+/// many bytes crossed the network to get it, so callers that report their traffic can
+/// count it.
+pub fn fetch_config(repo: &str) -> Option<(serde_json::Value, u64)> {
+    let out = Command::new("curl")
+        .args([
+            "-sSL",
+            "--fail",
+            "--max-time",
+            "20",
+            &crate::model::safetensors::hf_config_url(repo),
+        ])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let value = serde_json::from_slice(&out.stdout).ok()?;
+    Some((value, out.stdout.len() as u64))
 }
 
 #[cfg(test)]
@@ -421,5 +463,39 @@ mod shard_tests {
         assert!(shard_position("M-Q4_K_M-00004-of-00003.gguf").is_none());
         assert!(shard_position("M-Q4_K_M-000x-of-00003.gguf").is_none());
         assert!(shard_position("M-Q4_K_M-00001-of-.gguf").is_none());
+    }
+
+    #[test]
+    fn a_401_from_the_hub_is_explained_as_a_missing_or_gated_repo() {
+        // The hub answers 401 for a typo exactly as it does for a gated repo, so the
+        // message must name both rather than send the user looking for a token.
+        let msg = describe_curl_failure("curl: (22) The requested URL returned error: 401");
+        assert!(msg.contains("no such repo"), "{msg}");
+        assert!(msg.contains("gated"), "{msg}");
+        assert!(msg.contains("401"), "{msg}");
+    }
+
+    #[test]
+    fn a_404_gets_the_same_explanation() {
+        let msg = describe_curl_failure("curl: (56) The requested URL returned error: 404\n");
+        assert!(msg.contains("no such repo"), "{msg}");
+        assert!(msg.contains("404"), "{msg}");
+    }
+
+    #[test]
+    fn other_http_statuses_are_reported_as_such() {
+        let msg = describe_curl_failure("curl: (22) The requested URL returned error: 503");
+        assert_eq!(msg, "HuggingFace answered HTTP 503");
+    }
+
+    #[test]
+    fn a_non_http_failure_keeps_curls_own_words() {
+        let msg = describe_curl_failure("curl: (6) Could not resolve host: huggingface.co\n");
+        assert_eq!(msg, "curl: (6) Could not resolve host: huggingface.co");
+    }
+
+    #[test]
+    fn silence_from_curl_still_yields_a_sentence() {
+        assert!(describe_curl_failure("   ").contains("no such repo"));
     }
 }
