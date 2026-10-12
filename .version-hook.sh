@@ -7,9 +7,9 @@
 # and the release is tagged but the tree does not build:
 #
 #   1. `[workspace.package] version`, which every member inherits.
-#   2. `[workspace.dependencies] sift-core`'s `version` requirement. sift-cli and
-#      sift-bench depend on sift-core by path *and* version; once the crate is 0.2.0 a
-#      `^0.1.0` requirement no longer matches and cargo refuses to resolve.
+#   2. `[workspace.dependencies] sift-core`'s `version` requirement. sift-cli depends on
+#      sift-core by path *and* version; once the crate is 0.2.0 a `^0.1.0` requirement no
+#      longer matches and cargo refuses to resolve.
 #   3. The member entries in Cargo.lock, which is tracked because this workspace ships
 #      binaries.
 #

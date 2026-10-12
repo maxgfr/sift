@@ -1,9 +1,19 @@
 name: Release
 
+# Released only from a commit CI has passed. On `push` the two workflows raced: a commit
+# that failed its tests could be tagged and shipped before CI reported, and the binaries
+# built from it went out to Homebrew regardless.
 on:
-  push:
-    branches:
-      - main
+  workflow_run:
+    workflows: [ci]
+    types: [completed]
+    branches: [main]
+
+# One release at a time. Two pushes in quick succession must not run semantic-release
+# twice against the same tags.
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 permissions:
   contents: write
@@ -12,14 +22,22 @@ permissions:
 
 jobs:
   release:
+    # A push to main that CI passed. Not a pull request's run, and not a failed one.
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push'
     runs-on: ubuntu-latest
     outputs:
       published: ${{ steps.semantic.outputs.new_release_published }}
       version: ${{ steps.semantic.outputs.new_release_version }}
     steps:
+      # The commit CI tested, not whatever main points at by now. If main has moved on,
+      # semantic-release sees the branch is behind and publishes nothing; the newer
+      # commit's own CI run releases it instead.
       - name: Checkout
         uses: actions/checkout@v5
         with:
+          ref: ${{ github.event.workflow_run.head_sha }}
           fetch-depth: 0
 
       - name: Install Rust

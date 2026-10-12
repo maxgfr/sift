@@ -31,5 +31,17 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all -- --check
-      - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test --all
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      # `--locked`: the release builds from Cargo.lock, so CI must test what it ships
+      # rather than whatever newer dependency versions resolve on the day.
+      - run: cargo test --all --locked
+
+  # The manifests promise `rust-version = "1.85"`. Without a job on that toolchain the
+  # promise is only as good as the last time someone happened to check it.
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.85
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --all-targets --locked
