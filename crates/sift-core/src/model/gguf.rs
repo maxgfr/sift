@@ -29,6 +29,13 @@ pub enum Value {
     U64(u64),
     I64(i64),
     F64(f64),
+    /// An array the reader stepped over without materialising, keeping only its length.
+    ///
+    /// The tokenizer vocabulary is the case that matters: 150k strings allocated per
+    /// candidate, for a planner that never reads a token.
+    Skipped {
+        len: u64,
+    },
 }
 
 impl Value {
@@ -71,6 +78,9 @@ pub struct TensorInfo {
 
 impl TensorInfo {
     /// Total number of weights.
+    ///
+    /// Cannot overflow: [`Gguf::parse`] refuses a tensor whose dimensions multiply past
+    /// `u64`, so every `TensorInfo` it hands out has a representable element count.
     pub fn n_elems(&self) -> u64 {
         self.dims.iter().product()
     }
@@ -116,6 +126,13 @@ pub enum GgufError {
     },
     #[error("string of {0} bytes is implausible")]
     ImplausibleString(u64),
+    #[error(
+        "this GGUF is big-endian (written for s390x or similar); sift reads little-endian \
+         GGUF only, which is what every mainstream publisher ships"
+    )]
+    BigEndian,
+    #[error("tensor `{0}` has a shape or offset that overflows a 64-bit size")]
+    Overflow(String),
 }
 
 // A corrupt or hostile file can encode enormous counts. Refuse them rather than
@@ -125,9 +142,20 @@ const MAX_KV: u64 = 1 << 20;
 const MAX_DIMS: u64 = 8;
 const MAX_STRING: u64 = 1 << 26;
 const MAX_ARRAY: u64 = 1 << 26;
+/// Elements held across every array the reader keeps, tokenizer arrays excluded.
+///
+/// Each element costs a `Value`, so the per-array bound alone still allows a file with a
+/// few dozen maximal arrays to ask for tens of gigabytes. Nothing a planner reads is an
+/// array of more than a few hundred entries — per-layer head counts are the largest.
+const MAX_HELD_ARRAY_ELEMS: u64 = 1 << 22;
+
+/// Metadata arrays under this prefix are stepped over rather than read.
+const SKIPPED_PREFIX: &str = "tokenizer.";
 
 struct Reader<R> {
     inner: R,
+    /// Array elements materialised so far, against [`MAX_HELD_ARRAY_ELEMS`].
+    held: u64,
 }
 
 impl<R: Read + Seek> Reader<R> {
@@ -176,13 +204,13 @@ impl<R: Read + Seek> Reader<R> {
             7 => Value::Bool(self.u8()? != 0),
             8 => Value::String(self.string()?),
             9 => {
-                let elem_ty = self.u32()?;
-                let n = self.u64()?;
-                if n > MAX_ARRAY {
+                let (elem_ty, n) = self.array_header()?;
+                self.held = self.held.saturating_add(n);
+                if self.held > MAX_HELD_ARRAY_ELEMS {
                     return Err(GgufError::Implausible {
-                        what: "array",
-                        n,
-                        limit: MAX_ARRAY,
+                        what: "metadata array elements",
+                        n: self.held,
+                        limit: MAX_HELD_ARRAY_ELEMS,
                     });
                 }
                 let mut items = Vec::with_capacity(n.min(4096) as usize);
@@ -197,6 +225,65 @@ impl<R: Read + Seek> Reader<R> {
             other => return Err(GgufError::BadValueType(other)),
         })
     }
+
+    /// Read an array's element type and length, refusing what llama.cpp refuses.
+    ///
+    /// An array of arrays is rejected outright, as llama.cpp's own reader does: no
+    /// publisher writes one, and accepting it would let a hostile file nest the per-array
+    /// bound into a product of bounds.
+    fn array_header(&mut self) -> Result<(u32, u64), GgufError> {
+        let elem_ty = self.u32()?;
+        if elem_ty == 9 {
+            return Err(GgufError::BadValueType(9));
+        }
+        let n = self.u64()?;
+        if n > MAX_ARRAY {
+            return Err(GgufError::Implausible {
+                what: "array",
+                n,
+                limit: MAX_ARRAY,
+            });
+        }
+        Ok((elem_ty, n))
+    }
+
+    /// Step over an array without materialising it.
+    ///
+    /// Fixed-width elements are one seek. Strings are read through without being kept, so
+    /// nothing is allocated either way.
+    fn skip_array(&mut self) -> Result<Value, GgufError> {
+        let (elem_ty, n) = self.array_header()?;
+        let width = match elem_ty {
+            0 | 1 | 7 => Some(1),
+            2 | 3 => Some(2),
+            4..=6 => Some(4),
+            10..=12 => Some(8),
+            8 => None,
+            other => return Err(GgufError::BadValueType(other)),
+        };
+        match width {
+            Some(w) => {
+                let bytes = (n * w) as i64; // n <= 2^26 and w <= 8, so this cannot overflow
+                self.inner.seek(io::SeekFrom::Current(bytes))?;
+            }
+            None => {
+                // Read through rather than seek: a seek discards a `BufReader`'s buffer,
+                // and 150k of them would refill it 150k times. Copying into a sink costs
+                // a memcpy per string and allocates nothing.
+                for _ in 0..n {
+                    let len = self.u64()?;
+                    if len > MAX_STRING {
+                        return Err(GgufError::ImplausibleString(len));
+                    }
+                    let copied = io::copy(&mut (&mut self.inner).take(len), &mut io::sink())?;
+                    if copied != len {
+                        return Err(io::Error::from(io::ErrorKind::UnexpectedEof).into());
+                    }
+                }
+            }
+        }
+        Ok(Value::Skipped { len: n })
+    }
 }
 
 impl Gguf {
@@ -209,13 +296,22 @@ impl Gguf {
 
     /// Parse a GGUF directory from any seekable reader.
     pub fn parse<R: Read + Seek>(inner: R) -> Result<Self, GgufError> {
-        let mut r = Reader { inner };
+        let mut r = Reader { inner, held: 0 };
 
         let magic = r.u32()?;
+        if magic == MAGIC.swap_bytes() {
+            return Err(GgufError::BigEndian);
+        }
         if magic != MAGIC {
             return Err(GgufError::BadMagic(magic));
         }
         let version = r.u32()?;
+        // A big-endian file keeps the magic bytes in order and swaps everything after
+        // them, so its version 3 reads here as 50331648. Name that rather than report a
+        // version number nobody has ever shipped.
+        if (2..=3).contains(&version.swap_bytes()) {
+            return Err(GgufError::BigEndian);
+        }
         if !(2..=3).contains(&version) {
             return Err(GgufError::BadVersion(version));
         }
@@ -241,7 +337,11 @@ impl Gguf {
         for _ in 0..kv_count {
             let key = r.string()?;
             let ty = r.u32()?;
-            let value = r.value(ty)?;
+            let value = if ty == 9 && key.starts_with(SKIPPED_PREFIX) {
+                r.skip_array()?
+            } else {
+                r.value(ty)?
+            };
             metadata.insert(key, value);
         }
 
@@ -262,6 +362,14 @@ impl Gguf {
             }
             let dtype = GgmlType(r.u32()?);
             let rel_offset = r.u64()?;
+            // Checked once here so every later product and sum on this tensor is safe.
+            if dims
+                .iter()
+                .try_fold(1u64, |a, &d| a.checked_mul(d))
+                .is_none()
+            {
+                return Err(GgufError::Overflow(name));
+            }
             tensors.push(TensorInfo {
                 name,
                 dims,
@@ -278,6 +386,13 @@ impl Gguf {
             .unwrap_or(32);
         let pos = r.inner.stream_position()?;
         let data_offset = pos.div_ceil(alignment) * alignment;
+        // Absolute offsets are `data_offset + rel_offset` everywhere downstream.
+        if let Some(t) = tensors
+            .iter()
+            .find(|t| data_offset.checked_add(t.rel_offset).is_none())
+        {
+            return Err(GgufError::Overflow(t.name.clone()));
+        }
 
         Ok(Gguf {
             version,
@@ -313,9 +428,23 @@ impl Gguf {
             .and_then(Value::as_u64)
     }
 
+    /// Where this file sits in a split model: `(index from 1, total)`.
+    ///
+    /// `None` for an ordinary single-file model. Read from `split.no` and `split.count`,
+    /// which `llama-gguf-split` writes into every part — so a shard is recognisable from
+    /// its own header, whatever it happens to be called on disk.
+    pub fn split(&self) -> Option<(u64, u64)> {
+        let count = self.metadata.get("split.count").and_then(Value::as_u64)?;
+        let no = self.metadata.get("split.no").and_then(Value::as_u64)?;
+        (count > 1 && no < count).then_some((no + 1, count))
+    }
+
     /// Total payload bytes across all tensors whose size we can compute.
     pub fn total_tensor_bytes(&self) -> u64 {
-        self.tensors.iter().filter_map(TensorInfo::size_bytes).sum()
+        self.tensors
+            .iter()
+            .filter_map(TensorInfo::size_bytes)
+            .fold(0, u64::saturating_add)
     }
 
     /// Total weight count across every tensor.
@@ -329,7 +458,7 @@ impl Gguf {
             .iter()
             .filter(|t| t.size_bytes().is_some())
             .map(TensorInfo::n_elems)
-            .sum()
+            .fold(0, u64::saturating_add)
     }
 
     /// Mean bits stored per weight, measured from this file's own tensor directory.
@@ -454,6 +583,147 @@ mod tests {
             }) => {}
             other => panic!("expected Implausible, got {other:?}"),
         }
+    }
+
+    /// A header with the given metadata entries and no tensors.
+    fn with_kv(entries: &[(&str, Vec<u8>)]) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&MAGIC.to_le_bytes());
+        b.extend_from_slice(&3u32.to_le_bytes());
+        b.extend_from_slice(&0u64.to_le_bytes());
+        b.extend_from_slice(&(entries.len() as u64).to_le_bytes());
+        for (k, typed_value) in entries {
+            b.extend_from_slice(&(k.len() as u64).to_le_bytes());
+            b.extend_from_slice(k.as_bytes());
+            b.extend_from_slice(typed_value);
+        }
+        b
+    }
+
+    /// Type tag + array header + raw element bytes.
+    fn array(elem_ty: u32, n: u64, payload: &[u8]) -> Vec<u8> {
+        let mut v = 9u32.to_le_bytes().to_vec();
+        v.extend_from_slice(&elem_ty.to_le_bytes());
+        v.extend_from_slice(&n.to_le_bytes());
+        v.extend_from_slice(payload);
+        v
+    }
+
+    fn u16_value(n: u16) -> Vec<u8> {
+        let mut v = 2u32.to_le_bytes().to_vec();
+        v.extend_from_slice(&n.to_le_bytes());
+        v
+    }
+
+    #[test]
+    fn an_array_of_arrays_is_refused_as_llama_cpp_refuses_it() {
+        // Nesting would turn the per-array bound into a product of bounds.
+        let inner = array(4, 0, &[]);
+        let b = with_kv(&[("x", array(9, 1, &inner[4..]))]);
+        match Gguf::parse(Cursor::new(b)) {
+            Err(GgufError::BadValueType(9)) => {}
+            other => panic!("expected BadValueType(9), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tokenizer_arrays_are_stepped_over_and_the_rest_still_parses() {
+        let mut strings = Vec::new();
+        for tok in ["<s>", "hello", "world"] {
+            strings.extend_from_slice(&(tok.len() as u64).to_le_bytes());
+            strings.extend_from_slice(tok.as_bytes());
+        }
+        let ids: Vec<u8> = [1i32, 2, 3].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let mut arch = 8u32.to_le_bytes().to_vec();
+        arch.extend_from_slice(&5u64.to_le_bytes());
+        arch.extend_from_slice(b"llama");
+        let b = with_kv(&[
+            ("tokenizer.ggml.tokens", array(8, 3, &strings)),
+            ("tokenizer.ggml.token_type", array(5, 3, &ids)),
+            ("general.architecture", arch),
+        ]);
+        let g = Gguf::parse(Cursor::new(b)).expect("parse");
+        assert_eq!(
+            g.metadata.get("tokenizer.ggml.tokens"),
+            Some(&Value::Skipped { len: 3 })
+        );
+        assert_eq!(
+            g.metadata.get("tokenizer.ggml.token_type"),
+            Some(&Value::Skipped { len: 3 })
+        );
+        // The reader landed exactly after both arrays, or this key would be garbage.
+        assert_eq!(g.architecture(), Some("llama"));
+    }
+
+    #[test]
+    fn a_truncated_tokenizer_array_is_an_error_not_a_silent_skip() {
+        let mut strings = 10u64.to_le_bytes().to_vec();
+        strings.extend_from_slice(b"abc"); // claims 10 bytes, has 3
+        let b = with_kv(&[("tokenizer.ggml.tokens", array(8, 1, &strings))]);
+        assert!(Gguf::parse(Cursor::new(b)).is_err());
+    }
+
+    #[test]
+    fn arrays_held_in_memory_are_bounded_in_total_not_only_each() {
+        // Two arrays each under the per-array limit, together over the global one. The
+        // second count is checked before any of its elements is read, so it fails fast.
+        let half = (MAX_HELD_ARRAY_ELEMS / 2) as usize;
+        let b = with_kv(&[
+            ("a", array(0, half as u64, &vec![0u8; half])),
+            ("b", array(0, MAX_HELD_ARRAY_ELEMS, &[])),
+        ]);
+        match Gguf::parse(Cursor::new(b)) {
+            Err(GgufError::Implausible {
+                what: "metadata array elements",
+                ..
+            }) => {}
+            other => panic!("expected the global bound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_big_endian_file_is_named_as_such() {
+        // Regression: this used to read as "unsupported GGUF version 50331648".
+        let mut b = Vec::new();
+        b.extend_from_slice(&MAGIC.to_le_bytes());
+        b.extend_from_slice(&3u32.to_be_bytes());
+        b.extend_from_slice(&0u64.to_be_bytes());
+        b.extend_from_slice(&0u64.to_be_bytes());
+        match Gguf::parse(Cursor::new(b)) {
+            Err(GgufError::BigEndian) => {}
+            other => panic!("expected BigEndian, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_tensor_whose_shape_overflows_is_refused() {
+        let mut b = Vec::new();
+        b.extend_from_slice(&MAGIC.to_le_bytes());
+        b.extend_from_slice(&3u32.to_le_bytes());
+        b.extend_from_slice(&1u64.to_le_bytes());
+        b.extend_from_slice(&0u64.to_le_bytes());
+        let name = "t";
+        b.extend_from_slice(&(name.len() as u64).to_le_bytes());
+        b.extend_from_slice(name.as_bytes());
+        b.extend_from_slice(&2u32.to_le_bytes());
+        b.extend_from_slice(&(1u64 << 40).to_le_bytes());
+        b.extend_from_slice(&(1u64 << 40).to_le_bytes());
+        b.extend_from_slice(&0u32.to_le_bytes());
+        b.extend_from_slice(&0u64.to_le_bytes());
+        match Gguf::parse(Cursor::new(b)) {
+            Err(GgufError::Overflow(n)) => assert_eq!(n, "t"),
+            other => panic!("expected Overflow, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_shard_says_which_part_of_the_model_it_is() {
+        let b = with_kv(&[("split.no", u16_value(1)), ("split.count", u16_value(3))]);
+        let g = Gguf::parse(Cursor::new(b)).expect("parse");
+        assert_eq!(g.split(), Some((2, 3)), "split.no is zero-based");
+
+        let whole = Gguf::parse(Cursor::new(synth())).expect("parse");
+        assert_eq!(whole.split(), None);
     }
 
     #[test]

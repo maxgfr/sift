@@ -92,6 +92,8 @@ pub enum ExpertError {
         count: u64,
         block: u64,
     },
+    #[error("tensor `{0}` has a shape or offset that overflows a 64-bit size")]
+    Overflow(String),
 }
 
 /// Compute the byte range of one expert inside a stacked expert tensor.
@@ -127,8 +129,10 @@ pub fn expert_slice(g: &Gguf, tensor_name: &str, expert: u64) -> Result<ExpertSl
             dtype: t.dtype.name().to_string(),
         })?;
 
+    let overflow = || ExpertError::Overflow(t.name.clone());
+
     // Weights in one expert's matrix.
-    let per_expert_elems = t.dims[0] * t.dims[1];
+    let per_expert_elems = t.dims[0].checked_mul(t.dims[1]).ok_or_else(overflow)?;
     if per_expert_elems % layout.elems != 0 {
         return Err(ExpertError::NotBlockAligned {
             name: t.name.clone(),
@@ -138,9 +142,17 @@ pub fn expert_slice(g: &Gguf, tensor_name: &str, expert: u64) -> Result<ExpertSl
         });
     }
 
-    let bytes_per_expert = per_expert_elems / layout.elems * layout.bytes;
+    let bytes_per_expert = (per_expert_elems / layout.elems)
+        .checked_mul(layout.bytes)
+        .ok_or_else(overflow)?;
+    let offset = expert
+        .checked_mul(bytes_per_expert)
+        .and_then(|o| o.checked_add(g.absolute_offset(t)))
+        .ok_or_else(overflow)?;
+    // `end()` adds the length, so that sum must be representable too.
+    offset.checked_add(bytes_per_expert).ok_or_else(overflow)?;
     Ok(ExpertSlice {
-        offset: g.absolute_offset(t) + expert * bytes_per_expert,
+        offset,
         len: bytes_per_expert,
     })
 }
@@ -318,6 +330,31 @@ mod tests {
             }
             other => panic!("expected MissingTensor, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_stacked_tensor_whose_offsets_overflow_is_refused_not_wrapped() {
+        // A hostile header can claim dims whose product fits in u64 but whose per-expert
+        // offset does not. Wrapping would hand back a small, plausible, wrong offset.
+        let mut b = Vec::new();
+        b.extend_from_slice(&MAGIC.to_le_bytes());
+        b.extend_from_slice(&3u32.to_le_bytes());
+        b.extend_from_slice(&1u64.to_le_bytes());
+        b.extend_from_slice(&0u64.to_le_bytes());
+        let name = "blk.0.ffn_gate_exps.weight";
+        b.extend_from_slice(&(name.len() as u64).to_le_bytes());
+        b.extend_from_slice(name.as_bytes());
+        b.extend_from_slice(&3u32.to_le_bytes());
+        for d in [1u64 << 31, 1 << 31, 2] {
+            b.extend_from_slice(&d.to_le_bytes());
+        }
+        b.extend_from_slice(&0u32.to_le_bytes()); // F32: 4 bytes per weight
+        b.extend_from_slice(&0u64.to_le_bytes());
+        let g = Gguf::parse(Cursor::new(b)).expect("dims multiply to 2^63, which fits");
+        assert_eq!(
+            expert_slice(&g, name, 1),
+            Err(ExpertError::Overflow(name.to_string()))
+        );
     }
 
     #[test]

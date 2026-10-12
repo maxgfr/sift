@@ -43,6 +43,8 @@ pub enum SafetensorsError {
     Json(String),
     #[error("header has no tensors")]
     Empty,
+    #[error("tensor `{0}` has a shape or offsets that overflow a 64-bit size")]
+    Overflow(String),
 }
 
 /// A parsed safetensors header. No payload is read.
@@ -106,11 +108,16 @@ impl Safetensors {
             // are what the file actually reserves, and they are right for a quantization
             // this code has never heard of.
             let size_bytes = end.saturating_sub(start);
-            total_bytes += size_bytes;
+            let overflow = || SafetensorsError::Overflow(name.clone());
+            total_bytes = total_bytes.checked_add(size_bytes).ok_or_else(overflow)?;
+            let n_elems = dims
+                .iter()
+                .try_fold(1u64, |a, &d| a.checked_mul(d))
+                .ok_or_else(overflow)?;
 
             tensors.push(TensorEntry {
                 name: name.clone(),
-                n_elems: dims.iter().product::<u64>(),
+                n_elems,
                 dims,
                 size_bytes,
             });
@@ -222,6 +229,17 @@ mod tests {
         assert!(matches!(
             Safetensors::parse(&mut f).expect_err("must reject"),
             SafetensorsError::Empty
+        ));
+    }
+
+    #[test]
+    fn a_shape_that_overflows_is_refused_rather_than_wrapped() {
+        let mut f = file_with(
+            r#"{"a":{"dtype":"F32","shape":[4294967296,4294967296,2],"data_offsets":[0,4]}}"#,
+        );
+        assert!(matches!(
+            Safetensors::parse(&mut f).expect_err("must reject"),
+            SafetensorsError::Overflow(_)
         ));
     }
 

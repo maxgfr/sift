@@ -819,8 +819,15 @@ fn cmd_inspect(src: &Source, list_tensors: bool, json: bool) -> Result<()> {
                 "model": src.label(),
                 "format": src.format(),
                 "gguf_version": gguf.as_ref().map(|g| g.version),
+                // Set when this file is one part of a split model, so everything below
+                // describes that part only.
+                "split": gguf.as_ref().and_then(|g| g.split()).map(|(index, count)| {
+                    serde_json::json!({ "index": index, "count": count })
+                }),
                 "architecture": shape.architecture(),
                 "tensor_count": shape.tensors().len(),
+                // Tensors whose dtype this build cannot size, left out of every total.
+                "dropped_tensors": shape.dropped_tensors,
                 "tensor_payload_bytes": payload,
                 "parameters": shape.total_parameters(),
                 "bits_per_weight": shape.bits_per_weight(),
@@ -844,6 +851,13 @@ fn cmd_inspect(src: &Source, list_tensors: bool, json: bool) -> Result<()> {
     }
 
     println!("{}", src.label());
+    if let Some((index, count)) = gguf.as_ref().and_then(|g| g.split()) {
+        println!(
+            "  warning          shard {index} of {count}: every figure below covers this part\n\
+             {:>19}only. `sift fit` on the repo sums every part of a split model.",
+            ""
+        );
+    }
     if let Some(g) = &gguf {
         println!("  gguf version     {}", g.version);
     } else {

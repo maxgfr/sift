@@ -136,12 +136,18 @@ impl ModelShape {
 
     /// Total payload bytes across every shard.
     pub fn total_tensor_bytes(&self) -> u64 {
-        self.tensors.iter().map(|t| t.size_bytes).sum()
+        self.tensors
+            .iter()
+            .map(|t| t.size_bytes)
+            .fold(0, u64::saturating_add)
     }
 
     /// Total weight count across every shard.
     pub fn total_parameters(&self) -> u64 {
-        self.tensors.iter().map(|t| t.n_elems).sum()
+        self.tensors
+            .iter()
+            .map(|t| t.n_elems)
+            .fold(0, u64::saturating_add)
     }
 
     /// Mean bits stored per weight. See [`Gguf::bits_per_weight`].
@@ -304,11 +310,10 @@ impl MoeShape {
     /// An average across layers, so it is a description rather than a basis for
     /// arithmetic. Use [`Self::expert_bytes_per_token`] for traffic.
     pub fn mean_bytes_per_expert(&self) -> u64 {
-        let experts = self.experts_per_layer * self.moe_layers as u64;
-        if experts == 0 {
-            return 0;
+        match self.experts_per_layer.checked_mul(self.moe_layers as u64) {
+            Some(experts) if experts > 0 => self.total_expert_bytes / experts,
+            _ => 0,
         }
-        self.total_expert_bytes / experts
     }
 
     /// Bytes of routed-expert weights read per token, assuming every access misses.
