@@ -145,6 +145,41 @@ impl Safetensors {
 /// none of them, so every multimodal repo came out with an unsized KV cache.
 const TEXT_BLOCKS: [&str; 3] = ["text_config", "llm_config", "language_config"];
 
+/// Which layers attend, for hybrid models that say so in their own vocabulary rather
+/// than in `layer_types`. Every layer not named as attention holds no KV cache.
+///
+/// - LFM2: `full_attn_idxs`, the attention layers' indices; the rest are convolutions.
+/// - Nemotron-H: `hybrid_override_pattern`, one character per layer, `*` for attention,
+///   `M` for Mamba 2, `-` for an MLP-only layer.
+/// - Jamba: one attention layer every `attn_layer_period`, at `attn_layer_offset`.
+fn hybrid_layer_kinds<'a>(
+    get: &impl Fn(&str) -> Option<&'a serde_json::Value>,
+    n: u64,
+) -> Option<Vec<LayerKind>> {
+    let kind = |attends: bool| {
+        if attends {
+            LayerKind::Full
+        } else {
+            LayerKind::Linear
+        }
+    };
+    if let Some(idxs) = get("full_attn_idxs").and_then(|v| v.as_array()) {
+        let attends: std::collections::HashSet<u64> =
+            idxs.iter().filter_map(serde_json::Value::as_u64).collect();
+        return Some((0..n).map(|i| kind(attends.contains(&i))).collect());
+    }
+    if let Some(pattern) = get("hybrid_override_pattern").and_then(|v| v.as_str()) {
+        if pattern.chars().count() as u64 == n {
+            return Some(pattern.chars().map(|c| kind(c == '*')).collect());
+        }
+    }
+    let period = get("attn_layer_period").and_then(serde_json::Value::as_u64)?;
+    let offset = get("attn_layer_offset")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    (period > 0).then(|| (0..n).map(|i| kind(i % period == offset)).collect())
+}
+
 /// Read the architecture numbers out of a HuggingFace `config.json`.
 ///
 /// Names differ from GGUF's throughout — `num_key_value_heads` rather than
@@ -178,17 +213,20 @@ pub fn facts_from_config(config: &serde_json::Value) -> ArchFacts {
     };
 
     let layer_kinds = block_count.and_then(|n| {
-        let explicit = get("layer_types").and_then(|v| v.as_array()).map(|types| {
-            types
-                .iter()
-                .map(|t| match t.as_str().unwrap_or_default() {
-                    "sliding_attention" | "chunked_attention" => LayerKind::Sliding,
-                    "linear_attention" | "mamba" | "conv" | "recurrent" => LayerKind::Linear,
-                    // Unknown kinds are sized as full: overstating is the safe error.
-                    _ => LayerKind::Full,
-                })
-                .collect()
-        });
+        let explicit = get("layer_types")
+            .and_then(|v| v.as_array())
+            .map(|types| {
+                types
+                    .iter()
+                    .map(|t| match t.as_str().unwrap_or_default() {
+                        "sliding_attention" | "chunked_attention" => LayerKind::Sliding,
+                        "linear_attention" | "mamba" | "conv" | "recurrent" => LayerKind::Linear,
+                        // Unknown kinds are sized as full: overstating is the safe error.
+                        _ => LayerKind::Full,
+                    })
+                    .collect()
+            })
+            .or_else(|| hybrid_layer_kinds(&get, n));
         let pattern =
             sliding_window
                 .filter(|&w| w > 0)
@@ -592,6 +630,34 @@ mod tests {
         let kv = crate::model::kv::kv_shape_from_facts(&f).expect("sizeable");
         assert_eq!(kv.head_dim, 64);
         assert!(!kv.is_mixed());
+    }
+
+    #[test]
+    fn kv_hybrid_configs_that_name_their_attention_layers_are_honoured() {
+        // LiquidAI/LFM2-1.2B: six attention layers among sixteen, the rest convolutions.
+        let lfm2 = kv_of(serde_json::json!({
+            "model_type": "lfm2", "num_hidden_layers": 16, "num_attention_heads": 32,
+            "num_key_value_heads": 8, "hidden_size": 2048, "full_attn_idxs": [2, 5, 8, 10, 12, 14],
+        }));
+        assert_eq!((lfm2.full_layers, lfm2.recurrent_layers), (6, 10));
+
+        // nvidia/NVIDIA-Nemotron-Nano-9B-v2: `*` attends; `M` (Mamba 2) and `-` (MLP) do
+        // not. The uniform formula charged all 56 layers.
+        let pattern = "M-M-M-MM-M-M-M*-M-M-M*-M-M-M-M*-M-M-M-M*-M-MM-M-M-M-M-M-";
+        let nemotron = kv_of(serde_json::json!({
+            "model_type": "nemotron_h", "num_hidden_layers": 56, "num_attention_heads": 40,
+            "num_key_value_heads": 8, "head_dim": 128, "hidden_size": 4480,
+            "hybrid_override_pattern": pattern,
+        }));
+        assert_eq!((nemotron.full_layers, nemotron.recurrent_layers), (4, 52));
+
+        // ai21labs Jamba: one attention layer every 8, at offset 4.
+        let jamba = kv_of(serde_json::json!({
+            "model_type": "jamba", "num_hidden_layers": 32, "num_attention_heads": 32,
+            "num_key_value_heads": 8, "hidden_size": 4096,
+            "attn_layer_period": 8, "attn_layer_offset": 4,
+        }));
+        assert_eq!((jamba.full_layers, jamba.recurrent_layers), (4, 28));
     }
 
     #[test]
