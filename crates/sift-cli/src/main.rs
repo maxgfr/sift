@@ -798,6 +798,7 @@ fn cmd_inspect(src: &Source, list_tensors: bool, json: bool) -> Result<()> {
                 "layers": m.moe_layers,
                 "experts_per_layer": m.experts_per_layer,
                 "experts_per_token": m.experts_per_token,
+                "experts_per_token_assumed": m.experts_per_token_assumed,
                 "activation_ratio": m.activation_ratio(),
                 "mean_bytes_per_expert": m.mean_bytes_per_expert(),
                 "total_expert_bytes": m.total_expert_bytes(),
@@ -906,7 +907,15 @@ fn cmd_inspect(src: &Source, list_tensors: bool, json: bool) -> Result<()> {
             println!("\nmixture of experts");
             println!("  moe layers       {}", shape.moe_layers);
             println!("  experts / layer  {}", shape.experts_per_layer);
-            println!("  active / token   {}", shape.experts_per_token);
+            println!(
+                "  active / token   {}{}",
+                shape.experts_per_token,
+                if shape.experts_per_token_assumed {
+                    " (not stated by the model; assumed)"
+                } else {
+                    ""
+                }
+            );
             println!(
                 "  activation       {:.2}% of expert weights per token",
                 shape.activation_ratio() * 100.0
@@ -1002,6 +1011,8 @@ fn cmd_plan(src: &Source, hit_rate: f64, json: bool) -> Result<()> {
             serde_json::to_string_pretty(&serde_json::json!({
                 "model": src.label(),
                 "hit_rate": hit_rate,
+                "experts_per_token": shape.experts_per_token,
+                "experts_per_token_assumed": shape.experts_per_token_assumed,
                 "per_token_bytes": {
                     "routed_experts": traffic.expert_bytes,
                     "always_active": trunk_bytes,
@@ -1034,6 +1045,13 @@ fn cmd_plan(src: &Source, hit_rate: f64, json: bool) -> Result<()> {
         trunk_bytes as f64 / 1e9
     );
     println!("  total cold       {:.3} GB", traffic.total() as f64 / 1e9);
+    if shape.experts_per_token_assumed {
+        println!(
+            "\n  top-k is not stated in this model's metadata, so {} experts per token is\n  \
+             assumed. Routed traffic scales with it: read the figures above as a guess.",
+            shape.experts_per_token
+        );
+    }
 
     // Read bandwidth, not the copy figure. Decode streams weights in and writes back a
     // small activation, and a copy moves a byte each way — so a copy-based roofline is not

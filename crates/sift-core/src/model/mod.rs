@@ -80,6 +80,8 @@ pub struct ArchFacts {
     pub context_length: Option<u64>,
     /// Experts activated per token, the top-k of the router.
     pub expert_used_count: Option<u64>,
+    /// Routed experts per MoE layer, where the metadata states it.
+    pub expert_count: Option<u64>,
 }
 
 impl ModelShape {
@@ -198,6 +200,7 @@ fn gguf_facts(g: &Gguf) -> ArchFacts {
         key_length: g.arch_u64("attention.key_length"),
         context_length: g.arch_u64("context_length"),
         expert_used_count: g.arch_u64("expert_used_count"),
+        expert_count: g.arch_u64("expert_count"),
     }
 }
 
@@ -291,12 +294,17 @@ pub fn infer_kv_shape(g: &ModelShape) -> Option<KvShape> {
 /// A model's MoE shape, as far as the tensor directory reveals it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MoeShape {
-    /// Number of transformer blocks carrying stacked expert tensors.
+    /// Number of transformer blocks carrying routed-expert tensors.
     pub moe_layers: u32,
     /// Routed experts per MoE layer.
     pub experts_per_layer: u64,
     /// Experts activated per token per layer (top-k).
     pub experts_per_token: u64,
+    /// Whether `experts_per_token` is the assumed default rather than a stated figure.
+    ///
+    /// Callers print it: the traffic figure scales linearly with top-k, so a guessed 8 on a
+    /// top-2 model is a 4× error in every number derived from it.
+    pub experts_per_token_assumed: bool,
     /// Total bytes of routed-expert weights across every MoE layer.
     ///
     /// Summed per layer rather than extrapolated from one, because dynamic quantizations
@@ -342,120 +350,182 @@ impl MoeShape {
     }
 }
 
+/// Top-k assumed when a model does not state it.
+///
+/// The commonest value among published MoE models, and always reported as an assumption.
+pub const ASSUMED_EXPERTS_PER_TOKEN: u64 = 8;
+
 /// Infer a model's MoE shape from its tensor directory.
 ///
-/// Returns `None` for dense models, which have no stacked expert tensors.
+/// Returns `None` for dense models, which have no routed-expert tensors.
 ///
-/// `experts_per_token` comes from metadata (`{arch}.expert_used_count`) because it is a
-/// routing decision, not a property of the stored weights — nothing in the tensor shapes
-/// reveals it. Absent that key we assume 8, the near-universal default, and callers that
-/// care should check metadata themselves.
+/// Every tensor is classified on its own name rather than by probing layer numbers from
+/// zero. Probing stopped at the first layer without experts, which is layer 0 on DeepSeek
+/// and Kimi (dense leading layers) and layer 1 on Llama 4 (MoE every other layer) — and
+/// reported each of them as dense.
+///
+/// `experts_per_token` comes from metadata because it is a routing decision, not a property
+/// of the stored weights. Absent it, [`ASSUMED_EXPERTS_PER_TOKEN`] is used and
+/// [`MoeShape::experts_per_token_assumed`] says so.
 pub fn infer_moe_shape(g: &ModelShape) -> Option<MoeShape> {
-    // Two layouts, because two ecosystems name the same thing differently. GGUF stacks a
-    // layer's experts into one tensor with the expert count as its last dimension;
-    // safetensors keeps one tensor per expert. Trying stacked first costs a single lookup
-    // on the far more common case.
-    let (moe_layers, experts_per_layer, total_expert_bytes) =
-        stacked_experts(g).or_else(|| per_expert_tensors(g))?;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    #[derive(Default)]
+    struct Layer {
+        /// Distinct expert indices seen in per-expert tensors.
+        ids: BTreeSet<u64>,
+        /// Largest expert count read off a stacked tensor's expert dimension.
+        stacked: u64,
+    }
+
+    let mut layers: BTreeMap<u64, Layer> = BTreeMap::new();
+    let mut total_expert_bytes = 0u64;
+    for t in g.tensors() {
+        let Some((layer, which)) = classify_expert_tensor(&t.name, &t.dims) else {
+            continue;
+        };
+        let entry = layers.entry(layer).or_default();
+        match which {
+            ExpertIndex::One(j) => {
+                entry.ids.insert(j);
+            }
+            ExpertIndex::Stacked(n) => entry.stacked = entry.stacked.max(n),
+        }
+        // Sum every layer, never extrapolate from one. Dynamic quantizations deliberately
+        // give different layers different precision, and multiplying one layer out gave a
+        // per-token figure that was *larger* for a smaller file.
+        total_expert_bytes = total_expert_bytes.saturating_add(t.size_bytes);
+    }
+
+    // The widest layer, not the first: a shard boundary can leave the lowest-numbered layer
+    // holding only some of its experts.
+    let seen = layers
+        .values()
+        .map(|l| (l.ids.len() as u64).max(l.stacked))
+        .max()
+        .unwrap_or(0);
+    let experts_per_layer = g.facts.expert_count.filter(|&n| n > 0).unwrap_or(seen);
+    let moe_layers = layers.len() as u32;
 
     if moe_layers == 0 || experts_per_layer == 0 || total_expert_bytes == 0 {
         return None;
     }
 
-    let experts_per_token = g.facts.expert_used_count.unwrap_or(8);
+    let (experts_per_token, experts_per_token_assumed) =
+        match g.facts.expert_used_count.filter(|&k| k > 0) {
+            Some(k) => (k, false),
+            None => (ASSUMED_EXPERTS_PER_TOKEN, true),
+        };
 
     Some(MoeShape {
         moe_layers,
         experts_per_layer,
-        experts_per_token,
+        // A top-k above the expert count is a metadata error; a token cannot read more
+        // experts than exist.
+        experts_per_token: experts_per_token.min(experts_per_layer),
+        experts_per_token_assumed,
         total_expert_bytes,
     })
 }
 
-/// GGUF's layout: `blk.{layer}.ffn_{gate,up,down}_exps.weight`, experts stacked.
-fn stacked_experts(g: &ModelShape) -> Option<(u32, u64, u64)> {
-    let mut moe_layers = 0u32;
-    let mut experts_per_layer = 0u64;
-    let mut total_expert_bytes = 0u64;
-
-    for layer in 0..u32::MAX {
-        let name = format!("blk.{layer}.ffn_gate_exps.weight");
-        let Some(t) = g.tensor(&name) else { break };
-        moe_layers += 1;
-
-        if experts_per_layer == 0 && t.dims.len() == 3 {
-            experts_per_layer = t.dims[2];
-        }
-
-        // Sum every layer, never extrapolate from layer 0. Dynamic quantizations —
-        // Unsloth's UD- family, and llama.cpp's own Q4_K_M convention — deliberately give
-        // different layers different precision. Measuring one layer and multiplying gives
-        // a per-token figure that can be *larger* for a smaller file, which is visibly
-        // absurd and destroys trust in every number beside it.
-        for proj in ["gate", "up", "down"] {
-            let n = format!("blk.{layer}.ffn_{proj}_exps.weight");
-            if let Some(t) = g.tensor(&n) {
-                total_expert_bytes += t.size_bytes;
-            }
-        }
-    }
-
-    (moe_layers > 0).then_some((moe_layers, experts_per_layer, total_expert_bytes))
+/// How an expert tensor identifies its expert.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExpertIndex {
+    /// One expert per tensor, numbered.
+    One(u64),
+    /// Every expert of the layer stacked into one tensor, this many of them.
+    Stacked(u64),
 }
 
-/// HuggingFace's layout: `model.layers.{i}.mlp.experts.{j}.{gate,up,down}_proj.weight`.
+/// Recognise a routed-expert weight tensor, in any of the layouts publishers ship.
 ///
-/// Counted by scanning names rather than probing indices, because expert numbering is not
-/// guaranteed dense across a split repo — a shard can hold experts 40 to 63 of a layer and
-/// nothing else, and probing from zero would stop at the first gap and report a model with
-/// a fraction of its experts.
-fn per_expert_tensors(g: &ModelShape) -> Option<(u32, u64, u64)> {
-    use std::collections::{BTreeMap, BTreeSet};
-
-    let mut per_layer: BTreeMap<u64, BTreeSet<u64>> = BTreeMap::new();
-    let mut total_expert_bytes = 0u64;
-
-    for t in g.tensors() {
-        let Some((layer, expert)) = parse_expert_name(&t.name) else {
-            continue;
-        };
-        per_layer.entry(layer).or_default().insert(expert);
-        total_expert_bytes += t.size_bytes;
-    }
-
-    if per_layer.is_empty() {
+/// ```text
+/// blk.3.ffn_gate_exps.weight                         GGUF, stacked; experts are dims[2]
+/// blk.3.ffn_gate_up_exps.weight                      GGUF, gate and up fused
+/// blk.3.ffn_gate.5.weight                            GGUF, one tensor per expert (old Mixtral)
+/// model.layers.3.mlp.experts.5.gate_proj.weight      HF, one tensor per expert
+/// model.layers.3.block_sparse_moe.experts.5.w1.weight  Mixtral, Phi-MoE
+/// model.layers.3.mlp.experts.gate_up_proj            HF fused 3-D; experts are dims[0]
+/// model.layers.3.mlp.experts.down_proj_blocks        gpt-oss MXFP4 blocks and scales
+/// model.layers.3.mlp.switch_mlp.gate_proj.weight     MLX stacked; experts are dims[0]
+/// ```
+///
+/// Quantization side tensors (`qweight`, `scales`, `qzeros`, MLX `biases`, FP8
+/// `weight_scale_inv`) are counted too: they are read with the weights on every access,
+/// and leaving them out understates a quantized model's expert traffic. Routers, shared
+/// experts and plain biases are not routed-expert weights and never match.
+fn classify_expert_tensor(name: &str, dims: &[u64]) -> Option<(u64, ExpertIndex)> {
+    if let Some(rest) = name.strip_prefix("blk.") {
+        let (layer, rest) = rest.split_once('.')?;
+        let layer = layer.parse().ok()?;
+        // Stacked: `ffn_{gate,up,down,gate_up}_exps.weight`, expert count innermost-last.
+        if let Some(proj) = rest
+            .strip_prefix("ffn_")
+            .and_then(|r| r.strip_suffix("_exps.weight"))
+        {
+            if matches!(proj, "gate" | "up" | "down" | "gate_up") && dims.len() == 3 {
+                return Some((layer, ExpertIndex::Stacked(dims[2])));
+            }
+            return None;
+        }
+        // Per expert: `ffn_{gate,up,down}.{j}.weight`.
+        let rest = rest.strip_prefix("ffn_")?;
+        let (proj, rest) = rest.split_once('.')?;
+        let (j, tail) = rest.split_once('.')?;
+        if matches!(proj, "gate" | "up" | "down") && tail == "weight" {
+            return Some((layer, ExpertIndex::One(j.parse().ok()?)));
+        }
         return None;
     }
-    // The widest layer, not the first. A shard boundary can leave the lowest-numbered
-    // layer holding only some of its experts.
-    let experts_per_layer = per_layer
-        .values()
-        .map(|s| s.len() as u64)
-        .max()
-        .unwrap_or(0);
-    Some((
-        per_layer.len() as u32,
-        experts_per_layer,
-        total_expert_bytes,
-    ))
-}
 
-/// Pull `(layer, expert)` out of a HuggingFace expert tensor name.
-fn parse_expert_name(name: &str) -> Option<(u64, u64)> {
-    let rest = name.strip_prefix("model.layers.")?;
+    // HuggingFace names put the layer after `layers.`, under whatever prefix a multimodal
+    // wrapper adds (`model.`, `model.language_model.`, `language_model.model.`).
+    let at = name.find("layers.")?;
+    let rest = &name[at + "layers.".len()..];
     let (layer, rest) = rest.split_once('.')?;
-    let rest = rest.strip_prefix("mlp.experts.")?;
-    let (expert, tail) = rest.split_once('.')?;
+    let layer = layer.parse().ok()?;
 
-    // Only the three feed-forward projections count as expert weight. A per-expert bias or
-    // a router tensor caught by a looser match would inflate the traffic figure.
-    if !matches!(
-        tail,
-        "gate_proj.weight" | "up_proj.weight" | "down_proj.weight"
-    ) {
+    let (block, rest) = rest.split_once('.')?;
+    if !matches!(block, "mlp" | "block_sparse_moe" | "feed_forward") {
         return None;
     }
-    Some((layer.parse().ok()?, expert.parse().ok()?))
+    let side = |s: &str| {
+        matches!(
+            s,
+            "weight" | "qweight" | "scales" | "qzeros" | "biases" | "weight_scale_inv"
+        )
+    };
+    let proj = |s: &str| {
+        matches!(
+            s,
+            "gate_proj" | "up_proj" | "down_proj" | "gate_up_proj" | "w1" | "w2" | "w3"
+        )
+    };
+
+    if let Some(rest) = rest.strip_prefix("switch_mlp.") {
+        let (p, tail) = rest.split_once('.')?;
+        return (proj(p) && side(tail) && dims.len() == 3)
+            .then(|| (layer, ExpertIndex::Stacked(dims[0])));
+    }
+    let rest = rest.strip_prefix("experts.")?;
+    match rest.split_once('.') {
+        // Per expert: `experts.{j}.{proj}.{suffix}`.
+        Some((j, tail)) if j.bytes().all(|b| b.is_ascii_digit()) => {
+            let (p, suffix) = tail.split_once('.')?;
+            let j = j.parse().ok()?;
+            (proj(p) && side(suffix)).then_some((layer, ExpertIndex::One(j)))
+        }
+        // Fused 3-D: `experts.{proj}` or gpt-oss `experts.{proj}_{blocks,scales}`, with the
+        // expert count outermost. A `_bias` tensor is a bias, not a weight.
+        Some(_) => None,
+        None => {
+            let p = rest
+                .strip_suffix("_blocks")
+                .or_else(|| rest.strip_suffix("_scales"))
+                .unwrap_or(rest);
+            (proj(p) && dims.len() >= 2).then(|| (layer, ExpertIndex::Stacked(dims[0])))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -469,6 +539,7 @@ mod tests {
             moe_layers: 48,
             experts_per_layer: 128,
             experts_per_token: 8,
+            experts_per_token_assumed: false,
             total_expert_bytes: 884_736 * 3 * 128 * 48,
         };
 
@@ -496,6 +567,7 @@ mod tests {
             moe_layers: 48,
             experts_per_layer: 128,
             experts_per_token: 8,
+            experts_per_token_assumed: false,
             total_expert_bytes: 884_736 * 3 * 128 * 48,
         };
         let ratio = shape.expert_bytes_per_token() as f64 / shape.total_expert_bytes() as f64;
@@ -517,6 +589,7 @@ mod tests {
             moe_layers: 48,
             experts_per_layer: 128,
             experts_per_token: 8,
+            experts_per_token_assumed: false,
             total_expert_bytes: 17_000_000_000,
         };
         assert!(
@@ -532,6 +605,7 @@ mod tests {
             moe_layers: 2,
             experts_per_layer: 4,
             experts_per_token: 2,
+            experts_per_token_assumed: false,
             total_expert_bytes: 800,
         };
         assert_eq!(shape.mean_bytes_per_expert(), 100, "800 over 8 experts");
@@ -614,12 +688,230 @@ mod tests {
         );
     }
 
+    fn entry(name: &str, dims: &[u64], size_bytes: u64) -> TensorEntry {
+        TensorEntry {
+            name: name.into(),
+            dims: dims.to_vec(),
+            n_elems: dims.iter().product(),
+            size_bytes,
+        }
+    }
+
+    fn shape_of(tensors: Vec<TensorEntry>, facts: ArchFacts) -> ModelShape {
+        ModelShape::new(facts, tensors, 1)
+    }
+
+    #[test]
+    fn moe_deepseek_style_dense_leading_layer_is_not_mistaken_for_a_dense_model() {
+        // Regression: probing from `blk.0` stopped at the first layer without experts,
+        // which on DeepSeek and Kimi is layer 0 — and reported the whole model as dense.
+        let mut t = vec![
+            entry("blk.0.ffn_gate.weight", &[2048, 10944], 100),
+            entry("blk.0.ffn_up.weight", &[2048, 10944], 100),
+        ];
+        for l in 1..4 {
+            for p in ["gate", "up", "down"] {
+                t.push(entry(
+                    &format!("blk.{l}.ffn_{p}_exps.weight"),
+                    &[2048, 1408, 64],
+                    1000,
+                ));
+            }
+            t.push(entry(
+                &format!("blk.{l}.ffn_gate_shexp.weight"),
+                &[2048, 2816],
+                50,
+            ));
+        }
+        let facts = ArchFacts {
+            expert_count: Some(64),
+            expert_used_count: Some(6),
+            ..Default::default()
+        };
+        let moe = infer_moe_shape(&shape_of(t, facts)).expect("moe");
+        assert_eq!(moe.moe_layers, 3);
+        assert_eq!(moe.experts_per_layer, 64);
+        assert_eq!(moe.experts_per_token, 6);
+        assert!(!moe.experts_per_token_assumed);
+        assert_eq!(
+            moe.total_expert_bytes,
+            9 * 1000,
+            "shared experts are trunk, not routed"
+        );
+    }
+
+    #[test]
+    fn moe_interleaved_layers_are_all_counted() {
+        // Llama 4 puts experts on every other layer.
+        let mut t = Vec::new();
+        for l in [0, 2, 4] {
+            for p in ["gate", "up", "down"] {
+                t.push(entry(
+                    &format!("blk.{l}.ffn_{p}_exps.weight"),
+                    &[8, 8, 16],
+                    10,
+                ));
+            }
+        }
+        for l in [1, 3] {
+            t.push(entry(&format!("blk.{l}.ffn_gate.weight"), &[8, 8], 10));
+        }
+        let moe = infer_moe_shape(&shape_of(t, ArchFacts::default())).expect("moe");
+        assert_eq!(moe.moe_layers, 3);
+        assert_eq!(
+            moe.experts_per_layer, 16,
+            "read off dims[2] when metadata is silent"
+        );
+        assert_eq!(moe.total_expert_bytes, 90);
+    }
+
+    #[test]
+    fn moe_fused_gate_up_stacked_tensor_is_recognised() {
+        let t = vec![
+            entry("blk.0.ffn_gate_up_exps.weight", &[64, 256, 32], 200),
+            entry("blk.0.ffn_down_exps.weight", &[128, 64, 32], 100),
+        ];
+        let moe = infer_moe_shape(&shape_of(t, ArchFacts::default())).expect("moe");
+        assert_eq!(moe.experts_per_layer, 32);
+        assert_eq!(moe.total_expert_bytes, 300);
+    }
+
+    #[test]
+    fn moe_mixtral_hf_layout_is_recognised_and_its_router_is_not_counted() {
+        let mut t = Vec::new();
+        for l in 0..2 {
+            t.push(entry(
+                &format!("model.layers.{l}.block_sparse_moe.gate.weight"),
+                &[8, 64],
+                7,
+            ));
+            for j in 0..8 {
+                for w in ["w1", "w2", "w3"] {
+                    t.push(entry(
+                        &format!("model.layers.{l}.block_sparse_moe.experts.{j}.{w}.weight"),
+                        &[64, 224],
+                        10,
+                    ));
+                }
+            }
+        }
+        let facts = ArchFacts {
+            expert_count: Some(8),
+            expert_used_count: Some(2),
+            ..Default::default()
+        };
+        let moe = infer_moe_shape(&shape_of(t, facts)).expect("moe");
+        assert_eq!((moe.moe_layers, moe.experts_per_layer), (2, 8));
+        assert_eq!(moe.experts_per_token, 2);
+        assert_eq!(moe.total_expert_bytes, 2 * 8 * 3 * 10, "router excluded");
+    }
+
+    #[test]
+    fn moe_old_per_expert_gguf_layout_is_recognised() {
+        // TheBloke's Mixtral GGUFs predate stacked experts: one tensor per expert.
+        let mut t = Vec::new();
+        for j in 0..8 {
+            for p in ["gate", "up", "down"] {
+                t.push(entry(&format!("blk.0.ffn_{p}.{j}.weight"), &[64, 224], 10));
+            }
+        }
+        t.push(entry("blk.0.ffn_gate_inp.weight", &[64, 8], 5));
+        let moe = infer_moe_shape(&shape_of(t, ArchFacts::default())).expect("moe");
+        assert_eq!(moe.experts_per_layer, 8);
+        assert_eq!(moe.total_expert_bytes, 240);
+    }
+
+    #[test]
+    fn moe_gpt_oss_fused_mxfp4_tensors_are_recognised_without_their_biases() {
+        let mut t = Vec::new();
+        for l in 0..2 {
+            let pre = format!("model.layers.{l}.mlp.experts");
+            t.push(entry(
+                &format!("{pre}.gate_up_proj_blocks"),
+                &[32, 5760, 90, 16],
+                1000,
+            ));
+            t.push(entry(
+                &format!("{pre}.gate_up_proj_scales"),
+                &[32, 5760, 90],
+                60,
+            ));
+            t.push(entry(&format!("{pre}.gate_up_proj_bias"), &[32, 5760], 3));
+            t.push(entry(
+                &format!("{pre}.down_proj_blocks"),
+                &[32, 2880, 90, 16],
+                500,
+            ));
+            t.push(entry(
+                &format!("{pre}.down_proj_scales"),
+                &[32, 2880, 90],
+                30,
+            ));
+            t.push(entry(
+                &format!("model.layers.{l}.mlp.router.weight"),
+                &[32, 2880],
+                9,
+            ));
+        }
+        let facts = ArchFacts {
+            expert_used_count: Some(4),
+            ..Default::default()
+        };
+        let moe = infer_moe_shape(&shape_of(t, facts)).expect("moe");
+        assert_eq!((moe.moe_layers, moe.experts_per_layer), (2, 32));
+        assert_eq!(moe.total_expert_bytes, 2 * (1000 + 60 + 500 + 30));
+    }
+
+    #[test]
+    fn moe_mlx_switch_mlp_with_quantization_side_tensors_is_recognised() {
+        let mut t = Vec::new();
+        for p in ["gate_proj", "up_proj", "down_proj"] {
+            for s in ["weight", "scales", "biases"] {
+                t.push(entry(
+                    &format!("model.layers.0.mlp.switch_mlp.{p}.{s}"),
+                    &[128, 768, 256],
+                    10,
+                ));
+            }
+        }
+        let moe = infer_moe_shape(&shape_of(t, ArchFacts::default())).expect("moe");
+        assert_eq!(moe.experts_per_layer, 128);
+        assert_eq!(moe.total_expert_bytes, 90);
+    }
+
+    #[test]
+    fn moe_an_unstated_top_k_is_assumed_flagged_and_clamped_to_the_expert_count() {
+        let t = vec![entry("blk.0.ffn_gate_exps.weight", &[8, 8, 4], 10)];
+        let moe = infer_moe_shape(&shape_of(t, ArchFacts::default())).expect("moe");
+        assert!(moe.experts_per_token_assumed);
+        assert_eq!(
+            moe.experts_per_token, 4,
+            "8 assumed, but only 4 experts exist"
+        );
+        assert!(moe.activation_ratio() <= 1.0);
+    }
+
+    #[test]
+    fn moe_a_dense_model_has_none() {
+        let t = vec![
+            entry("blk.0.ffn_gate.weight", &[8, 8], 10),
+            entry("model.layers.0.mlp.gate_proj.weight", &[8, 8], 10),
+            entry(
+                "model.layers.0.mlp.shared_experts.gate_proj.weight",
+                &[8, 8],
+                10,
+            ),
+        ];
+        assert!(infer_moe_shape(&shape_of(t, ArchFacts::default())).is_none());
+    }
+
     #[test]
     fn a_dense_model_has_no_moe_shape() {
         let shape = MoeShape {
             moe_layers: 0,
             experts_per_layer: 0,
             experts_per_token: 0,
+            experts_per_token_assumed: false,
             total_expert_bytes: 0,
         };
         assert_eq!(shape.activation_ratio(), 0.0, "must not divide by zero");

@@ -36,6 +36,8 @@ pub struct Candidate {
     pub regime: Regime,
     pub est_tok_s: f64,
     pub is_moe: bool,
+    /// MoE only: top-k was not stated, so the traffic figure rests on an assumed 8.
+    pub top_k_assumed: bool,
     /// Mean bits stored per weight, measured from this file's tensor directory.
     pub bits_per_weight: Option<f64>,
     /// KV cache bytes at the context this evaluation assumed.
@@ -428,24 +430,21 @@ fn build(
     usable_ram: u64,
     context_tokens: u64,
 ) -> Candidate {
-    let (traffic, is_moe) = match model::infer_moe_shape(shape) {
-        Some(moe) => (
-            TokenTraffic {
-                expert_bytes: moe.expert_bytes_per_token(),
-                trunk_bytes: shape
-                    .total_tensor_bytes()
-                    .saturating_sub(moe.total_expert_bytes()),
-            },
-            true,
-        ),
+    let moe = model::infer_moe_shape(shape);
+    let is_moe = moe.is_some();
+    let top_k_assumed = moe.as_ref().is_some_and(|m| m.experts_per_token_assumed);
+    let traffic = match &moe {
+        Some(moe) => TokenTraffic {
+            expert_bytes: moe.expert_bytes_per_token(),
+            trunk_bytes: shape
+                .total_tensor_bytes()
+                .saturating_sub(moe.total_expert_bytes()),
+        },
         // Dense: every weight is read every token.
-        None => (
-            TokenTraffic {
-                expert_bytes: 0,
-                trunk_bytes: shape.total_tensor_bytes(),
-            },
-            false,
-        ),
+        None => TokenTraffic {
+            expert_bytes: 0,
+            trunk_bytes: shape.total_tensor_bytes(),
+        },
     };
 
     // A model that fits only with an empty context is a model that fails an hour in.
@@ -478,6 +477,7 @@ fn build(
         regime,
         est_tok_s,
         is_moe,
+        top_k_assumed,
         bits_per_weight: shape.bits_per_weight(),
         kv_bytes,
         format,
@@ -519,6 +519,7 @@ pub fn report_json(
                 "below_quality_floor": !c.meets_quality_floor(),
                 "bytes_per_token": c.traffic.total(),
                 "is_moe": c.is_moe,
+                "experts_per_token_assumed": c.top_k_assumed,
                 "shard_count": c.shard_count,
                 "dropped_tensors": c.dropped_tensors,
                 // Null rather than 0 when disk-bound: a consumer that plots this must not
@@ -611,6 +612,12 @@ pub fn report(
         // Annotations go after the numbers, never inside the label: a label that grows to
         // "UD-Q2_K_XL (2 parts)" overflows its column and unaligns every row below it.
         let mut notes = vec![if c.is_moe { "moe" } else { "dense" }.to_string()];
+        if c.top_k_assumed {
+            notes.push(format!(
+                "top-k {} assumed",
+                model::ASSUMED_EXPERTS_PER_TOKEN
+            ));
+        }
         if c.shard_count > 1 {
             notes.push(format!("{} parts", c.shard_count));
         }
@@ -729,6 +736,7 @@ mod tests {
             regime,
             est_tok_s: 10.0,
             is_moe: false,
+            top_k_assumed: false,
             bits_per_weight: bpw,
             // The regime is supplied directly by these tests, so the cache is already
             // accounted for in whatever the caller passed.

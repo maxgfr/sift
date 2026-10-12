@@ -155,7 +155,15 @@ pub fn facts_from_config(config: &serde_json::Value) -> ArchFacts {
         embedding_length: u("hidden_size"),
         key_length: u("head_dim"),
         context_length: u("max_position_embeddings"),
-        expert_used_count: u("num_experts_per_tok").or_else(|| u("num_experts_per_token")),
+        expert_used_count: u("num_experts_per_tok")
+            .or_else(|| u("num_experts_per_token"))
+            .or_else(|| u("moe_topk")),
+        // Each family names it differently: Mixtral `num_local_experts`, Qwen and OLMoE
+        // `num_experts`, DeepSeek `n_routed_experts`.
+        expert_count: u("num_local_experts")
+            .or_else(|| u("num_experts"))
+            .or_else(|| u("n_routed_experts"))
+            .or_else(|| u("moe_num_experts")),
     }
 }
 
