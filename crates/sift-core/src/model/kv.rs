@@ -323,6 +323,27 @@ pub fn default_sliding_window(arch: &str) -> Option<u64> {
     }
 }
 
+/// Whether an architecture has no attention at all: every layer recurrent, no KV cache.
+///
+/// Mamba and RWKV state their layer count and nothing about heads, which read as "the
+/// cache cannot be sized" when the cache is zero. Spelled as llama.cpp names them in GGUF
+/// and as transformers names them in `model_type`. Hybrids (Jamba, Granite 4, Nemotron-H)
+/// are not here: their attention layers do hold a cache, stated per layer.
+pub fn attention_free(arch: &str) -> bool {
+    matches!(
+        arch,
+        "mamba"
+            | "mamba2"
+            | "falcon_mamba"
+            | "rwkv"
+            | "rwkv5"
+            | "rwkv6"
+            | "rwkv7"
+            | "arwkv7"
+            | "rwkv6qwen2"
+    )
+}
+
 /// Every Nth layer full attention, the rest linear, for families that default it.
 ///
 /// llama.cpp's `qwen35`, `qwen35moe` and `qwen3next` loaders all fall back to 4.
@@ -480,6 +501,15 @@ mod tests {
             ..Default::default()
         };
         assert!(kv_shape_from_facts(&f).is_none(), "no heads, no width");
+    }
+
+    #[test]
+    fn kv_attention_free_architectures_are_all_recurrent() {
+        for arch in ["mamba", "mamba2", "rwkv6", "rwkv7", "falcon_mamba"] {
+            assert!(attention_free(arch), "{arch}");
+        }
+        assert!(!attention_free("jamba"), "hybrid: some layers attend");
+        assert!(!attention_free("llama"));
     }
 
     #[test]

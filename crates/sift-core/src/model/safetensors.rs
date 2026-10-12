@@ -196,6 +196,9 @@ pub fn facts_from_config(config: &serde_json::Value) -> ArchFacts {
                     Some(every) => Some((every, false)),
                     None => kv::default_sliding_pattern(model_type),
                 });
+        if explicit.is_none() && kv::attention_free(model_type) {
+            return Some(vec![LayerKind::Linear; n as usize]);
+        }
         kv::resolve_layer_kinds(n, explicit, u("full_attention_interval"), pattern)
     });
 
@@ -589,6 +592,19 @@ mod tests {
         let kv = crate::model::kv::kv_shape_from_facts(&f).expect("sizeable");
         assert_eq!(kv.head_dim, 64);
         assert!(!kv.is_mixed());
+    }
+
+    #[test]
+    fn kv_an_attention_free_model_holds_no_cache_rather_than_an_unknown_one() {
+        // state-spaces/mamba-2.8b-hf: 64 recurrent layers and no attention at all. "The
+        // metadata does not state its attention shape" was true and the wrong conclusion:
+        // the cache is zero, not unknown.
+        let kv = kv_of(serde_json::json!({
+            "architectures": ["MambaForCausalLM"], "model_type": "mamba",
+            "num_hidden_layers": 64, "hidden_size": 2560,
+        }));
+        assert_eq!(kv.bytes_at(131_072, 2), 0);
+        assert_eq!(kv.recurrent_layers, 64);
     }
 
     #[test]

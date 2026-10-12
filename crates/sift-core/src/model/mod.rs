@@ -273,6 +273,9 @@ fn gguf_facts(g: &Gguf) -> ArchFacts {
                 None => default,
             }
         });
+        if explicit.is_none() && kv::attention_free(arch) {
+            return Some(vec![LayerKind::Linear; n as usize]);
+        }
         kv::resolve_layer_kinds(n, explicit, interval, pattern)
     });
 

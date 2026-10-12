@@ -1149,6 +1149,11 @@ fn cmd_inspect(src: &Source, list_tensors: bool, json: bool) -> Result<()> {
     // engines start at, with the trained maximum alongside because the two can differ by
     // 64x and the cache scales linearly between them.
     match model::infer_kv_shape(&shape) {
+        // Mamba, RWKV: every layer recurrent. Zero is the answer, not an unknown.
+        Some(kv) if kv.layers == 0 => println!(
+            "\nkv cache         none: all {} layers are recurrent, with a fixed-size state",
+            kv.recurrent_layers
+        ),
         Some(kv) => {
             println!("\nkv cache");
             println!("  layers           {}", kv.layers);
