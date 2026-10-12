@@ -407,7 +407,7 @@ fn evaluate_one(
     context_tokens: u64,
 ) -> Row {
     use sift_core::engine::Regime;
-    use sift_core::model::{self, TokenTraffic};
+    use sift_core::model;
 
     let Read {
         shape,
@@ -419,19 +419,7 @@ fn evaluate_one(
     };
     let embedding = is_embedding(&shape, &m.name, pooling);
 
-    let moe = model::infer_moe_shape(&shape);
-    let traffic = match &moe {
-        Some(moe) => TokenTraffic {
-            expert_bytes: moe.expert_bytes_per_token(),
-            trunk_bytes: shape
-                .total_tensor_bytes()
-                .saturating_sub(moe.total_expert_bytes()),
-        },
-        None => TokenTraffic {
-            expert_bytes: 0,
-            trunk_bytes: shape.total_tensor_bytes(),
-        },
-    };
+    let (traffic, moe) = model::token_traffic(&shape);
 
     let kv = model::infer_kv_shape(&shape)
         .map(|k| k.bytes_at(context_tokens, model::KV_F16_BYTES))

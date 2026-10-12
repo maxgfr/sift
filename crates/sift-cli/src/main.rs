@@ -1204,19 +1204,11 @@ fn cmd_inspect(src: &Source, list_tensors: bool, json: bool) -> Result<()> {
 
 fn cmd_plan(src: &Source, hit_rate: f64, json: bool) -> Result<()> {
     let model_shape = src.read_shape()?.shape;
-    let moe = model::infer_moe_shape(&model_shape);
-
     // Everything that is not a routed expert is read on every token regardless of routing.
     // A dense model is all trunk: its ceiling is simpler, not absent, and refusing to
     // print it sent people to work it out by hand.
-    let trunk_bytes = model_shape
-        .total_tensor_bytes()
-        .saturating_sub(moe.as_ref().map_or(0, |m| m.total_expert_bytes()));
-
-    let traffic = model::TokenTraffic {
-        expert_bytes: moe.as_ref().map_or(0, |m| m.expert_bytes_per_token()),
-        trunk_bytes,
-    };
+    let (traffic, moe) = model::token_traffic(&model_shape);
+    let trunk_bytes = traffic.trunk_bytes;
 
     if json {
         let mem = doctor::measure_read_bandwidth(doctor::BANDWIDTH_BUF_BYTES, 3)

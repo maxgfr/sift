@@ -315,6 +315,70 @@ pub fn infer_kv_shape(g: &ModelShape) -> Option<KvShape> {
     kv::kv_shape_from_facts(&g.facts)
 }
 
+/// Whether a tensor belongs to something other than the text decoder.
+///
+/// Multimodal checkpoints carry their image and audio encoders in the same file — GGUF's
+/// `v.*`, `mm.*` and `a.*`, HuggingFace's `vision_tower`, `visual`, `multi_modal_projector`
+/// and the rest — and some carry a multi-token-prediction head (`mtp.*`) that ordinary
+/// decoding never runs. All of it is loaded, so it counts toward what has to fit, and none
+/// of it is read per generated token, so it must not count toward traffic.
+pub fn is_off_decoder(name: &str) -> bool {
+    let first = name.split('.').next().unwrap_or_default();
+    if matches!(first, "v" | "mm" | "a" | "mtp") {
+        return true;
+    }
+    // HuggingFace wraps everything in `model.` on some families (`model.visual`).
+    let head = match name.strip_prefix("model.") {
+        Some(rest) => rest.split('.').next().unwrap_or_default(),
+        None => first,
+    };
+    matches!(
+        head,
+        "visual"
+            | "vision_tower"
+            | "vision_model"
+            | "vision_encoder"
+            | "vision_language_adapter"
+            | "multi_modal_projector"
+            | "mm_projector"
+            | "patch_merger"
+            | "pre_mm_projector_norm"
+            | "audio_tower"
+            | "audio_model"
+            | "audio_encoder"
+            | "embed_vision"
+            | "embed_audio"
+            | "mtp"
+    )
+}
+
+/// Bytes a single generated token reads, and the MoE shape behind the figure when there is
+/// one.
+///
+/// The one place `fit`, `ls` and `plan` get traffic from. Routed experts count at the
+/// activation ratio; everything else in the text decoder counts in full; encoders and MTP
+/// heads count not at all (see [`is_off_decoder`]).
+pub fn token_traffic(g: &ModelShape) -> (TokenTraffic, Option<MoeShape>) {
+    let decoder: u64 = g
+        .tensors()
+        .iter()
+        .filter(|t| !is_off_decoder(&t.name))
+        .map(|t| t.size_bytes)
+        .fold(0, u64::saturating_add);
+    let moe = infer_moe_shape(g);
+    let traffic = match &moe {
+        Some(m) => TokenTraffic {
+            expert_bytes: m.expert_bytes_per_token(),
+            trunk_bytes: decoder.saturating_sub(m.total_expert_bytes()),
+        },
+        None => TokenTraffic {
+            expert_bytes: 0,
+            trunk_bytes: decoder,
+        },
+    };
+    (traffic, moe)
+}
+
 /// A model's MoE shape, as far as the tensor directory reveals it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MoeShape {
@@ -1010,6 +1074,69 @@ mod tests {
             ),
         ];
         assert!(infer_moe_shape(&shape_of(t, ArchFacts::default())).is_none());
+    }
+
+    #[test]
+    fn a_vision_encoder_in_the_file_is_loaded_but_not_read_per_token() {
+        // Ollama's qwen3-vl:2b blob holds the vision tower (`v.*`, 0.78 GB of 1.88).
+        // Counting it as read every token predicted 37-46 tok/s for a model that decodes
+        // text at 69: the encoder runs once per image, never per generated token.
+        let t = vec![
+            entry("blk.0.attn_q.weight", &[16, 16], 845),
+            entry("token_embd.weight", &[16, 16], 255),
+            entry("v.blk.0.attn_q.weight", &[16, 16], 700),
+            entry("mm.0.weight", &[16, 16], 81),
+        ];
+        let shape = shape_of(t, ArchFacts::default());
+        assert_eq!(
+            shape.total_tensor_bytes(),
+            1881,
+            "the engine still loads all of it"
+        );
+        let (traffic, moe) = token_traffic(&shape);
+        assert!(moe.is_none());
+        assert_eq!(traffic.total(), 1100);
+
+        // The same in HuggingFace spellings, and the MTP head ordinary decode never runs.
+        let t = vec![
+            entry(
+                "model.language_model.layers.0.mlp.up_proj.weight",
+                &[4, 4],
+                10,
+            ),
+            entry("model.visual.blocks.0.attn.qkv.weight", &[4, 4], 7),
+            entry(
+                "vision_tower.vision_model.encoder.layers.0.weight",
+                &[4, 4],
+                7,
+            ),
+            entry(
+                "multi_modal_projector.mm_input_projection_weight",
+                &[4, 4],
+                1,
+            ),
+            entry("vision_encoder.transformer.layers.0.weight", &[4, 4], 7),
+            entry("mtp.layers.0.mlp.up_proj.weight", &[4, 4], 3),
+            entry("lm_head.weight", &[4, 4], 2),
+        ];
+        let (traffic, _) = token_traffic(&shape_of(t, ArchFacts::default()));
+        assert_eq!(traffic.total(), 12);
+    }
+
+    #[test]
+    fn moe_traffic_reads_the_active_share_of_experts_plus_the_decoder_trunk() {
+        let t = vec![
+            entry("blk.0.ffn_gate_exps.weight", &[8, 8, 4], 400),
+            entry("blk.0.attn_q.weight", &[8, 8], 50),
+            entry("v.blk.0.attn_q.weight", &[8, 8], 999),
+        ];
+        let facts = ArchFacts {
+            expert_used_count: Some(1),
+            ..Default::default()
+        };
+        let (traffic, moe) = token_traffic(&shape_of(t, facts));
+        assert!(moe.is_some());
+        assert_eq!((traffic.expert_bytes, traffic.trunk_bytes), (100, 50));
     }
 
     #[test]

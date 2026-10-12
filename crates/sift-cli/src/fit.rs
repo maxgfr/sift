@@ -643,22 +643,9 @@ fn build(
     usable_ram: u64,
     context_tokens: u64,
 ) -> Candidate {
-    let moe = model::infer_moe_shape(shape);
+    let (traffic, moe) = model::token_traffic(shape);
     let is_moe = moe.is_some();
     let top_k_assumed = moe.as_ref().is_some_and(|m| m.experts_per_token_assumed);
-    let traffic = match &moe {
-        Some(moe) => TokenTraffic {
-            expert_bytes: moe.expert_bytes_per_token(),
-            trunk_bytes: shape
-                .total_tensor_bytes()
-                .saturating_sub(moe.total_expert_bytes()),
-        },
-        // Dense: every weight is read every token.
-        None => TokenTraffic {
-            expert_bytes: 0,
-            trunk_bytes: shape.total_tensor_bytes(),
-        },
-    };
 
     // A model that fits only with an empty context is a model that fails an hour in.
     // Classify on weights plus cache, not on the file size.
