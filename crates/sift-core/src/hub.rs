@@ -101,7 +101,9 @@ pub fn shard_position(path: &str) -> Option<(String, u32, u32)> {
 
     let total: u32 = total.parse().ok()?;
     let index: u32 = index.parse().ok()?;
-    if total == 0 || index == 0 || index > total {
+    // Index 0 is allowed: most sets count `1..=N`, but some (openai/gpt-oss) count
+    // `0..=N`, and whether a set is whole is [`ShardSet::is_complete`]'s question.
+    if total == 0 || index > total {
         return None;
     }
     Some((format!("{base}{ext}"), index, total))
@@ -135,10 +137,14 @@ impl ShardSet {
     /// downloads a model that cannot load.
     ///
     /// Counting parts is not enough: `1 of 2` beside `2 of 3` and `3 of 3` is three parts
-    /// of no model at all. Complete means the indices are exactly `1..=expected` and every
-    /// part agrees on `expected`.
+    /// of no model at all. Complete means every part agrees on `expected` and the indices
+    /// run without a gap in one of the three numberings publishers actually use:
+    /// `1..=N` (the convention), `0..N` (zero-based, N the count: MiniCPM5) and `0..=N`
+    /// (zero-based, N the last index: gpt-oss).
     pub fn is_complete(&self) -> bool {
-        self.totals_agree && self.indices.iter().copied().eq(1..=self.expected)
+        let indices = || self.indices.iter().copied();
+        let n = self.expected;
+        self.totals_agree && (indices().eq(1..=n) || indices().eq(0..n) || indices().eq(0..=n))
     }
 }
 
@@ -201,6 +207,110 @@ pub fn group_shards(files: &[RepoFile]) -> (Vec<RepoFile>, Vec<ShardSet>) {
     (whole, sets)
 }
 
+/// Split whole files from multi-file models, using the repo's safetensors indexes first.
+///
+/// `indexed` pairs each `*.safetensors.index.json` with the files its `weight_map` names
+/// (see [`index_parts`]). An index is the authoritative list of a model's parts, whatever
+/// they are called: MiMo-V2.6's `model_pp0_ep0_shard0.safetensors` has no `-of-` for
+/// [`shard_position`] to find, and without the index each of its 132 files was a "model".
+/// Files no index claims are grouped by name as before.
+pub fn group_models(
+    files: &[RepoFile],
+    indexed: &[(String, Vec<String>)],
+) -> (Vec<RepoFile>, Vec<ShardSet>) {
+    use std::collections::HashSet;
+    let mut claimed: HashSet<&str> = HashSet::new();
+    let mut sets = Vec::new();
+    for (index, parts) in indexed {
+        if parts.is_empty() {
+            continue;
+        }
+        let found: Vec<RepoFile> = parts
+            .iter()
+            .filter_map(|p| files.iter().find(|f| &f.path == p).cloned())
+            .collect();
+        for p in parts {
+            claimed.insert(p.as_str());
+        }
+        let base = index
+            .strip_suffix(".index.json")
+            .unwrap_or(index)
+            .to_string();
+        let size = if found.len() == parts.len() {
+            found.iter().map(|f| f.size).sum()
+        } else {
+            None
+        };
+        sets.push(ShardSet {
+            base: RepoFile { path: base, size },
+            // Numbered in the index's order; a missing part leaves a gap at the end, which
+            // is what makes `is_complete` false.
+            indices: (1..=found.len() as u32).collect(),
+            parts: found,
+            expected: parts.len() as u32,
+            totals_agree: true,
+        });
+    }
+    let rest: Vec<RepoFile> = files
+        .iter()
+        .filter(|f| !claimed.contains(f.path.as_str()))
+        .cloned()
+        .collect();
+    let (whole, by_name) = group_shards(&rest);
+    sets.extend(by_name);
+    (whole, sets)
+}
+
+/// The files a safetensors index names, resolved against the index's own directory, in
+/// order and once each.
+pub fn index_parts(index_path: &str, index: &serde_json::Value) -> Vec<String> {
+    let dir = index_path
+        .rsplit_once('/')
+        .map(|(d, _)| format!("{d}/"))
+        .unwrap_or_default();
+    let mut parts: Vec<String> = index["weight_map"]
+        .as_object()
+        .map(|m| {
+            m.values()
+                .filter_map(|v| v.as_str())
+                .map(|f| format!("{dir}{f}"))
+                .collect()
+        })
+        .unwrap_or_default();
+    parts.sort();
+    parts.dedup();
+    parts
+}
+
+/// Fetch every safetensors index a listing holds, as [`group_models`] takes them.
+///
+/// One small document per multi-file model, fetched only for repos that hold safetensors.
+/// An index that cannot be read is left out, and its files fall back to name grouping.
+pub fn fetch_indexes(
+    repo: &str,
+    revision: &str,
+    indexes: &[String],
+    files: &[RepoFile],
+) -> Vec<(String, Vec<String>)> {
+    if !files.iter().any(RepoFile::is_safetensors) {
+        return Vec::new();
+    }
+    indexes
+        .iter()
+        .filter_map(|path| {
+            let url = crate::model::hf_url_at(repo, revision, path);
+            let out = crate::http::Curl::new(&url, ["-L", "--fail", "--max-time", "20"])
+                .output()
+                .ok()?;
+            if !out.status.success() {
+                return None;
+            }
+            let json: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+            Some((path.clone(), index_parts(path, &json)))
+        })
+        .collect()
+}
+
 /// Whether a hyphen-separated filename part names a quantization.
 ///
 /// Deliberately an allow-list of prefixes rather than a shape test. `30B` and `A3B` are
@@ -250,6 +360,8 @@ pub struct Listing {
     /// Every later fetch is pinned to it, so a push landing mid-sweep cannot make one
     /// quantization's header come from one commit and the next from another.
     pub sha: Option<String>,
+    /// `*.safetensors.index.json` files, each naming one multi-file model's parts.
+    pub indexes: Vec<String>,
 }
 
 impl Listing {
@@ -315,9 +427,20 @@ pub fn list_weights(repo: &str, revision: Option<&str>) -> Result<Listing, HubEr
     }
 
     files.sort_by_key(|f| f.size);
+    let indexes = json["siblings"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|s| s["rfilename"].as_str())
+                .filter(|p| p.ends_with(".safetensors.index.json"))
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
     Ok(Listing {
         files,
         sha: json["sha"].as_str().map(str::to_owned),
+        indexes,
     })
 }
 
@@ -602,6 +725,112 @@ mod shard_tests {
     }
 
     #[test]
+    fn a_safetensors_index_groups_files_whatever_they_are_called() {
+        // XiaomiMiMo/MiMo-V2.6-Pro-RL names its shards `model_pp0_ep0_shard0.safetensors`
+        // and so on: no `-of-` anywhere, so each of 132 files became its own "model".
+        let files = vec![
+            sized("model_pp0_ep0_shard0.safetensors", 5),
+            sized("model_pp0_ep1_shard0.safetensors", 7),
+            sized("dflash/dflash_draft_model.safetensors", 1),
+        ];
+        let indexed = vec![(
+            "model.safetensors.index.json".to_string(),
+            vec![
+                "model_pp0_ep0_shard0.safetensors".to_string(),
+                "model_pp0_ep1_shard0.safetensors".to_string(),
+            ],
+        )];
+        let (whole, sets) = group_models(&files, &indexed);
+        assert_eq!(sets.len(), 1);
+        assert!(sets[0].is_complete());
+        assert_eq!(sets[0].base.path, "model.safetensors");
+        assert_eq!(sets[0].size(), Some(12));
+        assert_eq!(
+            whole.len(),
+            1,
+            "the draft model is not part of the indexed one"
+        );
+
+        // An index naming a file the listing lacks is an incomplete model, not a smaller one.
+        let missing = vec![(
+            "model.safetensors.index.json".to_string(),
+            vec!["a.safetensors".to_string(), "b.safetensors".to_string()],
+        )];
+        let (_, sets) = group_models(&[sized("a.safetensors", 1)], &missing);
+        assert!(!sets[0].is_complete());
+    }
+
+    #[test]
+    fn index_part_names_are_resolved_against_the_index_directory() {
+        let index = serde_json::json!({"weight_map": {
+            "a": "model-1.safetensors", "b": "model-2.safetensors", "c": "model-1.safetensors"
+        }});
+        assert_eq!(
+            index_parts("sub/model.safetensors.index.json", &index),
+            ["sub/model-1.safetensors", "sub/model-2.safetensors"]
+        );
+    }
+
+    #[test]
+    fn a_zero_based_set_is_a_complete_model() {
+        // openai/gpt-oss-20b ships model-00000-of-00002 … model-00002-of-00002: three
+        // files, numbered from zero. Rejecting index 0 split one model into a "whole file"
+        // holding a third of its tensors and a set missing that third.
+        let files = vec![
+            sized("model-00000-of-00002.safetensors", 4),
+            sized("model-00001-of-00002.safetensors", 4),
+            sized("model-00002-of-00002.safetensors", 4),
+        ];
+        let (whole, sets) = group_shards(&files);
+        assert!(whole.is_empty());
+        assert_eq!(sets.len(), 1);
+        assert!(sets[0].is_complete());
+        assert_eq!(sets[0].parts.len(), 3);
+        assert_eq!(sets[0].size(), Some(12));
+    }
+
+    #[test]
+    fn a_zero_based_set_counted_to_n_is_complete_too() {
+        // openbmb/MiniCPM5-2B is one file, `model-00000-of-00001`: numbered from zero with
+        // the count, not the last index, after `of`.
+        let one = vec![sized("model-00000-of-00001.safetensors", 4)];
+        let (whole, sets) = group_shards(&one);
+        assert!(whole.is_empty());
+        assert!(sets[0].is_complete());
+
+        let files: Vec<RepoFile> = (0..4)
+            .map(|i| sized(&format!("model-{i:05}-of-00004.safetensors"), 1))
+            .collect();
+        let (_, sets) = group_shards(&files);
+        assert!(sets[0].is_complete(), "0..4 of 4");
+    }
+
+    #[test]
+    fn where_names_are_ambiguous_the_index_decides() {
+        // `00000` and `00001` of `00002` is a whole model under the count convention and
+        // two thirds of one under gpt-oss's last-index convention. Names cannot tell; the
+        // index gpt-oss ships can.
+        let files = vec![
+            sized("model-00000-of-00002.safetensors", 4),
+            sized("model-00001-of-00002.safetensors", 4),
+        ];
+        let indexed = vec![(
+            "model.safetensors.index.json".to_string(),
+            vec![
+                "model-00000-of-00002.safetensors".to_string(),
+                "model-00001-of-00002.safetensors".to_string(),
+                "model-00002-of-00002.safetensors".to_string(),
+            ],
+        )];
+        let (_, sets) = group_models(&files, &indexed);
+        assert_eq!(sets.len(), 1);
+        assert!(
+            !sets[0].is_complete(),
+            "the index names a third file the repo lacks"
+        );
+    }
+
+    #[test]
     fn parts_that_disagree_on_the_total_are_not_a_complete_set() {
         let files = vec![
             sized("M-Q4_K_M-00001-of-00002.gguf", 10),
@@ -648,8 +877,11 @@ mod shard_tests {
 
     #[test]
     fn nonsense_shard_numbering_is_not_treated_as_a_split() {
-        assert!(shard_position("M-Q4_K_M-00000-of-00003.gguf").is_none());
+        // Index 0 is not nonsense — some publishers number from zero, see
+        // `a_zero_based_set_is_a_complete_model` — but an index past the total is, and so
+        // is a total of zero.
         assert!(shard_position("M-Q4_K_M-00004-of-00003.gguf").is_none());
+        assert!(shard_position("M-Q4_K_M-00000-of-00000.gguf").is_none());
         assert!(shard_position("M-Q4_K_M-000x-of-00003.gguf").is_none());
         assert!(shard_position("M-Q4_K_M-00001-of-.gguf").is_none());
     }

@@ -221,8 +221,8 @@ struct Model {
 
 /// Every model a repo listing holds. Incomplete sets are not models: two of three shards
 /// describe a model that cannot be loaded.
-fn models(files: &[RepoFile]) -> Vec<Model> {
-    let (whole, sets) = hub::group_shards(files);
+fn models(files: &[RepoFile], indexed: &[(String, Vec<String>)]) -> Vec<Model> {
+    let (whole, sets) = hub::group_models(files, indexed);
     whole
         .iter()
         .map(|f| Model {
@@ -280,10 +280,12 @@ impl Source {
             }),
             RepoRef::Repo { repo, quant } => {
                 let listing = hub::list_weights(&repo, None)?;
-                let offered = models(&listing.files);
+                let revision = listing.revision(None).to_string();
+                let indexed =
+                    hub::fetch_indexes(&repo, &revision, &listing.indexes, &listing.files);
+                let offered = models(&listing.files, &indexed);
                 let chosen = pick(&offered, quant.as_deref())
                     .with_context(|| format!("choosing a model from `{repo}`"))?;
-                let revision = listing.revision(None).to_string();
                 Ok(Source::Remote {
                     urls: chosen
                         .parts
@@ -442,9 +444,9 @@ fn directory_hint(dir: &Path) -> String {
 
 /// Choose one model from a repo.
 ///
-/// With no preference, the largest single file, on the reasoning that a repo's flagship
-/// quantization is usually its biggest one; a repo of split sets only (every safetensors
-/// repo past a few GB) gets its largest complete set.
+/// With no preference, the largest single file at the repo root, on the reasoning that a
+/// repo's flagship quantization is usually its biggest one; a repo of split sets only
+/// (every safetensors repo past a few GB) gets its largest complete set.
 ///
 /// With a preference, an exact label wins, case-insensitively. Failing that a substring
 /// match is accepted only when it is the only one: `Q4` against `IQ4_XS`, `Q4_0` and
@@ -465,11 +467,20 @@ fn pick<'a>(models: &'a [Model], quant: Option<&str>) -> Result<&'a Model> {
             .join(", ")
     };
     let Some(want) = quant else {
-        return models
+        // At the repo root if anything is: a subdirectory holds an alternative — gpt-oss's
+        // `original/` checkpoint, Unsloth's `BF16/` split — not the model a repo is named for.
+        let root: Vec<&Model> = models.iter().filter(|m| !m.path.contains('/')).collect();
+        let pool: Vec<&Model> = if root.is_empty() {
+            models.iter().collect()
+        } else {
+            root
+        };
+        return pool
             .iter()
             .filter(|m| !m.split)
             .max_by_key(|m| m.size)
-            .or_else(|| models.iter().max_by_key(|m| m.size))
+            .or_else(|| pool.iter().max_by_key(|m| m.size))
+            .copied()
             .context("no candidate models");
     };
 
@@ -515,7 +526,7 @@ mod tests {
 
     /// [`pick`] over a listing, owning its answer.
     fn choose(files: &[RepoFile], quant: Option<&str>) -> Result<Model> {
-        pick(&models(files), quant).cloned()
+        pick(&models(files, &[]), quant).cloned()
     }
 
     fn f(path: &str, size: u64) -> RepoFile {
@@ -608,6 +619,20 @@ mod tests {
         let m = choose(&files, None).unwrap();
         assert!(m.split);
         assert_eq!(m.size, 8);
+    }
+
+    #[test]
+    fn a_root_level_model_is_preferred_over_one_in_a_subdirectory() {
+        // gpt-oss-20b keeps its original-format checkpoint in `original/` beside the
+        // transformers one at the root; the root one is what every engine loads.
+        let files = vec![
+            f("original/model.safetensors", 13),
+            f("model-00000-of-00002.safetensors", 4),
+            f("model-00001-of-00002.safetensors", 4),
+            f("model-00002-of-00002.safetensors", 4),
+        ];
+        let m = choose(&files, None).unwrap();
+        assert_eq!(m.parts.len(), 3, "picked {:?}", m.path);
     }
 
     #[test]

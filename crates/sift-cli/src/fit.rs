@@ -242,6 +242,7 @@ pub fn list(target: Target) -> Result<Listed> {
     let listing = listing?;
     // Pin every header fetch to the commit the listing describes.
     let revision = listing.revision(target.revision).to_string();
+    let listing_indexes = listing.indexes;
     let mut files = listing.files;
     if let Some(only) = target.only {
         let base = |p: &str| hub::shard_position(p).map(|(b, _, _)| b);
@@ -251,42 +252,17 @@ pub fn list(target: Target) -> Result<Listed> {
             anyhow::bail!("`{only}` is not a weight file in `{repo}`");
         }
     }
-    let (whole, sets) = hub::group_shards(&files);
+    let indexed = hub::fetch_indexes(repo, &revision, &listing_indexes, &files);
+    let (whole, sets) = hub::group_models(&files, &indexed);
     // Only safetensors keeps its architecture numbers in `config.json`; a GGUF carries its
     // own, and a stray config beside it must not override them.
     let config = config.filter(|_| {
         files.iter().any(|f| f.is_safetensors()) || sets.iter().any(|s| s.base.is_safetensors())
     });
 
-    let mut units: Vec<Unit> = whole
-        .iter()
-        .map(|f| Unit {
-            label: f.quant_label(),
-            path: f.path.clone(),
-            download_arg: f.path.clone(),
-            size: f.size,
-            parts: vec![f.path.clone()],
-        })
-        .collect();
-    for set in &sets {
-        if !set.is_complete() {
-            eprintln!(
-                "  skipped {}: the repo does not hold all {} parts of it",
-                set.base.quant_label(),
-                set.expected
-            );
-            continue;
-        }
-        // Every part, not just the first. Each shard carries only its own slice of the
-        // tensor directory, so asking part 1 for the model's size or expert layout gives
-        // an answer that is confidently a third of the truth.
-        units.push(Unit {
-            label: set.base.quant_label(),
-            path: set.base.path.clone(),
-            download_arg: shard_glob(&set.base.path),
-            size: set.size(),
-            parts: set.parts.iter().map(|p| p.path.clone()).collect(),
-        });
+    let (mut units, skipped) = plan_units(&whole, &sets);
+    for why in skipped {
+        eprintln!("  skipped {why}");
     }
 
     // `repo:QUANT` narrows before a single header is read: the labels come from file
@@ -459,6 +435,104 @@ fn assemble(
         return Ok(model::safetensors::model_shape(safetensors, config));
     }
     model::ModelShape::sharded(&ggufs).context("a model with no parts")
+}
+
+/// Turn grouped files into the models to read, and say what was left out and why.
+///
+/// Two things are left out. A split set missing parts is not a model that can load. And a
+/// safetensors checkpoint in a subdirectory, when the repo has one at its root, is an
+/// adjunct or an alternative — MiMo-V2.6's `audio_tokenizer/` and `dflash/` draft model,
+/// gpt-oss's `original/` — and listing it as a quantization got a 1.9 GB audio tokenizer
+/// recommended. GGUF quants in subdirectories (`BF16/`) are quants and stay.
+fn plan_units(whole: &[hub::RepoFile], sets: &[hub::ShardSet]) -> (Vec<Unit>, Vec<String>) {
+    let mut units: Vec<Unit> = whole
+        .iter()
+        .map(|f| Unit {
+            label: f.quant_label(),
+            path: f.path.clone(),
+            download_arg: f.path.clone(),
+            size: f.size,
+            parts: vec![f.path.clone()],
+        })
+        .collect();
+    let mut skipped = Vec::new();
+    for set in sets {
+        if !set.is_complete() {
+            skipped.push(format!(
+                "{}: the repo does not hold all {} parts of it",
+                set.base.quant_label(),
+                set.expected
+            ));
+            continue;
+        }
+        // Every part, not just the first. Each shard carries only its own slice of the
+        // tensor directory, so asking part 1 for the model's size or expert layout gives
+        // an answer that is confidently a third of the truth.
+        let parts: Vec<String> = set.parts.iter().map(|p| p.path.clone()).collect();
+        units.push(Unit {
+            label: set.base.quant_label(),
+            path: set.base.path.clone(),
+            download_arg: download_glob(&set.base.path, &parts),
+            size: set.size(),
+            parts,
+        });
+    }
+
+    let st_root = units
+        .iter()
+        .any(|u| u.path.ends_with(".safetensors") && !u.path.contains('/'));
+    if st_root {
+        units.retain(|u| {
+            let adjunct = u.path.ends_with(".safetensors") && u.path.contains('/');
+            if adjunct {
+                skipped.push(format!(
+                    "{}: a checkpoint in a subdirectory beside the repo's own model",
+                    u.path
+                ));
+            }
+            !adjunct
+        });
+    }
+    (units, skipped)
+}
+
+/// An `--include` pattern matching every part of a multi-file model, and nothing else.
+///
+/// The set's own name gives it when its parts follow the `-0000x-of-0000N` convention.
+/// Parts an index named however their publisher liked get the longest prefix they share.
+fn download_glob(base_path: &str, parts: &[String]) -> String {
+    if let [only] = parts {
+        return only.clone();
+    }
+    let named = shard_glob(base_path);
+    let stem_ext = [".gguf", ".safetensors"]
+        .iter()
+        .find_map(|ext| base_path.strip_suffix(ext).map(|stem| (stem, *ext)));
+    if let Some((stem, ext)) = stem_ext {
+        let prefix = format!("{stem}-");
+        if parts
+            .iter()
+            .all(|p| p.starts_with(&prefix) && p.ends_with(ext))
+        {
+            return named;
+        }
+    }
+    let first = parts.first().map(String::as_str).unwrap_or(base_path);
+    let mut common = first.len();
+    for p in parts {
+        common = common.min(
+            first
+                .bytes()
+                .zip(p.bytes())
+                .take_while(|(a, b)| a == b)
+                .count(),
+        );
+    }
+    let ext = std::path::Path::new(first)
+        .extension()
+        .map(|e| format!(".{}", e.to_string_lossy()))
+        .unwrap_or_default();
+    format!("--include \"{}*{ext}\"", &first[..common])
 }
 
 /// Whether a GGUF is a multimodal projector rather than a language model.
@@ -1153,6 +1227,66 @@ mod calibration_tests {
 mod sweep_tests {
     use super::*;
     use std::sync::OnceLock;
+
+    fn file(path: &str, size: u64) -> hub::RepoFile {
+        hub::RepoFile {
+            path: path.into(),
+            size: Some(size),
+        }
+    }
+
+    #[test]
+    fn subdirectory_checkpoints_beside_a_root_model_are_not_candidates() {
+        // MiMo-V2.6 ships an audio tokenizer and a draft model in subdirectories. Listed as
+        // quantizations, the 1.9 GB audio tokenizer "fit" and was recommended.
+        let files = vec![
+            file("model_pp0_ep0_shard0.safetensors", 5),
+            file("model_pp0_ep1_shard0.safetensors", 5),
+            file("audio_tokenizer/model.safetensors", 2),
+            file("dflash/dflash_draft_model.safetensors", 1),
+        ];
+        let indexed = vec![(
+            "model.safetensors.index.json".to_string(),
+            vec![
+                "model_pp0_ep0_shard0.safetensors".to_string(),
+                "model_pp0_ep1_shard0.safetensors".to_string(),
+            ],
+        )];
+        let (whole, sets) = hub::group_models(&files, &indexed);
+        let (units, skipped) = plan_units(&whole, &sets);
+        let paths: Vec<&str> = units.iter().map(|u| u.path.as_str()).collect();
+        assert_eq!(paths, ["model.safetensors"]);
+        assert_eq!(skipped.len(), 2);
+        // The download pattern must match every part, whatever the parts are called.
+        assert_eq!(
+            units[0].download_arg,
+            "--include \"model_pp0_ep*.safetensors\""
+        );
+    }
+
+    #[test]
+    fn a_one_part_index_downloads_its_one_file() {
+        assert_eq!(
+            download_glob("model.safetensors", &["model.safetensors".to_string()]),
+            "model.safetensors"
+        );
+    }
+
+    #[test]
+    fn gguf_quants_in_subdirectories_stay_candidates() {
+        // Unsloth keeps a split BF16 in `BF16/` beside the root quants; it is a quant of
+        // the same model, not an adjunct.
+        let files = vec![
+            file("M-Q4_K_M.gguf", 5),
+            file("BF16/M-BF16-00001-of-00002.gguf", 5),
+            file("BF16/M-BF16-00002-of-00002.gguf", 5),
+        ];
+        let (whole, sets) = hub::group_models(&files, &[]);
+        let (units, skipped) = plan_units(&whole, &sets);
+        assert_eq!(units.len(), 2);
+        assert!(skipped.is_empty());
+        assert_eq!(units[1].download_arg, "--include \"BF16/M-BF16-*.gguf\"");
+    }
 
     fn safetensors(name: &str) -> model::Safetensors {
         let header =
