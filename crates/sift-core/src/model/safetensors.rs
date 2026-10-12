@@ -22,7 +22,7 @@
 
 use std::io::{self, Read, Seek, SeekFrom};
 
-use super::{ArchFacts, TensorEntry};
+use super::{kv, ArchFacts, LayerKind, TensorEntry};
 
 /// Ceiling on the JSON header we will read.
 ///
@@ -133,26 +133,87 @@ impl Safetensors {
     }
 }
 
+/// Nested blocks a multimodal `config.json` keeps its language model's numbers in.
+///
+/// Gemma 3, Llama 4 and Qwen3.5 put `num_hidden_layers` and friends under `text_config`;
+/// InternVL uses `llm_config`, others `language_config`. Reading only the top level found
+/// none of them, so every multimodal repo came out with an unsized KV cache.
+const TEXT_BLOCKS: [&str; 3] = ["text_config", "llm_config", "language_config"];
+
 /// Read the architecture numbers out of a HuggingFace `config.json`.
 ///
 /// Names differ from GGUF's throughout — `num_key_value_heads` rather than
 /// `attention.head_count_kv` — which is exactly why [`ArchFacts`] exists: the difference
 /// is absorbed here once instead of branching inside the KV arithmetic.
+///
+/// Each key is looked up at the top level first, then in the text block of a multimodal
+/// config, key by key: a wrapper config can state `architectures` itself and leave the
+/// layer count to its text model.
 pub fn facts_from_config(config: &serde_json::Value) -> ArchFacts {
-    let u = |k: &str| config.get(k).and_then(serde_json::Value::as_u64);
+    let get = |k: &str| -> Option<&serde_json::Value> {
+        std::iter::once(config)
+            .chain(TEXT_BLOCKS.iter().map(|b| &config[*b]))
+            .map(|c| &c[k])
+            .find(|v| !v.is_null())
+    };
+    let u = |k: &str| get(k).and_then(serde_json::Value::as_u64);
+    let s = |k: &str| get(k).and_then(serde_json::Value::as_str);
+
+    let block_count = u("num_hidden_layers");
+    let model_type = TEXT_BLOCKS
+        .iter()
+        .find_map(|b| config[*b]["model_type"].as_str())
+        .or_else(|| config["model_type"].as_str())
+        .unwrap_or_default();
+
+    // `use_sliding_window: false` (Qwen2) means the stated window is not used at all.
+    let sliding_window = match get("use_sliding_window").and_then(serde_json::Value::as_bool) {
+        Some(false) => None,
+        _ => u("sliding_window").or_else(|| u("attention_chunk_size")),
+    };
+
+    let layer_kinds = block_count.and_then(|n| {
+        let explicit = get("layer_types").and_then(|v| v.as_array()).map(|types| {
+            types
+                .iter()
+                .map(|t| match t.as_str().unwrap_or_default() {
+                    "sliding_attention" | "chunked_attention" => LayerKind::Sliding,
+                    "linear_attention" | "mamba" | "conv" | "recurrent" => LayerKind::Linear,
+                    // Unknown kinds are sized as full: overstating is the safe error.
+                    _ => LayerKind::Full,
+                })
+                .collect()
+        });
+        let pattern =
+            sliding_window
+                .filter(|&w| w > 0)
+                .and_then(|_| match u("sliding_window_pattern") {
+                    Some(every) => Some((every, false)),
+                    None => kv::default_sliding_pattern(model_type),
+                });
+        kv::resolve_layer_kinds(n, explicit, u("full_attention_interval"), pattern)
+    });
+
+    // Multi-head latent attention (DeepSeek V2/V3, Kimi K2) caches one latent of
+    // `kv_lora_rank + qk_rope_head_dim` per token per layer, whatever the head count.
+    let mla_latent = match (u("kv_lora_rank"), u("qk_rope_head_dim")) {
+        (Some(rank), Some(rope)) => Some(rank + rope),
+        _ => None,
+    };
 
     ArchFacts {
-        architecture: config["architectures"][0]
-            .as_str()
-            .or_else(|| config["model_type"].as_str())
+        architecture: get("architectures")
+            .and_then(|a| a[0].as_str())
+            .or_else(|| s("model_type"))
             .map(str::to_owned),
-        block_count: u("num_hidden_layers"),
+        block_count,
         head_count: u("num_attention_heads"),
         // Absent means multi-head attention, where query and KV head counts are equal by
         // definition. Left as `None` rather than copied, so `infer_kv_shape` applies that
         // fallback in one place for both formats.
         head_count_kv: u("num_key_value_heads"),
         embedding_length: u("hidden_size"),
+        // `head_dim: null` is common and means "derive it", which `as_u64` already gives.
         key_length: u("head_dim"),
         context_length: u("max_position_embeddings"),
         expert_used_count: u("num_experts_per_tok")
@@ -164,6 +225,13 @@ pub fn facts_from_config(config: &serde_json::Value) -> ArchFacts {
             .or_else(|| u("num_experts"))
             .or_else(|| u("n_routed_experts"))
             .or_else(|| u("moe_num_experts")),
+        value_length: None,
+        key_length_swa: None,
+        value_length_swa: None,
+        head_count_kv_layers: None,
+        sliding_window,
+        layer_kinds,
+        mla_latent,
     }
 }
 
@@ -273,6 +341,105 @@ mod tests {
         assert_eq!(f.expert_used_count, Some(8));
         // Not stated by this model, so left for `infer_kv_shape` to derive.
         assert_eq!(f.key_length, None);
+    }
+
+    fn kv_of(cfg: serde_json::Value) -> crate::model::KvShape {
+        crate::model::kv::kv_shape_from_facts(&facts_from_config(&cfg)).expect("sizeable")
+    }
+
+    #[test]
+    fn kv_gemma3_multimodal_config_is_read_through_text_config() {
+        // Real unsloth/gemma-3-4b-it values: everything that sizes the cache is nested.
+        let kv = kv_of(serde_json::json!({
+            "architectures": ["Gemma3ForConditionalGeneration"],
+            "model_type": "gemma3",
+            "text_config": {
+                "model_type": "gemma3_text", "num_hidden_layers": 34,
+                "num_attention_heads": 8, "num_key_value_heads": 4, "head_dim": 256,
+                "hidden_size": 2560, "max_position_embeddings": 131072,
+                "sliding_window": 1024, "sliding_window_pattern": 6,
+            },
+            "vision_config": { "num_hidden_layers": 27, "hidden_size": 1152 },
+        }));
+        assert_eq!((kv.full_layers, kv.sliding_layers), (5, 29));
+        let per_layer = 4 * (256 + 256) * 2;
+        assert_eq!(
+            kv.bytes_at(131_072, 2),
+            5 * per_layer * 131_072 + 29 * per_layer * 1024
+        );
+        assert_eq!(kv.train_context, Some(131_072));
+    }
+
+    #[test]
+    fn kv_deepseek_v3_config_is_sized_as_mla() {
+        // Real deepseek-ai/DeepSeek-V3 values. ~2.3 GB at 32k, where 128 heads of
+        // 128-wide K and V gave ~65 GB.
+        let kv = kv_of(serde_json::json!({
+            "architectures": ["DeepseekV3ForCausalLM"], "num_hidden_layers": 61,
+            "num_attention_heads": 128, "num_key_value_heads": 128, "hidden_size": 7168,
+            "kv_lora_rank": 512, "qk_rope_head_dim": 64, "qk_nope_head_dim": 128,
+            "v_head_dim": 128, "max_position_embeddings": 163840,
+        }));
+        let bytes = kv.bytes_at(32_768, 2);
+        assert_eq!(bytes, 61 * (512 + 64) * 32_768 * 2);
+        assert!((bytes as f64 / 1e9 - 2.30).abs() < 0.01, "{bytes}");
+    }
+
+    #[test]
+    fn kv_llama4_text_config_with_chunked_layers() {
+        let kv = kv_of(serde_json::json!({
+            "architectures": ["Llama4ForConditionalGeneration"],
+            "text_config": {
+                "model_type": "llama4_text", "num_hidden_layers": 4,
+                "num_attention_heads": 40, "num_key_value_heads": 8, "head_dim": 128,
+                "hidden_size": 5120, "attention_chunk_size": 8192,
+                "layer_types": ["chunked_attention", "chunked_attention",
+                                "chunked_attention", "full_attention"],
+            },
+        }));
+        assert_eq!((kv.full_layers, kv.sliding_layers), (1, 3));
+        assert_eq!(kv.window, Some(8192));
+        let per_layer = 8 * 256 * 2;
+        assert_eq!(
+            kv.bytes_at(65_536, 2),
+            per_layer * 65_536 + 3 * per_layer * 8192
+        );
+    }
+
+    #[test]
+    fn kv_qwen35_layer_types_mark_linear_attention_layers() {
+        let types: Vec<&str> = (0..8)
+            .map(|i| {
+                if i % 4 == 3 {
+                    "full_attention"
+                } else {
+                    "linear_attention"
+                }
+            })
+            .collect();
+        let kv = kv_of(serde_json::json!({
+            "architectures": ["Qwen3_5ForConditionalGeneration"],
+            "text_config": {
+                "num_hidden_layers": 8, "num_attention_heads": 16, "num_key_value_heads": 4,
+                "head_dim": 256, "hidden_size": 4096, "layer_types": types,
+                "full_attention_interval": 4,
+            },
+        }));
+        assert_eq!((kv.full_layers, kv.recurrent_layers), (2, 6));
+    }
+
+    #[test]
+    fn kv_a_null_head_dim_is_derived_and_an_unused_window_is_ignored() {
+        // Qwen2 states a 32k window and `use_sliding_window: false`.
+        let f = facts_from_config(&serde_json::json!({
+            "num_hidden_layers": 24, "num_attention_heads": 14, "num_key_value_heads": 2,
+            "hidden_size": 896, "head_dim": null, "sliding_window": 32768,
+            "use_sliding_window": false, "model_type": "qwen2",
+        }));
+        assert_eq!(f.sliding_window, None);
+        let kv = crate::model::kv::kv_shape_from_facts(&f).expect("sizeable");
+        assert_eq!(kv.head_dim, 64);
+        assert!(!kv.is_mixed());
     }
 
     #[test]

@@ -810,6 +810,10 @@ fn cmd_inspect(src: &Source, list_tensors: bool, json: bool) -> Result<()> {
                 "layers": k.layers,
                 "kv_heads": k.kv_heads,
                 "head_dim": k.head_dim,
+                "full_layers": k.full_layers,
+                "sliding_layers": k.sliding_layers,
+                "recurrent_layers": k.recurrent_layers,
+                "window": k.window,
                 "train_context": k.train_context,
                 "bytes_at_4096_f16": k.bytes_at(4096, model::KV_F16_BYTES),
             })
@@ -958,6 +962,22 @@ fn cmd_inspect(src: &Source, list_tensors: bool, json: bool) -> Result<()> {
         Some(kv) => {
             println!("\nkv cache");
             println!("  layers           {}", kv.layers);
+            if kv.is_mixed() {
+                // Spelled out because it is the difference between the cache this model
+                // actually keeps and the one a uniform formula would charge it for.
+                let mut parts = vec![format!("{} full", kv.full_layers)];
+                if kv.sliding_layers > 0 {
+                    parts.push(format!(
+                        "{} sliding (window {})",
+                        kv.sliding_layers,
+                        kv.window.unwrap_or(0)
+                    ));
+                }
+                if kv.recurrent_layers > 0 {
+                    parts.push(format!("{} linear, no KV", kv.recurrent_layers));
+                }
+                println!("  attention        {}", parts.join(" / "));
+            }
             println!("  kv heads         {}", kv.kv_heads);
             println!("  head dim         {}", kv.head_dim);
             println!(

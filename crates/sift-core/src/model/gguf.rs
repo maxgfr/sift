@@ -54,6 +54,23 @@ impl Value {
         }
     }
 
+    /// Interpret as an array of unsigned integers, booleans counting as 0 and 1.
+    ///
+    /// GGUF stores per-layer facts — KV heads, which layers are recurrent — as arrays on
+    /// models whose layers differ. `None` for anything that is not such an array.
+    pub fn as_u64_array(&self) -> Option<Vec<u64>> {
+        match self {
+            Value::Array(items) => items
+                .iter()
+                .map(|v| match v {
+                    Value::Bool(b) => Some(*b as u64),
+                    other => other.as_u64(),
+                })
+                .collect(),
+            _ => None,
+        }
+    }
+
     /// Interpret as a string.
     pub fn as_str(&self) -> Option<&str> {
         match self {
@@ -417,6 +434,12 @@ impl Gguf {
         self.metadata
             .get("general.architecture")
             .and_then(Value::as_str)
+    }
+
+    /// Read an architecture-scoped metadata value of any type.
+    pub fn arch_value(&self, suffix: &str) -> Option<&Value> {
+        let arch = self.architecture()?;
+        self.metadata.get(&format!("{arch}.{suffix}"))
     }
 
     /// Read an architecture-scoped metadata integer, e.g. `expert_count` resolves to

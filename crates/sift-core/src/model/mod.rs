@@ -8,6 +8,7 @@
 pub mod experts;
 pub mod ggml;
 pub mod gguf;
+pub mod kv;
 pub mod remote;
 pub mod safetensors;
 
@@ -18,6 +19,7 @@ pub use ggml::{BlockLayout, GgmlType};
 // Re-exported at the module root so callers reach for one `model::` path.
 pub use self::KV_F16_BYTES as KV_DEFAULT_BYTES;
 pub use gguf::{Gguf, GgufError, TensorInfo, Value};
+pub use kv::{KvLayer, KvShape, LayerKind, KV_F16_BYTES};
 pub use remote::{hf_url, RemoteFile};
 pub use safetensors::{Safetensors, SafetensorsError};
 
@@ -82,6 +84,21 @@ pub struct ArchFacts {
     pub expert_used_count: Option<u64>,
     /// Routed experts per MoE layer, where the metadata states it.
     pub expert_count: Option<u64>,
+    /// Width of one value head, where it differs from the key head.
+    pub value_length: Option<u64>,
+    /// Key and value head widths on sliding-window layers, where those differ.
+    pub key_length_swa: Option<u64>,
+    pub value_length_swa: Option<u64>,
+    /// KV heads per layer, for models whose layers differ. Zero marks a layer with no
+    /// attention.
+    pub head_count_kv_layers: Option<Vec<u64>>,
+    /// Tokens a sliding-window layer keeps.
+    pub sliding_window: Option<u64>,
+    /// How each layer attends, where the model's metadata says.
+    pub layer_kinds: Option<Vec<LayerKind>>,
+    /// Width of the latent multi-head latent attention caches per token, in place of a K
+    /// and a V per head.
+    pub mla_latent: Option<u64>,
 }
 
 impl ModelShape {
@@ -191,16 +208,83 @@ fn unsized_tensors(g: &Gguf) -> u64 {
 
 /// Read the architecture-scoped metadata GGUF stores.
 fn gguf_facts(g: &Gguf) -> ArchFacts {
+    let arch = g.architecture().unwrap_or_default();
+    let block_count = g.arch_u64("block_count");
+
+    // Head counts are a scalar on most models and a per-layer array on those whose layers
+    // differ (llama.cpp reads both through `get_key_or_arr`).
+    let per_layer = |suffix: &str| g.arch_value(suffix).and_then(Value::as_u64_array);
+    let head_count_kv_layers = per_layer("attention.head_count_kv");
+    let head_count = g
+        .arch_u64("attention.head_count")
+        .or_else(|| per_layer("attention.head_count")?.into_iter().max());
+    let head_count_kv = g.arch_u64("attention.head_count_kv").or_else(|| {
+        head_count_kv_layers
+            .as_ref()
+            .and_then(|h| h.iter().copied().max())
+    });
+
+    let key_length = g.arch_u64("attention.key_length");
+    // A `key_length_mla` means the file was converted for llama.cpp's MLA path, which
+    // caches `head_count_kv × key_length` per token and no V. Older DeepSeek conversions
+    // lack it, and llama.cpp then caches them per head like any other model.
+    let mla_latent = g
+        .arch_u64("attention.key_length_mla")
+        .and_then(|_| Some(key_length? * head_count_kv.unwrap_or(1)));
+
+    let sliding_window = g
+        .arch_u64("attention.sliding_window")
+        .or_else(|| kv::default_sliding_window(arch));
+    let layer_kinds = block_count.and_then(|n| {
+        // Stated per layer, as bool arrays: recurrent layers, sliding layers.
+        let flags = |suffix: &str| per_layer(suffix).filter(|v| v.len() as u64 == n);
+        let recurrent = flags("attention.recurrent_layers");
+        let swa = flags("attention.sliding_window_pattern");
+        let explicit = (recurrent.is_some() || swa.is_some()).then(|| {
+            (0..n as usize)
+                .map(|i| {
+                    if recurrent.as_ref().is_some_and(|r| r[i] != 0) {
+                        LayerKind::Linear
+                    } else if swa.as_ref().is_some_and(|s| s[i] != 0) {
+                        LayerKind::Sliding
+                    } else {
+                        LayerKind::Full
+                    }
+                })
+                .collect()
+        });
+        let interval = g
+            .arch_u64("full_attention_interval")
+            .or_else(|| kv::default_full_attention_interval(arch));
+        // llama.cpp turns sliding windows on only for architectures that load a pattern,
+        // and only when the window is nonzero.
+        let pattern = sliding_window.filter(|&w| w > 0).and_then(|_| {
+            let default = kv::default_sliding_pattern(arch);
+            match g.arch_u64("attention.sliding_window_pattern") {
+                Some(every) => Some((every, default.is_some_and(|(_, first)| first))),
+                None => default,
+            }
+        });
+        kv::resolve_layer_kinds(n, explicit, interval, pattern)
+    });
+
     ArchFacts {
         architecture: g.architecture().map(str::to_owned),
-        block_count: g.arch_u64("block_count"),
-        head_count: g.arch_u64("attention.head_count"),
-        head_count_kv: g.arch_u64("attention.head_count_kv"),
+        block_count,
+        head_count,
+        head_count_kv,
         embedding_length: g.arch_u64("embedding_length"),
-        key_length: g.arch_u64("attention.key_length"),
+        key_length,
         context_length: g.arch_u64("context_length"),
         expert_used_count: g.arch_u64("expert_used_count"),
         expert_count: g.arch_u64("expert_count"),
+        value_length: g.arch_u64("attention.value_length"),
+        key_length_swa: g.arch_u64("attention.key_length_swa"),
+        value_length_swa: g.arch_u64("attention.value_length_swa"),
+        head_count_kv_layers,
+        sliding_window,
+        layer_kinds,
+        mla_latent,
     }
 }
 
@@ -211,84 +295,13 @@ impl Gguf {
     }
 }
 
-/// What a model's attention layers cost to keep a context in memory.
+/// Infer the KV cache shape from a model's metadata.
 ///
-/// Weights are not the whole footprint, and on long contexts they are not even the larger
-/// part: a 30B model at 4 bits is ~18 GB of weights, and 128k tokens of KV cache on a
-/// 48-layer model is another 12 GB. Judging "does it fit" on the file size alone answers a
-/// question nobody asked.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct KvShape {
-    /// Transformer blocks, each of which holds its own K and V.
-    pub layers: u64,
-    /// Key/value heads. Fewer than query heads under grouped-query attention, which is
-    /// most modern models and is exactly why assuming `head_count` here overstates the
-    /// cache by the GQA ratio — 8x on some models.
-    pub kv_heads: u64,
-    /// Width of one head.
-    pub head_dim: u64,
-    /// Context the model was trained for, when it says so.
-    pub train_context: Option<u64>,
-}
-
-/// Bytes per KV element at the precision engines default to.
-///
-/// f16. Engines can be told to use 8- or 4-bit KV, which is why
-/// [`KvShape::bytes_at`] takes this as an argument rather than baking it in — but the
-/// default is what a user who has not gone looking will get.
-pub const KV_F16_BYTES: u64 = 2;
-
-impl KvShape {
-    /// Bytes of KV cache held at `context_tokens`.
-    ///
-    /// Two tensors per layer — K and V — each `kv_heads * head_dim` wide per token.
-    pub fn bytes_at(&self, context_tokens: u64, bytes_per_element: u64) -> u64 {
-        2u64.saturating_mul(self.layers)
-            .saturating_mul(self.kv_heads)
-            .saturating_mul(self.head_dim)
-            .saturating_mul(context_tokens)
-            .saturating_mul(bytes_per_element)
-    }
-}
-
-/// Infer the KV cache shape from metadata.
-///
-/// Returns `None` when any of the three factors is missing, because a partial answer here
-/// would be a silently low one — and a low KV estimate makes a model look like it fits
-/// when it does not, which is the failure mode with the highest cost to the user.
+/// Returns `None` when a factor is missing, because a partial answer here would be a
+/// silently low one — and a low KV estimate makes a model look like it fits when it does
+/// not. See [`kv`] for why the cache is modelled layer by layer.
 pub fn infer_kv_shape(g: &ModelShape) -> Option<KvShape> {
-    let f = &g.facts;
-    let layers = f.block_count?;
-    // Grouped-query attention means K/V heads are usually fewer than query heads. Fall
-    // back to `head_count` only when `head_count_kv` is absent, which means multi-head
-    // attention where the two are equal by definition.
-    let kv_heads = f.head_count_kv.or(f.head_count)?;
-
-    // Some architectures state the head width outright; the rest imply it. Deepseek-style
-    // models with a decoupled head dimension state it, and deriving it from the embedding
-    // width would be wrong for them.
-    let head_dim = match f.key_length {
-        Some(d) => d,
-        None => {
-            let embedding = f.embedding_length?;
-            let heads = f.head_count?;
-            if heads == 0 {
-                return None;
-            }
-            embedding / heads
-        }
-    };
-
-    if layers == 0 || kv_heads == 0 || head_dim == 0 {
-        return None;
-    }
-
-    Some(KvShape {
-        layers,
-        kv_heads,
-        head_dim,
-        train_context: f.context_length,
-    })
+    kv::kv_shape_from_facts(&g.facts)
 }
 
 /// A model's MoE shape, as far as the tensor directory reveals it.
@@ -614,77 +627,6 @@ mod tests {
             shape.expert_bytes_per_token(),
             400,
             "half the experts, so half"
-        );
-    }
-
-    #[test]
-    fn kv_cache_grows_linearly_with_context() {
-        // Real Qwen3-30B-A3B attention geometry: 48 layers, 4 KV heads, 128-wide.
-        let kv = KvShape {
-            layers: 48,
-            kv_heads: 4,
-            head_dim: 128,
-            train_context: Some(262_144),
-        };
-
-        // 2 * 48 * 4 * 128 * 4096 * 2 = 402,653,184
-        let at_4k = kv.bytes_at(4096, KV_F16_BYTES);
-        assert_eq!(at_4k, 402_653_184);
-        assert_eq!(kv.bytes_at(8192, KV_F16_BYTES), at_4k * 2);
-        assert_eq!(kv.bytes_at(0, KV_F16_BYTES), 0);
-    }
-
-    #[test]
-    fn kv_cache_at_full_context_is_large_enough_to_change_the_answer() {
-        // The reason this exists at all. Qwen3-30B-A3B at Q4_K_M is ~18.6 GB of weights;
-        // its full 262k context adds ~25 GB on top. A `fits` verdict that ignores the
-        // cache is not optimistic by a rounding error, it is wrong by more than the model.
-        let kv = KvShape {
-            layers: 48,
-            kv_heads: 4,
-            head_dim: 128,
-            train_context: Some(262_144),
-        };
-        let full = kv.bytes_at(262_144, KV_F16_BYTES);
-        assert!(
-            full > 25_000_000_000,
-            "expected >25 GB at full context, got {full}"
-        );
-    }
-
-    #[test]
-    fn grouped_query_attention_is_not_mistaken_for_multi_head() {
-        // The trap: using `head_count` where `head_count_kv` was meant. Qwen3 has 32 query
-        // heads and 4 KV heads, so that mistake overstates the cache 8x — and 8x on a
-        // multi-gigabyte figure turns a model that fits into one that does not.
-        let gqa = KvShape {
-            layers: 48,
-            kv_heads: 4,
-            head_dim: 128,
-            train_context: None,
-        };
-        let as_if_mha = KvShape {
-            kv_heads: 32,
-            ..gqa.clone()
-        };
-        assert_eq!(
-            as_if_mha.bytes_at(4096, KV_F16_BYTES),
-            gqa.bytes_at(4096, KV_F16_BYTES) * 8
-        );
-    }
-
-    #[test]
-    fn quantized_kv_scales_the_cache_down() {
-        let kv = KvShape {
-            layers: 32,
-            kv_heads: 8,
-            head_dim: 128,
-            train_context: None,
-        };
-        assert_eq!(
-            kv.bytes_at(4096, 1),
-            kv.bytes_at(4096, KV_F16_BYTES) / 2,
-            "8-bit KV halves it"
         );
     }
 
