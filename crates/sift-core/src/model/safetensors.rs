@@ -22,7 +22,7 @@
 
 use std::io::{self, Read, Seek, SeekFrom};
 
-use super::{kv, ArchFacts, LayerKind, TensorEntry};
+use super::{kv, ArchFacts, LayerKind, ModelShape, TensorEntry};
 
 /// Ceiling on the JSON header we will read.
 ///
@@ -51,6 +51,8 @@ pub enum SafetensorsError {
 #[derive(Debug, Clone)]
 pub struct Safetensors {
     pub tensors: Vec<TensorEntry>,
+    /// Each tensor's dtype string, in the same order as `tensors`.
+    pub dtypes: Vec<String>,
     /// Total bytes the tensors occupy.
     pub total_bytes: u64,
 }
@@ -82,6 +84,7 @@ impl Safetensors {
             .ok_or_else(|| SafetensorsError::Json("header is not an object".into()))?;
 
         let mut tensors = Vec::with_capacity(obj.len());
+        let mut dtypes = Vec::with_capacity(obj.len());
         let mut total_bytes = 0u64;
 
         for (name, spec) in obj {
@@ -121,6 +124,7 @@ impl Safetensors {
                 dims,
                 size_bytes,
             });
+            dtypes.push(spec["dtype"].as_str().unwrap_or_default().to_string());
         }
 
         if tensors.is_empty() {
@@ -128,6 +132,7 @@ impl Safetensors {
         }
         Ok(Self {
             tensors,
+            dtypes,
             total_bytes,
         })
     }
@@ -235,22 +240,139 @@ pub fn facts_from_config(config: &serde_json::Value) -> ArchFacts {
     }
 }
 
-/// Group a repo's safetensors files, keyed on the whole model.
-///
-/// `model-00001-of-00003.safetensors` is one part of one model, exactly like a GGUF split.
-/// Returned as `(base, parts)` so the caller can read every part's header — each carries
-/// only its own slice of the tensor map.
-pub fn shard_position(path: &str) -> Option<(String, u32, u32)> {
-    let stem = path.strip_suffix(".safetensors")?;
-    let (rest, total) = stem.rsplit_once("-of-")?;
-    let (base, index) = rest.rsplit_once('-')?;
+/// How a quantized checkpoint packs several weights into one stored integer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Packing {
+    /// `bits` per weight in a U32/I32: MLX (`quantization.bits`) and GPTQ / AWQ
+    /// (`quantization_config.bits`).
+    Bits(u64),
+    /// OCP MXFP4 (`quant_method: "mxfp4"`): two 4-bit weights per byte of `*_blocks`.
+    Mxfp4,
+}
 
-    let total: u32 = total.parse().ok()?;
-    let index: u32 = index.parse().ok()?;
-    if total == 0 || index == 0 || index > total {
-        return None;
+/// What `config.json` says about packed weights, if anything.
+pub fn packing(config: &serde_json::Value) -> Option<Packing> {
+    let bits = config["quantization"]["bits"]
+        .as_u64()
+        .or_else(|| config["quantization_config"]["bits"].as_u64())
+        .filter(|&b| (1..=16).contains(&b));
+    match bits {
+        Some(b) => Some(Packing::Bits(b)),
+        None => (config["quantization_config"]["quant_method"].as_str() == Some("mxfp4"))
+            .then_some(Packing::Mxfp4),
     }
-    Some((format!("{base}.safetensors"), index, total))
+}
+
+/// Whether `config.json` describes an MLX checkpoint.
+///
+/// `mlx_lm.convert` writes a top-level `quantization` block; transformers never does.
+pub fn is_mlx(config: &serde_json::Value) -> bool {
+    config["quantization"].is_object()
+}
+
+/// Width in bits of an integer dtype, which is what packed weights are stored as.
+fn int_width(dtype: &str) -> Option<u64> {
+    match dtype {
+        "U8" | "I8" => Some(8),
+        "U16" | "I16" => Some(16),
+        "U32" | "I32" => Some(32),
+        "U64" | "I64" => Some(64),
+        _ => None,
+    }
+}
+
+/// Turn packed integer tensors into logical weight counts.
+///
+/// A safetensors shape counts *stored* elements. An MLX 4-bit `weight` of U32 holds eight
+/// weights per element, so taking the shape at face value under-counts parameters by 8×
+/// and reports 30-odd bits per weight for a 4-bit model. The packed tensor's count is
+/// scaled by `width / bits`, and its side tensors — scales, zero points, MLX biases, GPTQ
+/// `g_idx` — keep their bytes but count no weights, since they are not weights.
+///
+/// Returns `false` when an integer tensor is left that no recognised scheme explains
+/// (bitsandbytes, or MXFP4 with no config to say so). Bits per weight is then unknown,
+/// and saying so beats inventing one.
+fn unpack(tensors: &mut [TensorEntry], dtypes: &[String], packing: Option<Packing>) -> bool {
+    use std::collections::HashMap;
+    let index: HashMap<String, usize> = tensors
+        .iter()
+        .enumerate()
+        .map(|(i, t)| (t.name.clone(), i))
+        .collect();
+    let mut side = vec![false; tensors.len()];
+    let mut packed = vec![false; tensors.len()];
+
+    for (i, t) in tensors.iter().enumerate() {
+        if int_width(&dtypes[i]).is_none() {
+            continue;
+        }
+        let (base, sides): (&str, &[&str]) = match packing {
+            Some(Packing::Bits(_)) => {
+                if let Some(b) = t.name.strip_suffix(".qweight") {
+                    (b, &[".qzeros", ".scales", ".g_idx"])
+                } else if let Some(b) = t.name.strip_suffix(".weight") {
+                    (b, &[".scales", ".biases"])
+                } else {
+                    continue;
+                }
+            }
+            Some(Packing::Mxfp4) => match t.name.strip_suffix("_blocks") {
+                Some(b) => (b, &["_scales"]),
+                None => continue,
+            },
+            None => continue,
+        };
+        let found: Vec<usize> = sides
+            .iter()
+            .filter_map(|s| index.get(&format!("{base}{s}")).copied())
+            .collect();
+        // A packed weight always travels with its scales. Without them this is some
+        // other integer tensor, and is left for the check below.
+        if !found.iter().any(|&j| tensors[j].name.ends_with("scales")) {
+            continue;
+        }
+        packed[i] = true;
+        for j in found {
+            side[j] = true;
+        }
+    }
+
+    let mut understood = true;
+    for (i, t) in tensors.iter_mut().enumerate() {
+        if packed[i] {
+            let width = int_width(&dtypes[i]).unwrap_or(32);
+            t.n_elems = match packing {
+                Some(Packing::Bits(bits)) => t.n_elems.saturating_mul(width) / bits,
+                Some(Packing::Mxfp4) => t.n_elems.saturating_mul(width / 4),
+                None => t.n_elems,
+            };
+        } else if side[i] {
+            t.n_elems = 0;
+        } else if int_width(&dtypes[i]).is_some() {
+            understood = false;
+        }
+    }
+    understood
+}
+
+/// One model's shape from its safetensors headers and its `config.json`.
+///
+/// The one place a safetensors model is assembled, so `fit`, `inspect`, `route` and `ls`
+/// cannot disagree about what a checkpoint holds.
+pub fn model_shape(parts: Vec<Safetensors>, config: Option<&serde_json::Value>) -> ModelShape {
+    let shard_count = parts.len() as u32;
+    let mut tensors = Vec::new();
+    let mut dtypes = Vec::new();
+    for p in parts {
+        tensors.extend(p.tensors);
+        dtypes.extend(p.dtypes);
+    }
+    let understood = unpack(&mut tensors, &dtypes, config.and_then(packing));
+    let facts = config.map(facts_from_config).unwrap_or_default();
+    ModelShape {
+        precision_unknown: !understood,
+        ..ModelShape::new(facts, tensors, shard_count)
+    }
 }
 
 /// URL of a repo's `config.json`, which carries the architecture numbers.
@@ -450,11 +572,128 @@ mod tests {
         assert_eq!(f, ArchFacts::default());
     }
 
+    /// A header with the given `(name, dtype, shape, bytes)` tensors, laid end to end.
+    fn header(tensors: &[(&str, &str, &[u64], u64)]) -> Safetensors {
+        let mut obj = serde_json::Map::new();
+        let mut off = 0u64;
+        for (name, dtype, shape, bytes) in tensors {
+            obj.insert(
+                name.to_string(),
+                serde_json::json!({"dtype": dtype, "shape": shape, "data_offsets": [off, off + bytes]}),
+            );
+            off += bytes;
+        }
+        Safetensors::parse(&mut file_with(&serde_json::Value::Object(obj).to_string()))
+            .expect("parse")
+    }
+
     #[test]
-    fn split_safetensors_are_recognised() {
-        let (base, i, n) = shard_position("model-00002-of-00003.safetensors").unwrap();
-        assert_eq!(base, "model.safetensors");
-        assert_eq!((i, n), (2, 3));
-        assert!(shard_position("model.safetensors").is_none());
+    fn mlx_4bit_weights_count_eight_per_u32_and_land_near_four_and_a_half_bits() {
+        // Real mlx-community/Qwen3-4B-4bit geometry: group size 64, BF16 scales and biases.
+        let st = header(&[
+            (
+                "model.layers.0.mlp.up_proj.weight",
+                "U32",
+                &[9728, 320],
+                9728 * 320 * 4,
+            ),
+            (
+                "model.layers.0.mlp.up_proj.scales",
+                "BF16",
+                &[9728, 40],
+                9728 * 40 * 2,
+            ),
+            (
+                "model.layers.0.mlp.up_proj.biases",
+                "BF16",
+                &[9728, 40],
+                9728 * 40 * 2,
+            ),
+        ]);
+        let cfg = serde_json::json!({"quantization": {"group_size": 64, "bits": 4}});
+        let shape = model_shape(vec![st], Some(&cfg));
+        assert_eq!(shape.total_parameters(), 9728 * 2560, "logical weights");
+        let bpw = shape.bits_per_weight().expect("known");
+        assert!((bpw - 4.5).abs() < 1e-9, "{bpw}");
+    }
+
+    #[test]
+    fn awq_and_gptq_qweights_are_unpacked_with_their_side_tensors_weightless() {
+        let st = header(&[
+            (
+                "model.layers.0.mlp.up_proj.qweight",
+                "I32",
+                &[2560, 1216],
+                2560 * 1216 * 4,
+            ),
+            (
+                "model.layers.0.mlp.up_proj.qzeros",
+                "I32",
+                &[20, 1216],
+                20 * 1216 * 4,
+            ),
+            (
+                "model.layers.0.mlp.up_proj.scales",
+                "F16",
+                &[20, 9728],
+                20 * 9728 * 2,
+            ),
+            ("model.layers.0.mlp.up_proj.g_idx", "I32", &[2560], 2560 * 4),
+        ]);
+        let cfg = serde_json::json!({"quantization_config": {"bits": 4, "quant_method": "awq"}});
+        let shape = model_shape(vec![st], Some(&cfg));
+        assert_eq!(shape.total_parameters(), 2560 * 9728);
+        let bpw = shape.bits_per_weight().expect("known");
+        assert!((4.0..4.5).contains(&bpw), "{bpw}");
+    }
+
+    #[test]
+    fn mxfp4_blocks_hold_two_weights_per_byte() {
+        let st = header(&[
+            (
+                "model.layers.0.mlp.experts.down_proj_blocks",
+                "U8",
+                &[32, 2880, 90, 16],
+                32 * 2880 * 90 * 16,
+            ),
+            (
+                "model.layers.0.mlp.experts.down_proj_scales",
+                "U8",
+                &[32, 2880, 90],
+                32 * 2880 * 90,
+            ),
+        ]);
+        let cfg = serde_json::json!({"quantization_config": {"quant_method": "mxfp4"}});
+        let shape = model_shape(vec![st], Some(&cfg));
+        assert!((shape.bits_per_weight().unwrap() - 4.25).abs() < 1e-9);
+    }
+
+    #[test]
+    fn an_unrecognised_packed_tensor_makes_precision_unknown_rather_than_invented() {
+        // Regression: a 1-bit MLX model read 23.8 bits per weight when its config was not
+        // consulted. A packed tensor nothing explains is an unknown, not a number.
+        let st = header(&[
+            ("model.layers.0.mlp.up_proj.weight", "U32", &[16, 4], 256),
+            ("model.layers.0.mlp.up_proj.scales", "F16", &[16, 1], 32),
+        ]);
+        let shape = model_shape(vec![st], None);
+        assert_eq!(shape.bits_per_weight(), None);
+    }
+
+    #[test]
+    fn an_ordinary_bf16_checkpoint_is_untouched() {
+        let st = header(&[("a.weight", "BF16", &[4, 4], 32)]);
+        let shape = model_shape(vec![st], Some(&serde_json::json!({})));
+        assert_eq!(shape.bits_per_weight(), Some(16.0));
+    }
+
+    #[test]
+    fn an_mlx_config_is_recognised_by_its_quantization_block() {
+        assert!(is_mlx(
+            &serde_json::json!({"quantization": {"bits": 1, "group_size": 128}})
+        ));
+        assert!(!is_mlx(
+            &serde_json::json!({"quantization_config": {"bits": 4}})
+        ));
     }
 }

@@ -263,7 +263,7 @@ fn evaluate_one(
                 f.path.clone(),
                 size,
                 &shape,
-                format_of(&f.path),
+                engine::format_of(&f.path, config),
                 mem_bytes_per_sec,
                 usable_ram,
                 context_tokens,
@@ -297,7 +297,7 @@ fn evaluate_one(
                 shard_glob(&set.base.path),
                 size,
                 &shape,
-                format_of(&set.base.path),
+                engine::format_of(&set.base.path, config),
                 mem_bytes_per_sec,
                 usable_ram,
                 context_tokens,
@@ -337,17 +337,14 @@ fn read_shape(
     let first = paths.first().context("a model with no files")?;
 
     if first.ends_with(".safetensors") {
-        let mut tensors = Vec::new();
+        let mut parts = Vec::with_capacity(paths.len());
         for p in paths {
             let mut remote = RemoteFile::new(hf_url(repo, p));
-            let st =
-                model::Safetensors::parse(&mut remote).with_context(|| format!("reading {p}"))?;
-            tensors.extend(st.tensors);
+            parts.push(
+                model::Safetensors::parse(&mut remote).with_context(|| format!("reading {p}"))?,
+            );
         }
-        let facts = config
-            .map(model::safetensors::facts_from_config)
-            .unwrap_or_default();
-        return Ok(model::ModelShape::new(facts, tensors, paths.len() as u32));
+        return Ok(model::safetensors::model_shape(parts, config));
     }
 
     let mut parts = Vec::with_capacity(paths.len());
@@ -407,18 +404,6 @@ pub fn narrow(cands: Vec<Candidate>, quant: &str) -> Result<Vec<Candidate>> {
 ///
 /// Shared by the single-file and split paths so the two cannot drift. A split model that
 /// scored differently from the same weights in one file would be a bug nobody would spot.
-/// The weight format a repo file is in, from its extension.
-///
-/// The same rule `Source::format` applies, kept to one line here because the sweep sees
-/// repo paths rather than resolved sources.
-fn format_of(path: &str) -> Format {
-    if path.ends_with(".safetensors") {
-        Format::Safetensors
-    } else {
-        Format::Gguf
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 fn build(
     label: String,
@@ -1041,12 +1026,26 @@ mod format_tests {
         // A repo can hold both. Deciding once for the whole sweep would mislabel whichever
         // kind is in the minority.
         assert_eq!(
-            format_of("model-00001-of-00003.safetensors"),
+            engine::format_of("model-00001-of-00003.safetensors", None),
             Format::Safetensors
         );
-        assert_eq!(format_of("Q4_K_M/Model-Q4_K_M.gguf"), Format::Gguf);
+        assert_eq!(
+            engine::format_of("Q4_K_M/Model-Q4_K_M.gguf", None),
+            Format::Gguf
+        );
         // Anything unrecognised stays GGUF, which is what the hub listing is overwhelmingly
         // made of, and is the format every local engine reads.
-        assert_eq!(format_of("model.bin"), Format::Gguf);
+        assert_eq!(engine::format_of("model.bin", None), Format::Gguf);
+    }
+
+    #[test]
+    fn an_mlx_quantized_safetensors_repo_is_mlx() {
+        let cfg = serde_json::json!({"quantization": {"bits": 4, "group_size": 64}});
+        assert_eq!(
+            engine::format_of("model.safetensors", Some(&cfg)),
+            Format::Mlx
+        );
+        // The same config on a GGUF file says nothing about the GGUF.
+        assert_eq!(engine::format_of("m.gguf", Some(&cfg)), Format::Gguf);
     }
 }

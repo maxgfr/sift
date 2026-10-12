@@ -45,6 +45,9 @@ pub struct ModelShape {
     /// Nonzero means the size, parameter count and bits per weight all describe less than
     /// the whole file, and callers say so rather than presenting them as complete.
     pub dropped_tensors: u64,
+    /// Set when some tensor packs weights in a way this build cannot count, so a weight
+    /// total — and bits per weight with it — would be invented.
+    pub precision_unknown: bool,
 }
 
 /// One tensor, reduced to what analysis needs.
@@ -109,6 +112,7 @@ impl ModelShape {
             tensors,
             shard_count,
             dropped_tensors: 0,
+            precision_unknown: false,
         }
     }
 
@@ -172,7 +176,7 @@ impl ModelShape {
     /// Mean bits stored per weight. See [`Gguf::bits_per_weight`].
     pub fn bits_per_weight(&self) -> Option<f64> {
         let params = self.total_parameters();
-        if params == 0 {
+        if params == 0 || self.precision_unknown {
             return None;
         }
         Some(self.total_tensor_bytes() as f64 * 8.0 / params as f64)

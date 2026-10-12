@@ -343,14 +343,15 @@ fn cmd_fit(repo: &str, context_tokens: u64, json: bool) -> Result<()> {
 }
 
 fn cmd_route(src: &Source, json: bool) -> Result<()> {
-    let (shape, _) = src.read_shape()?;
+    let loaded = src.read_shape()?;
+    let shape = loaded.shape;
     let facts = MachineFacts::collect();
     let usable = usable_ram(&facts);
     let installed = sift_core::engine::detect_installed();
 
     // Route on the actual format. mlx-lm reads safetensors and llama.cpp does not, so
     // assuming GGUF here would recommend an engine that cannot open the file.
-    let format = src.format();
+    let format = loaded.format;
     let size = shape.total_tensor_bytes();
     let rec = sift_core::engine::route(size, format, usable, &installed);
 
@@ -781,10 +782,14 @@ fn cmd_doctor(disk_sample: Option<PathBuf>, json: bool) -> Result<()> {
 }
 
 fn cmd_inspect(src: &Source, list_tensors: bool, json: bool) -> Result<()> {
-    let (shape, fetched) = src.read_shape()?;
+    let source::Loaded {
+        shape,
+        fetched,
+        format,
+    } = src.read_shape()?;
     // GGUF carries a format version and per-tensor dtypes that safetensors does not, so
     // those lines appear only where they exist rather than being filled with a placeholder.
-    let gguf = (src.format() == sift_core::engine::Format::Gguf)
+    let gguf = (format == sift_core::engine::Format::Gguf)
         .then(|| src.read_gguf().map(|(g, _)| g))
         .transpose()?;
 
@@ -822,7 +827,7 @@ fn cmd_inspect(src: &Source, list_tensors: bool, json: bool) -> Result<()> {
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
                 "model": src.label(),
-                "format": src.format(),
+                "format": format,
                 "gguf_version": gguf.as_ref().map(|g| g.version),
                 // Set when this file is one part of a split model, so everything below
                 // describes that part only.
@@ -866,7 +871,13 @@ fn cmd_inspect(src: &Source, list_tensors: bool, json: bool) -> Result<()> {
     if let Some(g) = &gguf {
         println!("  gguf version     {}", g.version);
     } else {
-        println!("  format           safetensors");
+        println!(
+            "  format           {}",
+            match format {
+                sift_core::engine::Format::Mlx => "mlx (safetensors)",
+                _ => "safetensors",
+            }
+        );
     }
     println!(
         "  architecture     {}",
@@ -1010,7 +1021,7 @@ fn cmd_inspect(src: &Source, list_tensors: bool, json: bool) -> Result<()> {
 }
 
 fn cmd_plan(src: &Source, hit_rate: f64, json: bool) -> Result<()> {
-    let (model_shape, _) = src.read_shape()?;
+    let model_shape = src.read_shape()?.shape;
     let shape = model::infer_moe_shape(&model_shape)
         .context("this model has no expert tensors; planning targets MoE models")?;
 

@@ -33,6 +33,24 @@ pub enum Source {
     },
 }
 
+/// A model's shape, read from wherever it lives.
+pub struct Loaded {
+    pub shape: sift_core::model::ModelShape,
+    /// Bytes over the network, for a remote source.
+    pub fetched: Option<Fetched>,
+    /// The weight format, which routing depends on.
+    pub format: sift_core::engine::Format,
+}
+
+/// The `config.json` beside a local safetensors file, if there is one.
+///
+/// Every MLX and HuggingFace download keeps it there. Without it a 1-bit MLX model reads
+/// as 23.8 bits per weight and its KV cache goes unsized.
+pub fn local_config(file: &Path) -> Option<serde_json::Value> {
+    let text = std::fs::read(file.parent()?.join("config.json")).ok()?;
+    serde_json::from_slice(&text).ok()
+}
+
 /// Bytes that crossed the network to read a remote model's shape.
 ///
 /// Kept in two figures because they answer two different questions. `header` is the part
@@ -148,79 +166,69 @@ impl Source {
         })
     }
 
-    /// The weight format this source is in.
-    pub fn format(&self) -> sift_core::engine::Format {
-        let name = match self {
-            Source::Local(p) => p.to_string_lossy().to_string(),
-            Source::Remote { url, .. } => url.clone(),
-        };
-        // Query strings on a signed CDN URL come after the filename, so match anywhere
-        // rather than only at the end.
-        if name.contains(".safetensors") {
-            sift_core::engine::Format::Safetensors
-        } else {
-            sift_core::engine::Format::Gguf
+    /// Whether this source names a safetensors file rather than a GGUF.
+    ///
+    /// Matched anywhere in the name, since a signed CDN URL carries its query string after
+    /// the filename.
+    fn is_safetensors(&self) -> bool {
+        match self {
+            Source::Local(p) => p.to_string_lossy().contains(".safetensors"),
+            Source::Remote { url, .. } => url.contains(".safetensors"),
         }
     }
 
     /// Read the model's shape, whatever format it is in. Payload is never fetched.
     ///
-    /// Returns the shape and, for remote sources, how many bytes crossed the network —
-    /// which callers print, because "we did not download the model" is a claim that should
-    /// come with evidence.
+    /// Returns the shape, its format and, for remote sources, how many bytes crossed the
+    /// network — which callers print, because "we did not download the model" is a claim
+    /// that should come with evidence.
     ///
     /// GGUF carries its architecture facts in its own header. A safetensors file keeps them
-    /// in the repo's `config.json`, so they are fetched when the reference named a repo and
-    /// reported as unavailable — not guessed — for a bare file or URL, which has no way to
-    /// locate that document.
-    pub fn read_shape(&self) -> Result<(sift_core::model::ModelShape, Option<Fetched>)> {
-        if self.format() == sift_core::engine::Format::Safetensors {
-            let (st, facts, fetched) = match self {
-                Source::Local(p) => {
-                    let mut f = std::fs::File::open(p)
-                        .with_context(|| format!("opening {}", p.display()))?;
-                    (
-                        sift_core::model::Safetensors::parse(&mut f)
-                            .with_context(|| format!("reading {}", p.display()))?,
-                        Default::default(),
-                        None,
-                    )
-                }
-                Source::Remote { url, repo, .. } => {
-                    let mut f = RemoteFile::new(url.clone());
-                    let st = sift_core::model::Safetensors::parse(&mut f)
-                        .with_context(|| format!("reading {url}"))?;
-                    // Counted, but separately from the header: "nothing was downloaded"
-                    // is a claim that should include every request made to back it, and
-                    // a 660-byte config must not turn a revalidated header into "0.00 MiB
-                    // of the model was read".
-                    let (facts, config) = match repo.as_deref().and_then(hub::fetch_config) {
-                        Some((cfg, n)) => {
-                            (sift_core::model::safetensors::facts_from_config(&cfg), n)
-                        }
-                        None => (Default::default(), 0),
-                    };
-                    (
-                        st,
-                        facts,
-                        Some(Fetched {
-                            header: f.bytes_fetched(),
-                            config,
-                        }),
-                    )
-                }
-            };
-            return Ok((
-                sift_core::model::ModelShape::new(facts, st.tensors, 1),
-                fetched,
-            ));
+    /// in `config.json`: the repo's, when the reference named a repo, or the one beside a
+    /// local file — the layout every MLX and HF download has. A bare file or URL with
+    /// neither is reported as unsized, not guessed at.
+    pub fn read_shape(&self) -> Result<Loaded> {
+        if !self.is_safetensors() {
+            let (g, fetched) = self.read_gguf()?;
+            return Ok(Loaded {
+                shape: g.shape(),
+                fetched: fetched.map(|header| Fetched { header, config: 0 }),
+                format: sift_core::engine::Format::Gguf,
+            });
         }
 
-        let (g, fetched) = self.read_gguf()?;
-        Ok((
-            g.shape(),
-            fetched.map(|header| Fetched { header, config: 0 }),
-        ))
+        let (st, config, fetched, name) = match self {
+            Source::Local(p) => {
+                let mut f =
+                    std::fs::File::open(p).with_context(|| format!("opening {}", p.display()))?;
+                let st = sift_core::model::Safetensors::parse(&mut f)
+                    .with_context(|| format!("reading {}", p.display()))?;
+                (st, local_config(p), None, p.to_string_lossy().to_string())
+            }
+            Source::Remote { url, repo, .. } => {
+                let mut f = RemoteFile::new(url.clone());
+                let st = sift_core::model::Safetensors::parse(&mut f)
+                    .with_context(|| format!("reading {url}"))?;
+                // Counted, but separately from the header: "nothing was downloaded" is a
+                // claim that should include every request made to back it, and a 660-byte
+                // config must not turn a revalidated header into "0.00 MiB of the model
+                // was read".
+                let (config, n) = match repo.as_deref().and_then(hub::fetch_config) {
+                    Some((cfg, n)) => (Some(cfg), n),
+                    None => (None, 0),
+                };
+                let fetched = Fetched {
+                    header: f.bytes_fetched(),
+                    config: n,
+                };
+                (st, config, Some(fetched), url.clone())
+            }
+        };
+        Ok(Loaded {
+            shape: sift_core::model::safetensors::model_shape(vec![st], config.as_ref()),
+            fetched,
+            format: sift_core::engine::format_of(&name, config.as_ref()),
+        })
     }
 
     /// Read the model's GGUF tensor directory. Payload is never fetched.

@@ -27,6 +27,24 @@ pub enum Format {
     Safetensors,
 }
 
+/// The weight format of a model file, from its name and, for safetensors, its config.
+///
+/// The one rule `fit`, `inspect`, `route` and `ls` all apply, so a file cannot be MLX to
+/// one command and plain safetensors to another. A safetensors checkpoint whose
+/// `config.json` carries MLX's `quantization` block is MLX — it loads in mlx-lm and LM
+/// Studio's MLX runtime and nowhere else. Names are matched anywhere rather than only at
+/// the end, because a signed CDN URL carries its query string after the filename.
+pub fn format_of(name: &str, config: Option<&serde_json::Value>) -> Format {
+    if !name.contains(".safetensors") {
+        return Format::Gguf;
+    }
+    if config.is_some_and(crate::model::safetensors::is_mlx) {
+        Format::Mlx
+    } else {
+        Format::Safetensors
+    }
+}
+
 /// What an engine does when a model does not fit in memory.
 ///
 /// This is the axis that actually decides the recommendation, and the one no existing tool

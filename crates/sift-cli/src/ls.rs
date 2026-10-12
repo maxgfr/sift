@@ -214,9 +214,12 @@ pub fn evaluate(
             // Saying so beats dropping the row silently.
             let shape = if m.path.extension().is_some_and(|e| e == "safetensors") {
                 match model::Safetensors::parse(&mut file) {
-                    // A bare safetensors file has no architecture metadata — that lives in
-                    // the repo's config.json — so the KV cache goes uncounted here.
-                    Ok(st) => model::ModelShape::new(Default::default(), st.tensors, 1),
+                    // The architecture lives in the config.json beside the weights; without
+                    // one the KV cache goes uncounted rather than guessed.
+                    Ok(st) => model::safetensors::model_shape(
+                        vec![st],
+                        crate::source::local_config(&m.path).as_ref(),
+                    ),
                     Err(e) => return errored(m, e.to_string()),
                 }
             } else {
