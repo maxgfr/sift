@@ -375,11 +375,6 @@ pub fn model_shape(parts: Vec<Safetensors>, config: Option<&serde_json::Value>) 
     }
 }
 
-/// URL of a repo's `config.json`, which carries the architecture numbers.
-pub fn hf_config_url(repo: &str) -> String {
-    format!("https://huggingface.co/{repo}/resolve/main/config.json")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

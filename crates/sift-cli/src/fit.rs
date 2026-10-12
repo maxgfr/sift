@@ -19,12 +19,14 @@
 use anyhow::{Context, Result};
 use sift_core::engine::{self, Format, Installed, Regime};
 use sift_core::hub;
-use sift_core::model::{self, hf_url, RemoteFile, TokenTraffic};
+use sift_core::model::{self, hf_url_at, RemoteFile, TokenTraffic};
 
 /// One evaluated quantization.
 #[derive(Debug)]
 pub struct Candidate {
     pub label: String,
+    /// The file this row describes, or the path a split set would have as one file.
+    pub path: String,
     /// What to pass `huggingface-cli download` to get this quantization.
     ///
     /// A path for a single file, a `--include` glob for a split set. Naming one shard
@@ -167,14 +169,36 @@ pub const DENSE_EFFICIENCY: f64 = 0.90;
 /// is also why these two numbers must always be re-derived together if that model changes.
 pub const MOE_EFFICIENCY: f64 = 0.76;
 
+/// What to evaluate: a repo, optionally at a revision, optionally one file of it.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Target<'a> {
+    pub repo: &'a str,
+    /// Branch, tag or commit. `None` is the default branch.
+    pub revision: Option<&'a str>,
+    /// Evaluate only the model stored at this path, or the split set it belongs to.
+    pub only: Option<&'a str>,
+}
+
 /// Evaluate every quantization a repo offers, at a given context length.
 pub fn evaluate(
-    repo: &str,
+    target: Target,
     mem_bytes_per_sec: f64,
     usable_ram: u64,
     context_tokens: u64,
 ) -> Result<Vec<Candidate>> {
-    let files = hub::list_weights(repo)?;
+    let repo = target.repo;
+    let listing = hub::list_weights(repo, target.revision)?;
+    // Pin every later fetch to the commit the listing describes.
+    let revision = listing.revision(target.revision).to_string();
+    let mut files = listing.files;
+    if let Some(only) = target.only {
+        let base = |p: &str| hub::shard_position(p).map(|(b, _, _)| b);
+        let wanted = base(only).unwrap_or_else(|| only.to_string());
+        files.retain(|f| f.path == only || base(&f.path).as_deref() == Some(wanted.as_str()));
+        if files.is_empty() {
+            anyhow::bail!("`{only}` is not a weight file in `{repo}`");
+        }
+    }
     let (whole, sets) = hub::group_shards(&files);
 
     // Safetensors keeps its architecture numbers in a separate `config.json`, so fetch it
@@ -183,7 +207,7 @@ pub fn evaluate(
     let config = if files.iter().any(|f| f.is_safetensors())
         || sets.iter().any(|s| s.base.is_safetensors())
     {
-        hub::fetch_config(repo).map(|(cfg, _)| cfg)
+        hub::fetch_config(repo, &revision).map(|(cfg, _)| cfg)
     } else {
         None
     };
@@ -212,6 +236,7 @@ pub fn evaluate(
                 };
                 if let Some(c) = evaluate_one(
                     repo,
+                    &revision,
                     &item,
                     config.as_ref(),
                     mem_bytes_per_sec,
@@ -227,7 +252,32 @@ pub fn evaluate(
     let mut out = out.into_inner().expect("results lock");
     // Sort here rather than relying on arrival order, which is now nondeterministic.
     out.sort_by_key(|c| c.size_bytes);
+    disambiguate(&mut out);
     Ok(out)
+}
+
+/// Give every row a label of its own.
+///
+/// Two files can carry the same quantization tag — `BF16/Model-BF16.gguf` beside a
+/// `Model-BF16.gguf`, or two safetensors sets both called `model`. Shown twice, `BF16`
+/// leaves the user to guess which one was recommended; the rows that collide are labelled
+/// by their path instead.
+fn disambiguate(cands: &mut [Candidate]) {
+    use std::collections::HashMap;
+    let mut seen: HashMap<String, usize> = HashMap::new();
+    for c in cands.iter() {
+        *seen.entry(c.label.to_ascii_uppercase()).or_default() += 1;
+    }
+    for c in cands.iter_mut() {
+        if seen[&c.label.to_ascii_uppercase()] > 1 {
+            c.label = c
+                .path
+                .strip_suffix(".gguf")
+                .or_else(|| c.path.strip_suffix(".safetensors"))
+                .unwrap_or(&c.path)
+                .to_string();
+        }
+    }
 }
 
 /// One unit of work for the sweep.
@@ -242,6 +292,7 @@ enum Work<'a> {
 /// row in this table is worse than a missing one, so nothing is guessed at.
 fn evaluate_one(
     repo: &str,
+    revision: &str,
     item: &Work,
     config: Option<&serde_json::Value>,
     mem_bytes_per_sec: f64,
@@ -250,16 +301,24 @@ fn evaluate_one(
 ) -> Option<Candidate> {
     match item {
         Work::Whole(f) => {
-            let shape = match read_shape(repo, std::slice::from_ref(&f.path), config) {
+            let shape = match read_shape(repo, revision, std::slice::from_ref(&f.path), config) {
                 Ok(s) => s,
                 Err(e) => {
-                    eprintln!("  skipped {}: {e}", f.quant_label());
+                    eprintln!("  skipped {}: {e:#}", f.quant_label());
                     return None;
                 }
             };
+            if is_projector(&shape) {
+                eprintln!(
+                    "  skipped {}: a vision or audio projector, not a model",
+                    f.path
+                );
+                return None;
+            }
             let size = f.size.unwrap_or_else(|| shape.total_tensor_bytes());
             Some(build(
                 f.quant_label(),
+                f.path.clone(),
                 f.path.clone(),
                 size,
                 &shape,
@@ -284,16 +343,24 @@ fn evaluate_one(
             // of the tensor directory, so asking part 1 for the model's size or expert
             // layout gives an answer that is confidently a third of the truth.
             let paths: Vec<String> = set.parts.iter().map(|p| p.path.clone()).collect();
-            let shape = match read_shape(repo, &paths, config) {
+            let shape = match read_shape(repo, revision, &paths, config) {
                 Ok(s) => s,
                 Err(e) => {
-                    eprintln!("  skipped {}: {e}", set.base.quant_label());
+                    eprintln!("  skipped {}: {e:#}", set.base.quant_label());
                     return None;
                 }
             };
+            if is_projector(&shape) {
+                eprintln!(
+                    "  skipped {}: a vision or audio projector, not a model",
+                    set.base.path
+                );
+                return None;
+            }
             let size = set.size().unwrap_or_else(|| shape.total_tensor_bytes());
             Some(build(
                 set.base.quant_label(),
+                set.base.path.clone(),
                 shard_glob(&set.base.path),
                 size,
                 &shape,
@@ -304,6 +371,14 @@ fn evaluate_one(
             ))
         }
     }
+}
+
+/// Whether a GGUF is a multimodal projector rather than a language model.
+///
+/// The filename filter catches `mmproj-*`; this catches a projector shipped under any
+/// other name, by what its own header says it is.
+fn is_projector(shape: &model::ModelShape) -> bool {
+    shape.architecture() == Some("clip")
 }
 
 /// A `--include` pattern matching every part of a split model.
@@ -331,6 +406,7 @@ fn shard_glob(base_path: &str) -> String {
 /// already fetched once for the whole sweep.
 fn read_shape(
     repo: &str,
+    revision: &str,
     paths: &[String],
     config: Option<&serde_json::Value>,
 ) -> Result<model::ModelShape> {
@@ -340,7 +416,7 @@ fn read_shape(
         let mut parts = Vec::with_capacity(paths.len());
         for p in paths {
             // Eight bytes of length, then exactly the header: two requests, no slack.
-            let mut remote = RemoteFile::new(hf_url(repo, p)).with_initial_fetch(8);
+            let mut remote = RemoteFile::new(hf_url_at(repo, revision, p)).with_initial_fetch(8);
             parts.push(
                 model::Safetensors::parse(&mut remote).with_context(|| format!("reading {p}"))?,
             );
@@ -351,7 +427,7 @@ fn read_shape(
 
     let mut parts = Vec::with_capacity(paths.len());
     for (i, p) in paths.iter().enumerate() {
-        let mut remote = RemoteFile::new(hf_url(repo, p));
+        let mut remote = RemoteFile::new(hf_url_at(repo, revision, p));
         // Only the first shard of a split model carries the tokenizer; the rest are a
         // tensor directory and little else.
         if i > 0 {
@@ -415,6 +491,7 @@ pub fn narrow(cands: Vec<Candidate>, quant: &str) -> Result<Vec<Candidate>> {
 #[allow(clippy::too_many_arguments)]
 fn build(
     label: String,
+    path: String,
     download_arg: String,
     size: u64,
     shape: &model::ModelShape,
@@ -462,6 +539,7 @@ fn build(
 
     Candidate {
         label,
+        path,
         download_arg,
         shard_count: shape.shard_count,
         dropped_tensors: shape.dropped_tensors,
@@ -720,6 +798,7 @@ mod tests {
         let size_bytes = (gb * 1e9) as u64;
         Candidate {
             label: label.into(),
+            path: format!("M-{label}.gguf"),
             download_arg: format!("{label}.gguf"),
             size_bytes,
             traffic: TokenTraffic {
@@ -876,6 +955,19 @@ mod tests {
             candidate("Q4_K_M", 18.0, Some(4.8), Regime::Fits),
         ];
         assert_eq!(labels(&narrow(cands, "Q4_K_M").unwrap()), ["Q4_K_M"]);
+    }
+
+    #[test]
+    fn colliding_labels_are_replaced_by_their_paths() {
+        // gemma-3 GGUF repos ship `gemma-3-4b-it-BF16.gguf` beside `mmproj-BF16.gguf`;
+        // two rows both called BF16 leave the user guessing which was recommended.
+        let mut a = candidate("BF16", 8.0, Some(16.0), Regime::Oversized);
+        a.path = "BF16/m-BF16.gguf".into();
+        let mut b = candidate("BF16", 8.0, Some(16.0), Regime::Oversized);
+        b.path = "m-BF16.gguf".into();
+        let mut cands = vec![a, b, candidate("Q4_K_M", 2.0, Some(4.8), Regime::Fits)];
+        disambiguate(&mut cands);
+        assert_eq!(labels(&cands), ["BF16/m-BF16", "m-BF16", "Q4_K_M"]);
     }
 
     #[test]

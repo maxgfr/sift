@@ -20,7 +20,7 @@ pub use ggml::{BlockLayout, GgmlType};
 pub use self::KV_F16_BYTES as KV_DEFAULT_BYTES;
 pub use gguf::{Gguf, GgufError, TensorInfo, Value};
 pub use kv::{KvLayer, KvShape, LayerKind, KV_F16_BYTES};
-pub use remote::{hf_url, RemoteFile};
+pub use remote::{hf_url, hf_url_at, RemoteFile};
 pub use safetensors::{Safetensors, SafetensorsError};
 
 /// One model's shape, whether it ships as a single file or several.

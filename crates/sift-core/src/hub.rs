@@ -5,8 +5,6 @@
 //! sizes from the API, architecture and dtype mix from a few kilobytes of range requests —
 //! before a single weight is transferred.
 
-use std::process::Command;
-
 /// One GGUF file offered by a repo.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepoFile {
@@ -34,20 +32,42 @@ impl RepoFile {
             .or_else(|| file.strip_suffix(".safetensors"))
             .unwrap_or(file);
 
-        let parts: Vec<&str> = stem.split('-').collect();
-        let mut take_from = parts.len();
-        for (i, p) in parts.iter().enumerate().rev() {
+        // Parts are separated by `-` or `.`: Unsloth writes `Model-Q4_K_M`, TheBloke and
+        // mradermacher `model.Q4_K_M`. Each part keeps its byte offset so the label can be
+        // cut from the stem with its own separators intact (`UD-Q2_K_XL`).
+        let mut parts: Vec<(usize, &str)> = Vec::new();
+        let mut start = 0;
+        for (i, c) in stem.char_indices() {
+            if c == '-' || c == '.' {
+                parts.push((start, &stem[start..i]));
+                start = i + 1;
+            }
+        }
+        parts.push((start, &stem[start..]));
+
+        let mut take_from = None;
+        for &(offset, p) in parts.iter().rev() {
             if is_quant_tag(p) {
-                take_from = i;
+                take_from = Some(offset);
             } else {
                 break;
             }
         }
-        if take_from < parts.len() {
-            parts[take_from..].join("-").to_ascii_uppercase()
-        } else {
-            stem.to_string()
+        match take_from {
+            Some(offset) => stem[offset..].to_ascii_uppercase(),
+            None => stem.to_string(),
         }
+    }
+
+    /// Whether this file is an adjunct shipped beside a model rather than a model.
+    ///
+    /// Vision projectors (`mmproj-F16.gguf`) and importance matrices sit in the same repos
+    /// as the weights and parse as GGUF. Listed as quantizations, a 0.8 GB projector was
+    /// the smallest "model" in the table and got recommended.
+    pub fn is_adjunct(&self) -> bool {
+        let file = self.path.rsplit('/').next().unwrap_or(&self.path);
+        let lower = file.to_ascii_lowercase();
+        lower.starts_with("mmproj") || lower.contains("imatrix")
     }
 
     /// Whether this file is one shard of a split model.
@@ -94,8 +114,12 @@ pub struct ShardSet {
     pub base: RepoFile,
     /// Every part, ordered by shard index.
     pub parts: Vec<RepoFile>,
+    /// Each part's index, in the same order as `parts`.
+    pub indices: Vec<u32>,
     /// How many parts the filenames claim exist.
     pub expected: u32,
+    /// Whether every part names the same total.
+    pub totals_agree: bool,
 }
 
 impl ShardSet {
@@ -109,8 +133,12 @@ impl ShardSet {
     /// An incomplete set is reported rather than silently summed: two of three shards add
     /// up to a plausible number that is wrong by a third, and a user acting on it
     /// downloads a model that cannot load.
+    ///
+    /// Counting parts is not enough: `1 of 2` beside `2 of 3` and `3 of 3` is three parts
+    /// of no model at all. Complete means the indices are exactly `1..=expected` and every
+    /// part agrees on `expected`.
     pub fn is_complete(&self) -> bool {
-        self.parts.len() as u32 == self.expected
+        self.totals_agree && self.indices.iter().copied().eq(1..=self.expected)
     }
 }
 
@@ -122,17 +150,29 @@ impl ShardSet {
 pub fn group_shards(files: &[RepoFile]) -> (Vec<RepoFile>, Vec<ShardSet>) {
     use std::collections::BTreeMap;
 
+    /// Parts gathered under one base name, before they become a [`ShardSet`].
+    struct Gathered {
+        parts: Vec<(u32, RepoFile)>,
+        expected: u32,
+        totals_agree: bool,
+    }
+
     let mut whole = Vec::new();
-    let mut sets: BTreeMap<String, (Vec<(u32, RepoFile)>, u32)> = BTreeMap::new();
+    let mut sets: BTreeMap<String, Gathered> = BTreeMap::new();
 
     for f in files {
         match shard_position(&f.path) {
             Some((base, index, total)) => {
-                let entry = sets.entry(base).or_insert_with(|| (Vec::new(), total));
-                entry.0.push((index, f.clone()));
-                // Trust the largest claim: a set whose parts disagree is malformed, and
-                // over-counting makes `is_complete` false, which is the safe direction.
-                entry.1 = entry.1.max(total);
+                let entry = sets.entry(base).or_insert_with(|| Gathered {
+                    parts: Vec::new(),
+                    expected: total,
+                    totals_agree: true,
+                });
+                entry.parts.push((index, f.clone()));
+                // Trust the largest claim, and remember the disagreement: a set whose
+                // parts disagree is malformed, and `is_complete` says so.
+                entry.totals_agree &= entry.expected == total;
+                entry.expected = entry.expected.max(total);
             }
             None => whole.push(f.clone()),
         }
@@ -140,13 +180,20 @@ pub fn group_shards(files: &[RepoFile]) -> (Vec<RepoFile>, Vec<ShardSet>) {
 
     let sets = sets
         .into_iter()
-        .map(|(base, (mut parts, expected))| {
+        .map(|(base, g)| {
+            let Gathered {
+                mut parts,
+                expected,
+                totals_agree,
+            } = g;
             parts.sort_by_key(|(i, _)| *i);
             let size = parts.iter().map(|(_, p)| p.size).sum();
             ShardSet {
                 base: RepoFile { path: base, size },
+                indices: parts.iter().map(|(i, _)| *i).collect(),
                 parts: parts.into_iter().map(|(_, p)| p).collect(),
                 expected,
+                totals_agree,
             }
         })
         .collect();
@@ -193,20 +240,47 @@ pub enum HubError {
     NoWeights(String),
 }
 
+/// What a repo offers at one revision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Listing {
+    /// Weight files, smallest first.
+    pub files: Vec<RepoFile>,
+    /// The commit the listing describes.
+    ///
+    /// Every later fetch is pinned to it, so a push landing mid-sweep cannot make one
+    /// quantization's header come from one commit and the next from another.
+    pub sha: Option<String>,
+}
+
+impl Listing {
+    /// The revision to fetch files at: the listed commit, else what was asked for.
+    pub fn revision<'a>(&'a self, asked: Option<&'a str>) -> &'a str {
+        self.sha.as_deref().or(asked).unwrap_or("main")
+    }
+}
+
 /// List the weight files a repo offers, with sizes, without downloading anything.
 ///
 /// Both formats, because a repo that ships only safetensors is a repo `sift` should have
-/// something to say about rather than a dead end.
-pub fn list_weights(repo: &str) -> Result<Vec<RepoFile>, HubError> {
-    let url = format!("https://huggingface.co/api/models/{repo}?blobs=true");
-    let out = Command::new("curl")
-        .args(["-sSL", "--fail", "--max-time", "30", &url])
-        .output()?;
+/// something to say about rather than a dead end. Vision projectors and importance
+/// matrices are left out: they are GGUF files and not models. `revision` is a branch, tag
+/// or commit; `None` is the default branch.
+pub fn list_weights(repo: &str, revision: Option<&str>) -> Result<Listing, HubError> {
+    let url = match revision {
+        Some(rev) => format!(
+            "https://huggingface.co/api/models/{repo}/revision/{}?blobs=true",
+            crate::http::encode_path(rev)
+        ),
+        None => format!("https://huggingface.co/api/models/{repo}?blobs=true"),
+    };
+    let curl = crate::http::Curl::new(&url, ["-L", "--fail", "--max-time", "30"]);
+    let authenticated = curl.authenticated();
+    let out = curl.output()?;
 
     if !out.status.success() {
         return Err(HubError::Request {
             repo: repo.to_string(),
-            detail: describe_curl_failure(&String::from_utf8_lossy(&out.stderr)),
+            detail: describe_curl_failure(&String::from_utf8_lossy(&out.stderr), authenticated),
         });
     }
 
@@ -231,6 +305,7 @@ pub fn list_weights(repo: &str) -> Result<Vec<RepoFile>, HubError> {
                         size: s["size"].as_u64().or_else(|| s["lfs"]["size"].as_u64()),
                     })
                 })
+                .filter(|f| !f.is_adjunct())
                 .collect()
         })
         .unwrap_or_default();
@@ -240,26 +315,29 @@ pub fn list_weights(repo: &str) -> Result<Vec<RepoFile>, HubError> {
     }
 
     files.sort_by_key(|f| f.size);
-    Ok(files)
+    Ok(Listing {
+        files,
+        sha: json["sha"].as_str().map(str::to_owned),
+    })
 }
 
 /// Turn curl's failure text into something a user can act on.
 ///
 /// The hub answers `401` for a repo that does not exist as well as for one that is gated,
 /// so a raw `curl: (22) The requested URL returned error: 401` reads as an authentication
-/// problem to someone who merely mistyped a name. Name both possibilities.
-fn describe_curl_failure(stderr: &str) -> String {
+/// problem to someone who merely mistyped a name. Name both possibilities, and say what to
+/// do about the second.
+fn describe_curl_failure(stderr: &str, authenticated: bool) -> String {
     let stderr = stderr.trim();
     let status = stderr
         .rsplit_once("returned error: ")
         .and_then(|(_, tail)| tail.split_whitespace().next())
         .and_then(|code| code.parse::<u16>().ok());
     match status {
-        Some(code @ (401 | 404)) => format!(
-            "no such repo on HuggingFace, or it is private or gated and needs \
-             authentication (HTTP {code})"
-        ),
-        Some(code) => format!("HuggingFace answered HTTP {code}"),
+        Some(code) => match crate::http::refusal_hint(code, authenticated) {
+            Some(hint) => format!("{hint} (HTTP {code})"),
+            None => format!("HuggingFace answered HTTP {code}"),
+        },
         None if stderr.is_empty() => {
             "no such repo, or it is gated and needs authentication".to_string()
         }
@@ -273,15 +351,9 @@ fn describe_curl_failure(stderr: &str) -> String {
 /// the KV cache goes uncounted and the caller says so. Returns the parsed document and how
 /// many bytes crossed the network to get it, so callers that report their traffic can
 /// count it.
-pub fn fetch_config(repo: &str) -> Option<(serde_json::Value, u64)> {
-    let out = Command::new("curl")
-        .args([
-            "-sSL",
-            "--fail",
-            "--max-time",
-            "20",
-            &crate::model::safetensors::hf_config_url(repo),
-        ])
+pub fn fetch_config(repo: &str, revision: &str) -> Option<(serde_json::Value, u64)> {
+    let url = crate::model::hf_url_at(repo, revision, "config.json");
+    let out = crate::http::Curl::new(&url, ["-L", "--fail", "--max-time", "20"])
         .output()
         .ok()?;
     if !out.status.success() {
@@ -289,6 +361,56 @@ pub fn fetch_config(repo: &str) -> Option<(serde_json::Value, u64)> {
     }
     let value = serde_json::from_slice(&out.stdout).ok()?;
     Some((value, out.stdout.len() as u64))
+}
+
+/// A file on HuggingFace named by its web URL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HubFile {
+    pub repo: String,
+    pub revision: String,
+    pub path: String,
+}
+
+/// Read `https://huggingface.co/{org}/{repo}/(blob|resolve)/{rev}/{path}`.
+///
+/// The `blob` form is what a browser's address bar shows, and pasting it used to fetch an
+/// HTML page and fail with a 404 from the GGUF parser's point of view. Both forms name the
+/// same file, so both become a repo, a revision and a path.
+pub fn parse_hub_url(url: &str) -> Option<HubFile> {
+    let rest = url
+        .strip_prefix("https://huggingface.co/")
+        .or_else(|| url.strip_prefix("https://hf.co/"))?;
+    let rest = rest.split(['?', '#']).next()?;
+    let mut it = rest.splitn(5, '/');
+    let (org, name, kind, rev, path) = (it.next()?, it.next()?, it.next()?, it.next()?, it.next()?);
+    if !matches!(kind, "blob" | "resolve") || org.is_empty() || name.is_empty() || path.is_empty() {
+        return None;
+    }
+    Some(HubFile {
+        repo: format!("{org}/{name}"),
+        revision: percent_decode(rev),
+        path: percent_decode(path),
+    })
+}
+
+/// Undo `%XX` escapes. Malformed escapes are kept as written.
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            let hex = |c: u8| (c as char).to_digit(16);
+            if let (Some(hi), Some(lo)) = (hex(b[i + 1]), hex(b[i + 2])) {
+                out.push((hi * 16 + lo) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 #[cfg(test)]
@@ -344,6 +466,58 @@ mod tests {
         assert!(is_quant_tag("BF16"));
         assert!(is_quant_tag("UD"));
         assert!(is_quant_tag("MXFP4"));
+    }
+
+    #[test]
+    fn dot_separated_names_are_split_like_hyphenated_ones() {
+        // TheBloke and mradermacher write `model.Q4_K_M.gguf`; the whole stem used to come
+        // back as the label and overflow the table.
+        assert_eq!(
+            f("mixtral-8x7b-instruct-v0.1.Q4_K_M.gguf").quant_label(),
+            "Q4_K_M"
+        );
+        assert_eq!(f("DeepSeek-V2-Lite.IQ3_XS.gguf").quant_label(), "IQ3_XS");
+        assert_eq!(f("Model.i1-Q4_K_M.gguf").quant_label(), "Q4_K_M");
+        // A version number with a dot is not mistaken for a separator before a tag.
+        assert_eq!(f("Qwen2.5-7B-Instruct-Q8_0.gguf").quant_label(), "Q8_0");
+    }
+
+    #[test]
+    fn projectors_and_importance_matrices_are_adjuncts_not_models() {
+        assert!(f("mmproj-F32.gguf").is_adjunct());
+        assert!(f("mmproj-model-f16.gguf").is_adjunct());
+        assert!(f("sub/MMPROJ-BF16.gguf").is_adjunct());
+        assert!(f("imatrix_unsloth.gguf").is_adjunct());
+        assert!(!f("gemma-3-4b-it-Q4_K_M.gguf").is_adjunct());
+    }
+
+    #[test]
+    fn hub_page_urls_are_read_as_repo_revision_and_file() {
+        let blob = parse_hub_url(
+            "https://huggingface.co/unsloth/Qwen3-30B-A3B-GGUF/blob/main/Qwen3-30B-A3B-Q4_K_M.gguf",
+        )
+        .expect("a hub file");
+        assert_eq!(blob.repo, "unsloth/Qwen3-30B-A3B-GGUF");
+        assert_eq!(blob.revision, "main");
+        assert_eq!(blob.path, "Qwen3-30B-A3B-Q4_K_M.gguf");
+
+        let nested = parse_hub_url(
+            "https://huggingface.co/o/r/resolve/abc123/BF16/m%20x-BF16-00001-of-00002.gguf?download=true",
+        )
+        .expect("a hub file");
+        assert_eq!(nested.revision, "abc123");
+        assert_eq!(nested.path, "BF16/m x-BF16-00001-of-00002.gguf");
+
+        assert!(parse_hub_url("https://huggingface.co/o/r").is_none());
+        assert!(parse_hub_url("https://huggingface.co/o/r/tree/main/x.gguf").is_none());
+        assert!(parse_hub_url("https://example.com/o/r/blob/main/x.gguf").is_none());
+    }
+
+    #[test]
+    fn a_malformed_escape_is_kept_rather_than_panicking() {
+        assert_eq!(percent_decode("a%2"), "a%2");
+        assert_eq!(percent_decode("%zz%41"), "%zzA");
+        assert_eq!(percent_decode("é%20x"), "é x");
     }
 
     #[test]
@@ -428,6 +602,22 @@ mod shard_tests {
     }
 
     #[test]
+    fn parts_that_disagree_on_the_total_are_not_a_complete_set() {
+        let files = vec![
+            sized("M-Q4_K_M-00001-of-00002.gguf", 10),
+            sized("M-Q4_K_M-00002-of-00003.gguf", 20),
+            sized("M-Q4_K_M-00003-of-00003.gguf", 30),
+        ];
+        let (_, sets) = group_shards(&files);
+        assert_eq!(sets.len(), 1);
+        assert!(!sets[0].totals_agree);
+        assert!(
+            !sets[0].is_complete(),
+            "1 of 2, 2 of 3, 3 of 3 is not one model"
+        );
+    }
+
+    #[test]
     fn two_quantizations_split_separately_stay_separate() {
         let files = vec![
             sized("M-Q4_K_M-00001-of-00002.gguf", 10),
@@ -468,33 +658,36 @@ mod shard_tests {
     fn a_401_from_the_hub_is_explained_as_a_missing_or_gated_repo() {
         // The hub answers 401 for a typo exactly as it does for a gated repo, so the
         // message must name both rather than send the user looking for a token.
-        let msg = describe_curl_failure("curl: (22) The requested URL returned error: 401");
+        let msg = describe_curl_failure("curl: (22) The requested URL returned error: 401", false);
         assert!(msg.contains("no such repo"), "{msg}");
         assert!(msg.contains("gated"), "{msg}");
         assert!(msg.contains("401"), "{msg}");
+        assert!(msg.contains("HF_TOKEN"), "{msg}");
     }
 
     #[test]
     fn a_404_gets_the_same_explanation() {
-        let msg = describe_curl_failure("curl: (56) The requested URL returned error: 404\n");
+        let msg =
+            describe_curl_failure("curl: (56) The requested URL returned error: 404\n", false);
         assert!(msg.contains("no such repo"), "{msg}");
         assert!(msg.contains("404"), "{msg}");
     }
 
     #[test]
     fn other_http_statuses_are_reported_as_such() {
-        let msg = describe_curl_failure("curl: (22) The requested URL returned error: 503");
+        let msg = describe_curl_failure("curl: (22) The requested URL returned error: 503", false);
         assert_eq!(msg, "HuggingFace answered HTTP 503");
     }
 
     #[test]
     fn a_non_http_failure_keeps_curls_own_words() {
-        let msg = describe_curl_failure("curl: (6) Could not resolve host: huggingface.co\n");
+        let msg =
+            describe_curl_failure("curl: (6) Could not resolve host: huggingface.co\n", false);
         assert_eq!(msg, "curl: (6) Could not resolve host: huggingface.co");
     }
 
     #[test]
     fn silence_from_curl_still_yields_a_sentence() {
-        assert!(describe_curl_failure("   ").contains("no such repo"));
+        assert!(describe_curl_failure("   ", false).contains("no such repo"));
     }
 }

@@ -14,7 +14,7 @@
 
 use anyhow::{bail, Context, Result};
 use sift_core::hub::{self, RepoFile};
-use sift_core::model::{hf_url, Gguf, RemoteFile};
+use sift_core::model::{hf_url_at, Gguf, RemoteFile};
 use std::path::{Path, PathBuf};
 
 /// A resolved model reference.
@@ -30,6 +30,8 @@ pub enum Source {
         /// its architecture numbers in the repo's `config.json`, so knowing the repo is
         /// what makes KV sizing possible for that format.
         repo: Option<String>,
+        /// The revision `url` is pinned to, for fetching the matching `config.json`.
+        revision: String,
     },
 }
 
@@ -124,6 +126,23 @@ impl Source {
             return Ok(Source::Local(as_path.to_path_buf()));
         }
 
+        // A HuggingFace page URL — the `blob` form a browser shows, or `resolve` — names a
+        // repo, a revision and a file. Read as a raw URL, the `blob` form fetched an HTML
+        // page; read this way it is the file, with the repo's config.json in reach.
+        if let Some(f) = hub::parse_hub_url(reference) {
+            let label = RepoFile {
+                path: f.path.clone(),
+                size: None,
+            }
+            .quant_label();
+            return Ok(Source::Remote {
+                url: hf_url_at(&f.repo, &f.revision, &f.path),
+                label: format!("{}:{label}", f.repo),
+                repo: Some(f.repo),
+                revision: f.revision,
+            });
+        }
+
         if reference.starts_with("http://") || reference.starts_with("https://") {
             return Ok(Source::Remote {
                 url: reference.to_string(),
@@ -133,6 +152,7 @@ impl Source {
                     .unwrap_or(reference)
                     .to_string(),
                 repo: None,
+                revision: "main".to_string(),
             });
         }
 
@@ -153,19 +173,22 @@ impl Source {
             );
         }
 
-        let files = hub::list_weights(repo)?;
-        let chosen = pick(&files, wanted).with_context(|| {
+        let listing = hub::list_weights(repo, None)?;
+        let files = &listing.files;
+        let chosen = pick(files, wanted).with_context(|| {
             let available: Vec<String> = files.iter().take(12).map(RepoFile::quant_label).collect();
             format!(
                 "choosing a file from `{repo}`. Available: {}",
                 available.join(", ")
             )
         })?;
+        let revision = listing.revision(None).to_string();
 
         Ok(Source::Remote {
-            url: hf_url(repo, &chosen.path),
+            url: hf_url_at(repo, &revision, &chosen.path),
             label: format!("{repo}:{}", chosen.quant_label()),
             repo: Some(repo.to_string()),
+            revision,
         })
     }
 
@@ -209,7 +232,12 @@ impl Source {
                     .with_context(|| format!("reading {}", p.display()))?;
                 (st, local_config(p), None, p.to_string_lossy().to_string())
             }
-            Source::Remote { url, repo, .. } => {
+            Source::Remote {
+                url,
+                repo,
+                revision,
+                ..
+            } => {
                 let mut f = RemoteFile::new(url.clone()).with_initial_fetch(8);
                 let st = sift_core::model::Safetensors::parse(&mut f)
                     .with_context(|| format!("reading {url}"))?;
@@ -218,7 +246,8 @@ impl Source {
                 // claim that should include every request made to back it, and a 660-byte
                 // config must not turn a revalidated header into "0.00 MiB of the model
                 // was read".
-                let (config, n) = match repo.as_deref().and_then(hub::fetch_config) {
+                let (config, n) = match repo.as_deref().and_then(|r| hub::fetch_config(r, revision))
+                {
                     Some((cfg, n)) => (Some(cfg), n),
                     None => (None, 0),
                 };
@@ -355,6 +384,30 @@ mod tests {
             err.contains("org/repo"),
             "should explain the expected form: {err}"
         );
+    }
+
+    #[test]
+    fn a_hub_blob_url_resolves_to_the_file_at_its_revision() {
+        // Regression: the `blob` URL a browser shows was fetched as-is, which returned an
+        // HTML page and failed as a 404 from the parser's side.
+        let s = Source::resolve(
+            "https://huggingface.co/unsloth/Qwen3-30B-A3B-GGUF/blob/main/Qwen3-30B-A3B-Q4_K_M.gguf",
+            None,
+        )
+        .unwrap();
+        match s {
+            Source::Remote {
+                url, label, repo, ..
+            } => {
+                assert_eq!(
+                    url,
+                    "https://huggingface.co/unsloth/Qwen3-30B-A3B-GGUF/resolve/main/Qwen3-30B-A3B-Q4_K_M.gguf"
+                );
+                assert_eq!(label, "unsloth/Qwen3-30B-A3B-GGUF:Q4_K_M");
+                assert_eq!(repo.as_deref(), Some("unsloth/Qwen3-30B-A3B-GGUF"));
+            }
+            other => panic!("expected a remote source, got {other:?}"),
+        }
     }
 
     #[test]

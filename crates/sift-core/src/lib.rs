@@ -19,12 +19,14 @@
 //!   reports about itself.
 //! - [`model`] — read model files without loading them.
 //! - [`hub`] — list what a HuggingFace repo offers, without downloading any of it.
+//! - [`http`] — how every `curl` call is built: the HuggingFace token, encoded URLs.
 //! - [`engine`] — which runtime should run a given model, and which to avoid.
 //! - [`io`] — explicit reads that bypass the page cache, so a cold measurement is honest.
 
 pub mod cache;
 pub mod doctor;
 pub mod engine;
+pub mod http;
 pub mod hub;
 pub mod io;
 pub mod model;

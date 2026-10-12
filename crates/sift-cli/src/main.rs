@@ -303,7 +303,18 @@ fn cmd_fit(repo: &str, context_tokens: u64, json: bool) -> Result<()> {
     // `fit repo:QUANT` asks about one quantization. The suffix is stripped here rather than
     // reaching the hub: it used to be sent as part of the repo name, and HuggingFace answers
     // a 401 for a repo that does not exist, so a valid request read as an auth failure.
-    let (repo, quant) = source::split_quant(repo);
+    // A HuggingFace file URL — the `blob` form a browser shows, or `resolve` — narrows
+    // the sweep to that one file, at the revision the URL names.
+    let hub_file = sift_core::hub::parse_hub_url(repo);
+    let (repo, quant) = match &hub_file {
+        Some(f) => (f.repo.as_str(), None),
+        None => source::split_quant(repo),
+    };
+    let target = fit::Target {
+        repo,
+        revision: hub_file.as_ref().map(|f| f.revision.as_str()),
+        only: hub_file.as_ref().map(|f| f.path.as_str()),
+    };
 
     let facts = MachineFacts::collect();
     let usable = usable_ram(&facts);
@@ -329,7 +340,7 @@ fn cmd_fit(repo: &str, context_tokens: u64, json: bool) -> Result<()> {
         println!("reading headers from {repo} without downloading…");
     }
 
-    let cands = fit::evaluate(repo, mem.gb_per_sec * 1e9, usable, context_tokens)?;
+    let cands = fit::evaluate(target, mem.gb_per_sec * 1e9, usable, context_tokens)?;
     // Narrow after the sweep, not before it: the hub listing is what knows which labels
     // exist, so an unmatched suffix can be answered with the ones that do.
     let cands = match quant {

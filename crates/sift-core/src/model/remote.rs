@@ -22,7 +22,6 @@
 //! scripted responses instead of a network.
 
 use std::io::{self, Read, Seek, SeekFrom};
-use std::process::{Command, Stdio};
 
 use crate::cache::{Cache, Entry};
 
@@ -90,19 +89,17 @@ impl Fetch for CurlFetch {
         end: u64,
         validator: Option<&str>,
     ) -> io::Result<Fetched> {
-        let mut cmd = Command::new("curl");
-        cmd.args(["-sSL", "--max-time", "60", "-D", "-", "-r"])
-            .arg(format!("{start}-{end}"));
+        let range = format!("{start}-{end}");
+        let mut args = vec!["-L", "--max-time", "60", "-D", "-", "-r", &range];
         // No `--fail`: 304 is the answer a validator hopes for and 416 means "past the
         // end", so the status is read here instead of being turned into an exit code.
-        if let Some(etag) = validator {
-            cmd.arg("-H").arg(format!("If-None-Match: {etag}"));
+        let condition = validator.map(|etag| format!("If-None-Match: {etag}"));
+        if let Some(c) = &condition {
+            args.extend(["-H", c.as_str()]);
         }
-        cmd.arg(url).stdout(Stdio::piped()).stderr(Stdio::piped());
-
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| io::Error::other(format!("running curl: {e}")))?;
+        let curl = crate::http::Curl::new(url, args);
+        let authenticated = curl.authenticated();
+        let mut child = curl.spawn()?;
         let mut stdout = child.stdout.take().expect("stdout is piped");
 
         // Read with a ceiling. A server that ignores `Range` answers 200 with the whole
@@ -144,8 +141,11 @@ impl Fetch for CurlFetch {
 
         let response = parse_response(&out);
         if response.status >= 400 && response.status != 416 {
+            let hint = crate::http::refusal_hint(response.status, authenticated)
+                .map(|h| format!(": {h}"))
+                .unwrap_or_default();
             return Err(io::Error::other(format!(
-                "fetching {url}: HTTP {}",
+                "fetching {url}: HTTP {}{hint}",
                 response.status
             )));
         }
@@ -555,9 +555,21 @@ fn parse_range_start(value: &str) -> Option<u64> {
     range.split(['-', '/']).next()?.trim().parse().ok()
 }
 
-/// Build a HuggingFace resolve URL for a file in a repo.
+/// Build a HuggingFace resolve URL for a file in a repo, on the default branch.
 pub fn hf_url(repo: &str, file: &str) -> String {
-    format!("https://huggingface.co/{repo}/resolve/main/{file}")
+    hf_url_at(repo, "main", file)
+}
+
+/// Build a HuggingFace resolve URL for a file at a revision: a branch, tag or commit.
+///
+/// The file path is percent-encoded: a `#` or `?` in a file name would otherwise end the
+/// path, and a space would end the URL.
+pub fn hf_url_at(repo: &str, revision: &str, file: &str) -> String {
+    format!(
+        "https://huggingface.co/{repo}/resolve/{}/{}",
+        crate::http::encode_path(revision),
+        crate::http::encode_path(file)
+    )
 }
 
 #[cfg(test)]
