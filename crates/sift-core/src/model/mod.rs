@@ -174,9 +174,13 @@ impl ModelShape {
     }
 
     /// Mean bits stored per weight. See [`Gguf::bits_per_weight`].
+    ///
+    /// `None` when some tensors could not be sized: the mean of the rest describes a model
+    /// that does not exist — a ternary GGUF whose weights are in a fork's own types read as
+    /// 17.6 bits from its F16 embeddings alone.
     pub fn bits_per_weight(&self) -> Option<f64> {
         let params = self.total_parameters();
-        if params == 0 || self.precision_unknown {
+        if params == 0 || self.precision_unknown || self.dropped_tensors > 0 {
             return None;
         }
         Some(self.total_tensor_bytes() as f64 * 8.0 / params as f64)
@@ -849,6 +853,17 @@ mod tests {
             ),
         ];
         assert!(infer_moe_shape(&shape_of(t, ArchFacts::default())).is_none());
+    }
+
+    #[test]
+    fn bits_per_weight_is_unknown_when_tensors_could_not_be_sized() {
+        // Regression: a ternary GGUF in a fork's own types had 402 of its tensors unsized,
+        // and the F16 remainder reported 17.61 bits per weight as if it were the model.
+        let t = vec![entry("token_embd.weight", &[16, 16], 512)];
+        let mut shape = shape_of(t, ArchFacts::default());
+        assert_eq!(shape.bits_per_weight(), Some(16.0));
+        shape.dropped_tensors = 402;
+        assert_eq!(shape.bits_per_weight(), None);
     }
 
     #[test]
