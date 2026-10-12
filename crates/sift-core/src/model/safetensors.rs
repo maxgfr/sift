@@ -316,10 +316,16 @@ fn unpack(tensors: &mut [TensorEntry], dtypes: &[String], packing: Option<Packin
                     continue;
                 }
             }
-            Some(Packing::Mxfp4) => match t.name.strip_suffix("_blocks") {
-                Some(b) => (b, &["_scales"]),
-                None => continue,
-            },
+            Some(Packing::Mxfp4) => {
+                if let Some(b) = t.name.strip_suffix("_blocks") {
+                    (b, &["_scales"])
+                } else if let Some(b) = t.name.strip_suffix(".blocks") {
+                    // gpt-oss's original checkpoint spells it with a dot.
+                    (b, &[".scales"])
+                } else {
+                    continue;
+                }
+            }
             None => continue,
         };
         let found: Vec<usize> = sides
@@ -337,9 +343,35 @@ fn unpack(tensors: &mut [TensorEntry], dtypes: &[String], packing: Option<Packin
         }
     }
 
+    // FP4 recognised from shapes alone. MiMo-V2.6 and DeepSeek-V4 store experts as bytes
+    // holding two 4-bit weights, each group of 16 or 32 sharing one byte-sized scale, while
+    // their configs describe only the FP8 rest of the model. A byte tensor whose sibling
+    // scale has one entry per 16 or 32 of its weights is that layout and nothing else.
+    let mut fp4 = vec![false; tensors.len()];
+    for (i, t) in tensors.iter().enumerate() {
+        if packed[i] || side[i] || !matches!(dtypes[i].as_str(), "U8" | "I8") {
+            continue;
+        }
+        let base = t.name.strip_suffix(".weight").unwrap_or(&t.name);
+        let scale = [".weight_scale", ".scale", ".scales"]
+            .iter()
+            .find_map(|s| index.get(&format!("{base}{s}")).copied())
+            .filter(|&j| matches!(dtypes[j].as_str(), "U8" | "I8" | "F8_E8M0"));
+        let Some(j) = scale else { continue };
+        let (Some(&w), Some(&g)) = (t.dims.last(), tensors[j].dims.last()) else {
+            continue;
+        };
+        if g > 0 && (w * 2) % g == 0 && matches!(w * 2 / g, 16 | 32) {
+            fp4[i] = true;
+            side[j] = true;
+        }
+    }
+
     let mut understood = true;
     for (i, t) in tensors.iter_mut().enumerate() {
-        if packed[i] {
+        if fp4[i] {
+            t.n_elems = t.n_elems.saturating_mul(2);
+        } else if packed[i] {
             let width = int_width(&dtypes[i]).unwrap_or(32);
             t.n_elems = match packing {
                 Some(Packing::Bits(bits)) => t.n_elems.saturating_mul(width) / bits,
@@ -661,6 +693,65 @@ mod tests {
         let cfg = serde_json::json!({"quantization_config": {"quant_method": "mxfp4"}});
         let shape = model_shape(vec![st], Some(&cfg));
         assert!((shape.bits_per_weight().unwrap() - 4.25).abs() < 1e-9);
+    }
+
+    #[test]
+    fn fp4_experts_are_recognised_from_their_shapes_without_a_config_saying_so() {
+        // MiMo-V2.6 and DeepSeek-V4.1 store experts as U8 holding two FP4 weights per byte,
+        // with one U8 scale per 32 weights — and their configs describe the FP8 rest of the
+        // model, not the experts. The shapes say it: 1024 bytes, 64 scales, 32 per scale.
+        let st = header(&[
+            (
+                "model.layers.1.mlp.experts.0.down_proj.weight",
+                "U8",
+                &[6144, 1024],
+                6144 * 1024,
+            ),
+            (
+                "model.layers.1.mlp.experts.0.down_proj.weight_scale",
+                "U8",
+                &[6144, 64],
+                6144 * 64,
+            ),
+            (
+                "layers.1.ffn.experts.0.w1.weight",
+                "I8",
+                &[2304, 2560],
+                2304 * 2560,
+            ),
+            // DeepSeek-V4.1 types its scales as what they are, E8M0, not as bytes.
+            (
+                "layers.1.ffn.experts.0.w1.scale",
+                "F8_E8M0",
+                &[2304, 160],
+                2304 * 160,
+            ),
+        ]);
+        let cfg = serde_json::json!({"quantization_config": {"quant_method": "fp8"}});
+        let shape = model_shape(vec![st], Some(&cfg));
+        assert_eq!(shape.total_parameters(), 6144 * 2048 + 2304 * 5120);
+        assert!((shape.bits_per_weight().expect("known") - 4.25).abs() < 1e-9);
+    }
+
+    #[test]
+    fn gpt_oss_original_blocks_are_unpacked_like_the_hf_ones() {
+        let st = header(&[
+            (
+                "block.0.mlp.mlp1_weight.blocks",
+                "U8",
+                &[32, 5760, 90, 16],
+                32 * 5760 * 90 * 16,
+            ),
+            (
+                "block.0.mlp.mlp1_weight.scales",
+                "U8",
+                &[32, 5760, 90],
+                32 * 5760 * 90,
+            ),
+        ]);
+        let cfg = serde_json::json!({"quantization_config": {"quant_method": "mxfp4"}});
+        let shape = model_shape(vec![st], Some(&cfg));
+        assert!((shape.bits_per_weight().expect("known") - 4.25).abs() < 1e-9);
     }
 
     #[test]

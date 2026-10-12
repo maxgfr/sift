@@ -469,6 +469,8 @@ enum ExpertIndex {
 /// model.layers.3.mlp.experts.gate_up_proj            HF fused 3-D; experts are dims[0]
 /// model.layers.3.mlp.experts.down_proj_blocks        gpt-oss MXFP4 blocks and scales
 /// model.layers.3.mlp.switch_mlp.gate_proj.weight     MLX stacked; experts are dims[0]
+/// layers.3.ffn.experts.5.w1.weight                   DeepSeek-V4
+/// block.3.mlp.mlp1_weight.blocks                     gpt-oss original; experts are dims[0]
 /// ```
 ///
 /// Quantization side tensors (`qweight`, `scales`, `qzeros`, MLX `biases`, FP8
@@ -499,21 +501,46 @@ fn classify_expert_tensor(name: &str, dims: &[u64]) -> Option<(u64, ExpertIndex)
         return None;
     }
 
+    // gpt-oss's original checkpoint: `block.N.mlp.mlp{1,2}_weight.{blocks,scales}`, every
+    // expert of the layer stacked with the expert count first.
+    if let Some(rest) = name.strip_prefix("block.") {
+        let (layer, rest) = rest.split_once('.')?;
+        let layer = layer.parse().ok()?;
+        let rest = rest.strip_prefix("mlp.")?;
+        let (proj, part) = rest.split_once('.')?;
+        return (matches!(proj, "mlp1_weight" | "mlp2_weight")
+            && matches!(part, "blocks" | "scales")
+            && dims.len() >= 2)
+            .then(|| (layer, ExpertIndex::Stacked(dims[0])));
+    }
+
     // HuggingFace names put the layer after `layers.`, under whatever prefix a multimodal
-    // wrapper adds (`model.`, `model.language_model.`, `language_model.model.`).
+    // wrapper adds (`model.`, `model.language_model.`, `language_model.model.`), or none
+    // (DeepSeek-V4's `layers.N.ffn…`).
     let at = name.find("layers.")?;
     let rest = &name[at + "layers.".len()..];
     let (layer, rest) = rest.split_once('.')?;
     let layer = layer.parse().ok()?;
 
     let (block, rest) = rest.split_once('.')?;
-    if !matches!(block, "mlp" | "block_sparse_moe" | "feed_forward") {
+    if !matches!(block, "mlp" | "block_sparse_moe" | "feed_forward" | "ffn") {
         return None;
     }
+    // The weight itself under every name a quantizer gives it, and the side tensors read
+    // with it: GPTQ/AWQ `qweight`/`qzeros`, MLX `scales`/`biases`, FP8 and FP4 `scale`,
+    // `weight_scale` and `weight_scale_inv`, EXL3's `trellis`.
     let side = |s: &str| {
         matches!(
             s,
-            "weight" | "qweight" | "scales" | "qzeros" | "biases" | "weight_scale_inv"
+            "weight"
+                | "qweight"
+                | "scales"
+                | "qzeros"
+                | "biases"
+                | "scale"
+                | "weight_scale"
+                | "weight_scale_inv"
+                | "trellis"
         )
     };
     let proj = |s: &str| {
@@ -827,6 +854,63 @@ mod tests {
         let moe = infer_moe_shape(&shape_of(t, ArchFacts::default())).expect("moe");
         assert_eq!(moe.experts_per_layer, 128);
         assert_eq!(moe.total_expert_bytes, 90);
+    }
+
+    #[test]
+    fn moe_layouts_seen_on_the_hub_in_2026_are_recognised() {
+        // DeepSeek-V4.1: `layers.N.ffn.experts.J.wK.weight` with a `.scale` beside it.
+        let t = vec![
+            entry("layers.1.ffn.experts.0.w1.weight", &[2304, 2560], 10),
+            entry("layers.1.ffn.experts.0.w1.scale", &[2304, 160], 1),
+            entry("layers.1.ffn.experts.1.w1.weight", &[2304, 2560], 10),
+        ];
+        let moe = infer_moe_shape(&shape_of(t, ArchFacts::default())).expect("V4.1 moe");
+        assert_eq!(moe.experts_per_layer, 2);
+        assert_eq!(
+            moe.total_expert_bytes, 21,
+            "the scale is read with the weight"
+        );
+
+        // MiMo: FP8/FP4 checkpoints with `weight_scale`.
+        let t = vec![
+            entry(
+                "model.layers.1.mlp.experts.0.down_proj.weight",
+                &[6144, 1024],
+                10,
+            ),
+            entry(
+                "model.layers.1.mlp.experts.0.down_proj.weight_scale",
+                &[6144, 64],
+                1,
+            ),
+        ];
+        let moe = infer_moe_shape(&shape_of(t, ArchFacts::default())).expect("MiMo moe");
+        assert_eq!(moe.total_expert_bytes, 11);
+
+        // EXL3: the weights are a `trellis`.
+        let t = vec![entry(
+            "model.layers.5.mlp.experts.3.down_proj.trellis",
+            &[768, 384, 64],
+            10,
+        )];
+        assert!(
+            infer_moe_shape(&shape_of(t, ArchFacts::default())).is_some(),
+            "EXL3 moe"
+        );
+
+        // gpt-oss's original checkpoint: `block.N.mlp.mlp1_weight.blocks`, experts first.
+        let t = vec![
+            entry("block.3.mlp.mlp1_weight.blocks", &[32, 5760, 90, 16], 100),
+            entry("block.3.mlp.mlp1_weight.scales", &[32, 5760, 90], 6),
+            entry("block.3.mlp.mlp1_bias", &[32, 5760], 1),
+            entry("block.3.mlp.gate.weight", &[32, 2880], 1),
+        ];
+        let moe = infer_moe_shape(&shape_of(t, ArchFacts::default())).expect("gpt-oss original");
+        assert_eq!(moe.experts_per_layer, 32);
+        assert_eq!(
+            moe.total_expert_bytes, 106,
+            "biases and the router are not expert weights"
+        );
     }
 
     #[test]
