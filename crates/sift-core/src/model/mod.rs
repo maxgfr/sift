@@ -470,6 +470,8 @@ enum ExpertIndex {
 /// model.layers.3.mlp.experts.down_proj_blocks        gpt-oss MXFP4 blocks and scales
 /// model.layers.3.mlp.switch_mlp.gate_proj.weight     MLX stacked; experts are dims[0]
 /// layers.3.ffn.experts.5.w1.weight                   DeepSeek-V4
+/// model.layers.3.mlp.experts.gate_proj.weight        MLX stacked; experts are dims[0]
+/// model.layers.3.block_sparse_moe.input_linear.weight  Granite 4; experts are dims[0]
 /// block.3.mlp.mlp1_weight.blocks                     gpt-oss original; experts are dims[0]
 /// ```
 ///
@@ -555,6 +557,16 @@ fn classify_expert_tensor(name: &str, dims: &[u64]) -> Option<(u64, ExpertIndex)
         return (proj(p) && side(tail) && dims.len() == 3)
             .then(|| (layer, ExpertIndex::Stacked(dims[0])));
     }
+    // IBM Granite 4: `block_sparse_moe.{input,output}_linear.weight`, experts first. The
+    // block name is what makes them experts; the same names under `shared_mlp` are not.
+    if block == "block_sparse_moe" {
+        if let Some((p, tail)) = rest.split_once('.') {
+            if matches!(p, "input_linear" | "output_linear") {
+                return (side(tail) && dims.len() == 3)
+                    .then(|| (layer, ExpertIndex::Stacked(dims[0])));
+            }
+        }
+    }
     let rest = rest.strip_prefix("experts.")?;
     match rest.split_once('.') {
         // Per expert: `experts.{j}.{proj}.{suffix}`.
@@ -563,9 +575,10 @@ fn classify_expert_tensor(name: &str, dims: &[u64]) -> Option<(u64, ExpertIndex)
             let j = j.parse().ok()?;
             (proj(p) && side(suffix)).then_some((layer, ExpertIndex::One(j)))
         }
-        // Fused 3-D: `experts.{proj}` or gpt-oss `experts.{proj}_{blocks,scales}`, with the
-        // expert count outermost. A `_bias` tensor is a bias, not a weight.
-        Some(_) => None,
+        // Stacked with no expert number: MLX's `experts.{proj}.{weight,scales}`, experts
+        // first. A `.bias` is a bias, not a weight.
+        Some((p, suffix)) => (proj(p) && side(suffix) && dims.len() >= 2)
+            .then(|| (layer, ExpertIndex::Stacked(dims[0]))),
         None => {
             let p = rest
                 .strip_suffix("_blocks")
@@ -910,6 +923,63 @@ mod tests {
         assert_eq!(
             moe.total_expert_bytes, 106,
             "biases and the router are not expert weights"
+        );
+    }
+
+    #[test]
+    fn moe_stacked_hf_and_mlx_tensors_without_an_expert_index_are_recognised() {
+        // mlx-community/gpt-oss-20b: `mlp.experts.{proj}.{weight,scales}`, experts first,
+        // no expert number in the name; its biases are not expert weights.
+        let mut t = Vec::new();
+        for p in ["gate_proj", "up_proj", "down_proj"] {
+            t.push(entry(
+                &format!("model.layers.1.mlp.experts.{p}.weight"),
+                &[32, 2880, 360],
+                100,
+            ));
+            t.push(entry(
+                &format!("model.layers.1.mlp.experts.{p}.scales"),
+                &[32, 2880, 90],
+                10,
+            ));
+            t.push(entry(
+                &format!("model.layers.1.mlp.experts.{p}.bias"),
+                &[32, 2880],
+                1,
+            ));
+        }
+        let moe = infer_moe_shape(&shape_of(t, ArchFacts::default())).expect("mlx gpt-oss");
+        assert_eq!(moe.experts_per_layer, 32);
+        assert_eq!(moe.total_expert_bytes, 330);
+
+        // IBM Granite 4 hybrid: `block_sparse_moe.{input,output}_linear`, experts first.
+        let t = vec![
+            entry(
+                "model.layers.1.block_sparse_moe.input_linear.weight",
+                &[64, 1024, 1536],
+                50,
+            ),
+            entry(
+                "model.layers.1.block_sparse_moe.output_linear.weight",
+                &[64, 1536, 512],
+                25,
+            ),
+            entry(
+                "model.layers.1.block_sparse_moe.router.layer.weight",
+                &[64, 1536],
+                1,
+            ),
+            entry(
+                "model.layers.1.shared_mlp.input_linear.weight",
+                &[2048, 1536],
+                9,
+            ),
+        ];
+        let moe = infer_moe_shape(&shape_of(t, ArchFacts::default())).expect("granite");
+        assert_eq!(moe.experts_per_layer, 64);
+        assert_eq!(
+            moe.total_expert_bytes, 75,
+            "the shared MLP and router are trunk"
         );
     }
 
