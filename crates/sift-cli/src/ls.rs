@@ -174,10 +174,15 @@ fn walk(dir: &Path, depth: u32, seen: &mut HashSet<PathBuf>, out: &mut Vec<(Path
         let is_weights = path
             .extension()
             .is_some_and(|e| e == "gguf" || e == "safetensors");
-        // Vision projectors ship alongside a model and are not one. Listing them as
-        // models would have the user trying to chat with an encoder.
-        let file_name = path.file_name().unwrap_or_default().to_string_lossy();
-        if is_weights && !file_name.to_ascii_lowercase().starts_with("mmproj") {
+        // Vision projectors and speculative-decoding heads ship alongside a model and are
+        // not one. Listing them as models would have the user trying to chat with an
+        // encoder. The same rule the hub listing applies.
+        let adjunct = sift_core::hub::RepoFile {
+            path: path.to_string_lossy().to_string(),
+            size: None,
+        }
+        .is_adjunct();
+        if is_weights && !adjunct {
             out.push((path, meta.len()));
         }
     }
@@ -677,6 +682,7 @@ mod tests {
             "Model-Q8_0-00002-of-00002.gguf",
             "Model-Q4_K_M.gguf",
             "mmproj-F16.gguf",
+            "eagle3-Model-BF16.gguf",
         ] {
             std::fs::write(dir.join(f), b"x").unwrap();
         }

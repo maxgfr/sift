@@ -64,10 +64,17 @@ impl RepoFile {
     /// Vision projectors (`mmproj-F16.gguf`) and importance matrices sit in the same repos
     /// as the weights and parse as GGUF. Listed as quantizations, a 0.8 GB projector was
     /// the smallest "model" in the table and got recommended.
+    ///
+    /// Speculative-decoding heads are adjuncts too: an EAGLE3 or DFlash draft runs only
+    /// beside the model it was trained on, and a 1.7 GB one "fitted" and was recommended.
     pub fn is_adjunct(&self) -> bool {
         let file = self.path.rsplit('/').next().unwrap_or(&self.path);
         let lower = file.to_ascii_lowercase();
-        lower.starts_with("mmproj") || lower.contains("imatrix")
+        lower.starts_with("mmproj")
+            || lower.contains("imatrix")
+            || lower.starts_with("eagle")
+            || lower.starts_with("dflash")
+            || lower.contains("_draft_model")
     }
 
     /// Whether this file is one shard of a split model.
@@ -612,6 +619,14 @@ mod tests {
         assert!(f("sub/MMPROJ-BF16.gguf").is_adjunct());
         assert!(f("imatrix_unsloth.gguf").is_adjunct());
         assert!(!f("gemma-3-4b-it-Q4_K_M.gguf").is_adjunct());
+        // Speculative-decoding heads ride along with their target model and cannot run
+        // alone: ggml-org/gpt-oss-20b-GGUF recommended its 1.7 GB EAGLE3 head.
+        assert!(f("eagle3-gpt-oss-20b-BF16.gguf").is_adjunct());
+        assert!(f("dflash/dflash_draft_model.safetensors").is_adjunct());
+        assert!(
+            !f("Draftsman-7B-Q4_K_M.gguf").is_adjunct(),
+            "a model may be called that"
+        );
     }
 
     #[test]

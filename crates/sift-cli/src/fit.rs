@@ -320,12 +320,11 @@ pub fn read(listed: Listed) -> Result<Vec<Swept>> {
     let mut out = Vec::with_capacity(units.len());
     for (unit, parts) in units.into_iter().zip(slots) {
         match assemble(parts, config.as_ref()) {
-            Ok(shape) if is_projector(&shape) => {
-                eprintln!(
-                    "  skipped {}: a vision or audio projector, not a model",
-                    unit.path
-                )
-            }
+            Ok(shape) if not_a_model(&shape).is_some() => eprintln!(
+                "  skipped {}: {}",
+                unit.path,
+                not_a_model(&shape).unwrap_or_default()
+            ),
             Ok(shape) => out.push(Swept {
                 size: unit.size.unwrap_or_else(|| shape.total_tensor_bytes()),
                 format: engine::format_of(&unit.path, config.as_ref()),
@@ -535,12 +534,20 @@ fn download_glob(base_path: &str, parts: &[String]) -> String {
     format!("--include \"{}*{ext}\"", &first[..common])
 }
 
-/// Whether a GGUF is a multimodal projector rather than a language model.
+/// Why a file that parsed is still not a model to recommend, if it is not.
 ///
-/// The filename filter catches `mmproj-*`; this catches a projector shipped under any
-/// other name, by what its own header says it is.
-fn is_projector(shape: &model::ModelShape) -> bool {
-    shape.architecture() == Some("clip")
+/// The filename filter catches `mmproj-*` and `eagle3-*`; this catches the same things
+/// shipped under any other name, by what their own headers say they are: a multimodal
+/// projector (`clip`), or a speculative-decoding head (EAGLE, DFlash, Medusa) that only
+/// runs beside the model it was trained for.
+fn not_a_model(shape: &model::ModelShape) -> Option<&'static str> {
+    match shape.architecture()? {
+        "clip" => Some("a vision or audio projector, not a model"),
+        "eagle" | "eagle3" | "dflash" | "medusa" => {
+            Some("a speculative-decoding head, which runs only beside its model")
+        }
+        _ => None,
+    }
 }
 
 /// A `--include` pattern matching every part of a split model.
@@ -1227,6 +1234,27 @@ mod calibration_tests {
 mod sweep_tests {
     use super::*;
     use std::sync::OnceLock;
+
+    #[test]
+    fn heads_and_projectors_are_not_models_whatever_their_files_are_called() {
+        for arch in ["clip", "eagle", "eagle3", "dflash", "medusa"] {
+            let facts = model::ArchFacts {
+                architecture: Some(arch.into()),
+                ..Default::default()
+            };
+            let shape = model::ModelShape::new(facts, Vec::new(), 1);
+            assert!(not_a_model(&shape).is_some(), "{arch}");
+        }
+        let llm = model::ModelShape::new(
+            model::ArchFacts {
+                architecture: Some("gpt-oss".into()),
+                ..Default::default()
+            },
+            Vec::new(),
+            1,
+        );
+        assert!(not_a_model(&llm).is_none());
+    }
 
     fn file(path: &str, size: u64) -> hub::RepoFile {
         hub::RepoFile {
