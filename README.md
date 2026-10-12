@@ -245,9 +245,18 @@ the ways this tool was wrong before it was right.
 |---|---|---|---|
 | Qwen3.5-9B Q4_K_M, dense, LM Studio on M5 | 21 tok/s | **21.11 tok/s** | under 1% |
 | OLMoE-1B-7B Q4_K_M, MoE, LM Studio on M5 | 125 tok/s | **129.10 tok/s** | 3% |
+| qwen3:4b, dense, Ollama on M5 | 33–37 tok/s | **35.30 tok/s** | within the spread |
+| qwen3-vl:2b, dense + vision tower, Ollama on M5 | 74–83 tok/s | **72.73 tok/s** | 2–14% high |
 
-Two models, one machine, one engine. That is two calibration points, not a validation — and
-getting them took discarding four measurements that looked fine.
+The first two are the calibration points the efficiency factors were fitted to — getting
+them took discarding four measurements that looked fine. The last two are checks on a
+different engine, taken afterwards with the factors unchanged; the predicted range is
+`sift ls` run just before and just after `sift bench`, because the live bandwidth reading
+moves on a busy machine.
+
+The qwen3-vl row is also a bug this table caught: its Ollama blob carries a 0.78 GB vision
+tower that text decoding never touches, and counting it as read every token predicted
+37–46 tok/s. Encoders now count toward what has to fit, not toward traffic.
 
 **The first ruler measured the wrong access pattern.** `sift` sized the ceiling with a
 STREAM *copy*. Decode streams weights in and writes back a small activation; a copy moves a
