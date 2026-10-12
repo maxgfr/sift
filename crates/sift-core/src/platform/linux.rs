@@ -19,19 +19,55 @@ use std::path::Path;
 
 pub fn machine_facts() -> MachineFacts {
     let meminfo = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
+    facts_from(
+        &meminfo,
+        super::cgroup::memory_limit(Path::new("/")),
+        dmi_product_name(),
+    )
+}
+
+/// Assemble facts from `/proc/meminfo` and the cgroup limit, if one binds.
+///
+/// A container's limit is what it may use, whatever the host has: RAM is the smaller of
+/// the two, and available memory is the smaller of the kernel's estimate and what is left
+/// under the limit.
+fn facts_from(
+    meminfo: &str,
+    cgroup: Option<super::cgroup::CgroupMemory>,
+    model: Option<String>,
+) -> MachineFacts {
+    let total = meminfo_kib(meminfo, "MemTotal");
+    let available = meminfo_kib(meminfo, "MemAvailable");
+    let cgroup = cgroup.filter(|c| total.is_none_or(|t| c.limit < t));
+    let ram_bytes = match (total, cgroup) {
+        (Some(t), Some(c)) => t.min(c.limit),
+        (None, Some(c)) => c.limit,
+        (Some(t), None) => t,
+        (None, None) => 0,
+    };
+    let available_bytes = match (available, cgroup.and_then(|c| c.headroom())) {
+        (Some(a), Some(h)) => Some(a.min(h)),
+        (a, h) => a.or(h),
+    };
     MachineFacts {
-        ram_bytes: meminfo_kib(&meminfo, "MemTotal").unwrap_or(0),
-        available_bytes: meminfo_kib(&meminfo, "MemAvailable"),
+        ram_bytes,
+        available_bytes,
         page_bytes: page_size(),
         cpus: std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(1),
-        model: dmi_product_name(),
-        // Linux has no equivalent of the Apple wired limit, so this is never `Limited`:
-        // what the drivers report is a separate pool, and `AccelMemory` keeps the two
-        // apart. See `discrete_vram`.
-        accel_memory: discrete_vram(),
+        model,
+        // Linux has no equivalent of the Apple wired limit, so this is never `Limited`.
+        // GPU memory is a separate pool and is only looked for by `doctor`; see
+        // `gpu_memory`.
+        accel_memory: AccelMemory::Unknown,
+        cgroup_limit_bytes: cgroup.map(|c| c.limit),
     }
+}
+
+/// GPU memory, as the drivers report it. For `doctor`.
+pub fn gpu_memory() -> AccelMemory {
+    discrete_vram()
 }
 
 /// Directory the kernel exposes one entry per DRM device under.
@@ -49,10 +85,7 @@ const NVIDIA_PROC: &str = "/proc/driver/nvidia/version";
 /// enormous pool that no single model can be loaded into, and reporting the first would
 /// depend on PCI enumeration order.
 fn discrete_vram() -> AccelMemory {
-    let amd = sysfs_vram_bytes(Path::new(DRM_CLASS)).map(|bytes| AccelMemory::Discrete {
-        bytes,
-        vendor: "amdgpu",
-    });
+    let amd = sysfs_vram_bytes(Path::new(DRM_CLASS)).map(amd_memory);
     let nvidia = nvidia_vram_bytes().map(|bytes| AccelMemory::Discrete {
         bytes,
         vendor: "nvidia",
@@ -63,6 +96,28 @@ fn discrete_vram() -> AccelMemory {
         .flatten()
         .max_by_key(|a| a.vram_bytes().unwrap_or(0))
         .unwrap_or(AccelMemory::Unknown)
+}
+
+/// Below this, an amdgpu "VRAM" figure is an APU's carve-out of system memory.
+///
+/// APUs reserve 512 MiB to 2 GiB of RAM for the GPU and amdgpu reports it under the same
+/// file a discrete card uses for its own memory. No discrete card sold in the last decade
+/// has less than 2 GiB, so the size tells the two apart where nothing else in sysfs does.
+const APU_CARVEOUT_MAX: u64 = 2 << 30;
+
+/// Classify an amdgpu memory figure as a discrete card's or an APU's.
+fn amd_memory(bytes: u64) -> AccelMemory {
+    if bytes < APU_CARVEOUT_MAX {
+        AccelMemory::Integrated {
+            bytes,
+            vendor: "amdgpu",
+        }
+    } else {
+        AccelMemory::Discrete {
+            bytes,
+            vendor: "amdgpu",
+        }
+    }
 }
 
 /// Total VRAM from DRM sysfs, in bytes.
@@ -107,10 +162,29 @@ fn nvidia_vram_bytes() -> Option<u64> {
     if !Path::new(NVIDIA_PROC).exists() {
         return None;
     }
-    let out = std::process::Command::new("nvidia-smi")
+    let mut child = std::process::Command::new("nvidia-smi")
         .args(["--query-gpu=memory.total", "--format=csv,noheader,nounits"])
-        .output()
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
         .ok()?;
+    // A wedged driver can hang `nvidia-smi` indefinitely, and `doctor` must not hang with
+    // it. Three seconds is far longer than a healthy driver takes.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(20))
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+    let out = child.wait_with_output().ok()?;
     if !out.status.success() {
         return None;
     }
@@ -299,6 +373,41 @@ Buffers:            2048 kB
         let root = fake_drm(&[("card0", Some("0")), ("card1", None)]);
         assert_eq!(sysfs_vram_bytes(root.path()), None);
         assert_eq!(sysfs_vram_bytes(Path::new("/nonexistent/drm")), None);
+    }
+
+    #[test]
+    fn an_apu_carveout_is_integrated_not_vram() {
+        assert!(matches!(
+            amd_memory(512 << 20),
+            AccelMemory::Integrated { .. }
+        ));
+        assert!(matches!(amd_memory(16 << 30), AccelMemory::Discrete { .. }));
+    }
+
+    #[test]
+    fn a_cgroup_limit_bounds_ram_and_available_memory() {
+        use super::super::cgroup::CgroupMemory;
+        let limit = CgroupMemory {
+            limit: 2 << 30,
+            usage: Some(512 << 20),
+        };
+        let f = facts_from(SAMPLE, Some(limit), None);
+        assert_eq!(
+            f.ram_bytes,
+            2 << 30,
+            "the container's 2 GiB, not the host's 15.6"
+        );
+        assert_eq!(f.available_bytes, Some((2 << 30) - (512 << 20)));
+        assert_eq!(f.cgroup_limit_bytes, Some(2 << 30));
+
+        // A limit above physical RAM binds nothing and is not reported.
+        let loose = CgroupMemory {
+            limit: 64 << 30,
+            usage: None,
+        };
+        let f = facts_from(SAMPLE, Some(loose), None);
+        assert_eq!(f.ram_bytes, 16_333_816 * 1024);
+        assert_eq!(f.cgroup_limit_bytes, None);
     }
 
     #[test]

@@ -7,8 +7,9 @@ use std::os::unix::io::AsRawFd;
 use std::path::Path;
 
 pub fn machine_facts() -> MachineFacts {
+    let ram_bytes = sysctl_u64("hw.memsize").unwrap_or(0);
     MachineFacts {
-        ram_bytes: sysctl_u64("hw.memsize").unwrap_or(0),
+        ram_bytes,
         // macOS exposes no single "available" figure. Reconstructing one from `vm_stat`
         // means deciding which of purgeable, compressed and inactive counts as available,
         // and that is a judgement call this crate would rather not make silently.
@@ -18,16 +19,23 @@ pub fn machine_facts() -> MachineFacts {
             .map(|n| n.get())
             .unwrap_or(1),
         model: sysctl_string("hw.model"),
-        // `iogpu.wired_limit_mb` unset means macOS applies an internal default, itself
-        // well below physical RAM. This is why an 11 GB model can fail to load on a 16 GB
-        // machine: the limit, not the RAM, is what binds.
-        accel_memory: match sysctl_u64("iogpu.wired_limit_mb").filter(|&mb| mb > 0) {
-            Some(mb) => AccelMemory::Limited {
-                bytes: mb * 1024 * 1024,
-            },
-            None => AccelMemory::PlatformDefault,
-        },
+        // `iogpu.wired_limit_mb` at 0 means macOS applies an internal default, itself well
+        // below physical RAM. This is why an 11 GB model can fail to load on a 16 GB
+        // machine: the limit, not the RAM, is what binds. Absent altogether (an Intel
+        // Mac), there is no Apple GPU to limit.
+        accel_memory: super::apple_wired_limit(
+            sysctl_u64("iogpu.wired_limit_mb"),
+            sysctl_u64("debug.iogpu.wired_limit"),
+            ram_bytes,
+        ),
+        cgroup_limit_bytes: None,
     }
+}
+
+/// Apple Silicon's GPU memory is the wired limit `machine_facts` already reports, and an
+/// Intel Mac's discrete GPU is not one this build looks for.
+pub fn gpu_memory() -> AccelMemory {
+    AccelMemory::Unknown
 }
 
 pub fn page_size() -> usize {

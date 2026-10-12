@@ -45,9 +45,15 @@ pub fn machine_facts() -> MachineFacts {
             .unwrap_or(1),
         model: system_product_name(),
         // Never `Limited`: Windows has no equivalent of the Apple wired limit, and what the
-        // display driver reports is a separate pool. `AccelMemory` keeps the two apart.
-        accel_memory: discrete_vram(),
+        // display driver reports is a separate pool, looked for only by `doctor`.
+        accel_memory: AccelMemory::Unknown,
+        cgroup_limit_bytes: None,
     }
+}
+
+/// GPU memory, as the display driver recorded it. For `doctor`.
+pub fn gpu_memory() -> AccelMemory {
+    discrete_vram()
 }
 
 /// The display-adapter class key. This GUID is fixed by Windows and has not changed since
@@ -73,24 +79,32 @@ const MAX_ADAPTERS: u32 = 8;
 /// The older `HardwareInformation.MemorySize` is deliberately not consulted: it is a DWORD
 /// and truncates on any card of 4 GB or more, which is every card worth reporting.
 fn discrete_vram() -> AccelMemory {
-    let best = (0..MAX_ADAPTERS)
+    let adapters: Vec<(u64, bool)> = (0..MAX_ADAPTERS)
         .filter_map(|i| {
-            reg_qword(
-                &format!("{DISPLAY_CLASS_KEY}\\{i:04}"),
-                "HardwareInformation.qwMemorySize",
-            )
+            let key = format!("{DISPLAY_CLASS_KEY}\\{i:04}");
+            let bytes = reg_qword(&key, "HardwareInformation.qwMemorySize")?;
+            let integrated =
+                reg_sz(&key, "DriverDesc").is_some_and(|d| super::is_integrated_adapter(&d));
+            Some((bytes, integrated))
         })
-        .filter(|&b| b > 0)
-        // The largest adapter, not the sum: two cards are two pools, and a laptop with
-        // switchable graphics lists both its integrated and its discrete part.
-        .max();
+        .filter(|&(b, _)| b > 0)
+        .collect();
 
-    match best {
-        Some(bytes) => AccelMemory::Discrete {
+    // The largest discrete adapter, not the sum: two cards are two pools, and a laptop
+    // with switchable graphics lists both its integrated and its discrete part. An
+    // integrated part is reported only when it is all there is.
+    let discrete = adapters.iter().filter(|a| !a.1).map(|a| a.0).max();
+    let integrated = adapters.iter().filter(|a| a.1).map(|a| a.0).max();
+    match (discrete, integrated) {
+        (Some(bytes), _) => AccelMemory::Discrete {
             bytes,
             vendor: "display driver",
         },
-        None => AccelMemory::Unknown,
+        (None, Some(bytes)) => AccelMemory::Integrated {
+            bytes,
+            vendor: "display driver",
+        },
+        (None, None) => AccelMemory::Unknown,
     }
 }
 
@@ -194,8 +208,21 @@ fn memory_status() -> (u64, Option<u64>) {
 /// Readable without elevation. Motherboards that were never configured leave placeholder
 /// strings here, which are filtered out — "System Product Name" is not a machine model.
 fn system_product_name() -> Option<String> {
-    let subkey = wide("HARDWARE\\DESCRIPTION\\System\\BIOS");
-    let value = wide("SystemProductName");
+    let name = reg_sz("HARDWARE\\DESCRIPTION\\System\\BIOS", "SystemProductName")?;
+    if name.is_empty()
+        || name.eq_ignore_ascii_case("None")
+        || name.to_ascii_lowercase().contains("to be filled")
+        || name.to_ascii_lowercase().contains("system product name")
+    {
+        return None;
+    }
+    Some(name)
+}
+
+/// Read a `REG_SZ` from `HKEY_LOCAL_MACHINE`, trimmed.
+fn reg_sz(subkey: &str, value: &str) -> Option<String> {
+    let subkey = wide(subkey);
+    let value = wide(value);
 
     // Ask for the size first, then read into a buffer of exactly that size.
     let mut size: u32 = 0;
@@ -235,15 +262,7 @@ fn system_product_name() -> Option<String> {
     }
 
     let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
-    let name = String::from_utf16_lossy(&buf[..len]).trim().to_string();
-    if name.is_empty()
-        || name.eq_ignore_ascii_case("None")
-        || name.to_ascii_lowercase().contains("to be filled")
-        || name.to_ascii_lowercase().contains("system product name")
-    {
-        return None;
-    }
-    Some(name)
+    Some(String::from_utf16_lossy(&buf[..len]).trim().to_string())
 }
 
 /// NUL-terminated UTF-16, as every `W` entry point expects.
@@ -285,6 +304,12 @@ mod tests {
             reg_qword("HARDWARE\\DESCRIPTION\\System\\BIOS", "SystemProductName"),
             None
         );
+    }
+
+    #[test]
+    fn the_bios_product_name_reads_as_a_string() {
+        // Exercises `reg_sz` on a value every Windows machine has.
+        assert!(reg_sz("HARDWARE\\DESCRIPTION\\System\\BIOS", "SystemProductName").is_some());
     }
 
     #[test]

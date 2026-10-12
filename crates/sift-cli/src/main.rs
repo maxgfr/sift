@@ -12,8 +12,14 @@ mod ls;
 mod source;
 use source::Source;
 
-/// Memory reserved for the OS when nothing better is known.
-const OS_RESERVE_BYTES: u64 = 4 * sift_core::GIB;
+/// Memory left to the OS when nothing better is known: a quarter of RAM, between 1 and
+/// 4 GiB.
+///
+/// A flat 4 GiB was right for a 16 GiB laptop and absurd at either end: a 4 GiB machine
+/// came out with nothing usable at all, and the reserve did not grow on a 64 GiB box.
+fn os_reserve_bytes(ram_bytes: u64) -> u64 {
+    (ram_bytes / 4).clamp(sift_core::GIB, 4 * sift_core::GIB)
+}
 
 /// Context length `fit` sizes the KV cache for unless told otherwise.
 ///
@@ -41,7 +47,9 @@ fn usable_ram(facts: &MachineFacts) -> u64 {
     if let Some(ceiling) = facts.accel_memory.host_ceiling_bytes() {
         return ceiling;
     }
-    let estimate = facts.ram_bytes.saturating_sub(OS_RESERVE_BYTES);
+    let estimate = facts
+        .ram_bytes
+        .saturating_sub(os_reserve_bytes(facts.ram_bytes));
     match facts.available_bytes {
         // Take the lower of the two. Available memory can briefly exceed RAM minus the
         // reserve on an idle machine, and advising against that headroom would tell
@@ -595,7 +603,8 @@ fn cmd_engines(json: bool) -> Result<()> {
 }
 
 fn cmd_doctor(disk_sample: Option<PathBuf>, json: bool) -> Result<()> {
-    let facts = MachineFacts::collect();
+    let facts = MachineFacts::collect_with_vram();
+    let usable = usable_ram(&facts);
 
     // 256 MiB per buffer, enough to overflow every cache level so we measure DRAM.
     let mem = doctor::measure_memory_bandwidth(256 << 20, 8);
@@ -631,6 +640,11 @@ fn cmd_doctor(disk_sample: Option<PathBuf>, json: bool) -> Result<()> {
                 "cpus": facts.cpus,
                 "available_bytes": facts.available_bytes,
                 "accel_memory": facts.accel_memory,
+                "cgroup_limit_bytes": facts.cgroup_limit_bytes,
+                "usable_memory_bytes": usable,
+                // True when the figure above rests on sift's estimate of an OS default the
+                // platform does not publish, rather than on a value it reported.
+                "usable_memory_is_estimate": facts.accel_memory.is_estimate(),
             },
             "memory_copy": mem,
             "memory_read": read,
@@ -651,6 +665,12 @@ fn cmd_doctor(disk_sample: Option<PathBuf>, json: bool) -> Result<()> {
     );
     println!("  page size        {} KiB", facts.page_bytes / 1024);
     println!("  cpus             {}", facts.cpus);
+    if let Some(limit) = facts.cgroup_limit_bytes {
+        println!(
+            "  container limit  {:.1} GiB (cgroup memory limit; RAM above is capped to it)",
+            sift_core::gib(limit)
+        );
+    }
     if let Some(b) = facts.available_bytes {
         println!("  available now    {:.1} GiB", sift_core::gib(b));
     }
@@ -658,11 +678,23 @@ fn cmd_doctor(disk_sample: Option<PathBuf>, json: bool) -> Result<()> {
         AccelMemory::Limited { bytes } => {
             println!("  gpu wired limit  {:.1} GiB", sift_core::gib(bytes))
         }
-        AccelMemory::PlatformDefault => println!(
-            "  gpu wired limit  unset -> macOS default, well below physical RAM.\n\
-             {:>19}This, not your RAM, is what an 11 GB model hits first.\n\
+        AccelMemory::PlatformDefault { estimated_bytes } => println!(
+            "  gpu wired limit  unset -> macOS default, ~{:.1} GiB (estimate: Apple does\n\
+             {:>19}not publish it; about 2/3 of RAM up to 36 GiB, 3/4 above). This, not\n\
+             {:>19}your RAM, is what a model hits first.\n\
              {:>19}Raise with: sudo sysctl iogpu.wired_limit_mb=<MB>",
-            "", ""
+            sift_core::gib(estimated_bytes),
+            "",
+            "",
+            ""
+        ),
+        AccelMemory::Integrated { bytes, vendor } => println!(
+            "  integrated gpu   {:.1} GiB reserved ({vendor})\n\
+             {:>19}A slice of system RAM, not memory of its own: nothing is added to\n\
+             {:>19}what fits.",
+            sift_core::gib(bytes),
+            "",
+            ""
         ),
         // Reported, and reported as a *separate pool*. Folding it into usable memory would
         // be the mistake that has competing tools telling a 16 GB laptop with a 24 GB card
@@ -687,6 +719,16 @@ fn cmd_doctor(disk_sample: Option<PathBuf>, json: bool) -> Result<()> {
             "", "", ""
         ),
     }
+
+    println!(
+        "  usable for a model {:.1} GiB{}",
+        sift_core::gib(usable),
+        if facts.accel_memory.is_estimate() {
+            " (estimate)"
+        } else {
+            ""
+        }
+    );
 
     println!("\nmemory bandwidth");
     println!("  read, all cores  {:.1} GB/s", read.gb_per_sec);
@@ -1117,4 +1159,49 @@ fn cmd_plan(src: &Source, hit_rate: f64, json: bool) -> Result<()> {
     );
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn facts(ram_gib: u64, accel: AccelMemory) -> MachineFacts {
+        MachineFacts {
+            ram_bytes: ram_gib * sift_core::GIB,
+            available_bytes: None,
+            page_bytes: 4096,
+            cpus: 1,
+            model: None,
+            accel_memory: accel,
+            cgroup_limit_bytes: None,
+        }
+    }
+
+    #[test]
+    fn the_os_reserve_scales_with_ram_between_one_and_four_gib() {
+        // Regression: a flat 4 GiB left a 4 GiB machine with nothing usable.
+        assert_eq!(
+            usable_ram(&facts(4, AccelMemory::Unknown)),
+            3 * sift_core::GIB
+        );
+        assert_eq!(usable_ram(&facts(2, AccelMemory::Unknown)), sift_core::GIB);
+        assert_eq!(
+            usable_ram(&facts(16, AccelMemory::Unknown)),
+            12 * sift_core::GIB
+        );
+        assert_eq!(
+            usable_ram(&facts(64, AccelMemory::Unknown)),
+            60 * sift_core::GIB
+        );
+    }
+
+    #[test]
+    fn an_unset_mac_wired_limit_plans_against_the_estimate() {
+        let ram = 16 * sift_core::GIB;
+        let f = facts(
+            16,
+            sift_core::platform::apple_wired_limit(Some(0), None, ram),
+        );
+        assert_eq!(usable_ram(&f), ram / 3 * 2);
+    }
 }
