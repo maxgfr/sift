@@ -49,11 +49,23 @@ pub struct KvLayer {
     pub window: Option<u64>,
 }
 
+/// Tokens a sliding-window cache holds beyond its window: llama.cpp's default `n_ubatch`,
+/// one batch of new tokens arriving while the window is still full.
+pub const SWA_BATCH_TOKENS: u64 = 512;
+
 impl KvLayer {
     /// Bytes this layer holds at `context_tokens`.
+    ///
+    /// A sliding layer is sized as llama.cpp sizes it, since every GGUF engine runs on it:
+    /// the window plus one batch of [`SWA_BATCH_TOKENS`], padded to 256 cells, never more
+    /// than the context (`llama-kv-cache-iswa.cpp`). Counting the window alone put
+    /// gemma-3-1b's cache at 27 MiB where llama.cpp allocates 38.
     pub fn bytes_at(&self, context_tokens: u64, bytes_per_element: u64) -> u64 {
         let tokens = match self.window {
-            Some(w) => context_tokens.min(w),
+            Some(w) => {
+                let cells = context_tokens.min(w.saturating_add(SWA_BATCH_TOKENS));
+                context_tokens.min(cells.div_ceil(256).saturating_mul(256))
+            }
             None => context_tokens,
         };
         self.kv_heads
@@ -86,6 +98,9 @@ pub struct KvShape {
     pub window: Option<u64>,
     /// Every KV-holding layer, in order.
     pub per_layer: Vec<KvLayer>,
+    /// Bytes of state the recurrent layers keep whatever the context, when the metadata
+    /// sizes it. Zero when it does not, which understates by tens of MiB at most.
+    pub state_bytes: u64,
 }
 
 /// More layers than this is not a model but a corrupt or hostile header.
@@ -120,17 +135,20 @@ impl KvShape {
             recurrent_layers: 0,
             window: None,
             per_layer: vec![layer; layers as usize],
+            state_bytes: 0,
         }
     }
 
-    /// Bytes of KV cache held at `context_tokens`.
+    /// Bytes of context memory held at `context_tokens`: the KV cache plus the fixed
+    /// recurrent state.
     ///
-    /// Summed per layer: `kv_heads × (k_dim + v_dim) × min(context, window)` each.
+    /// Summed per layer: `kv_heads × (k_dim + v_dim) × min(context, window)` each. The
+    /// recurrent state is f32 in llama.cpp whatever the KV precision, so it is added as is.
     pub fn bytes_at(&self, context_tokens: u64, bytes_per_element: u64) -> u64 {
         self.per_layer
             .iter()
             .map(|l| l.bytes_at(context_tokens, bytes_per_element))
-            .fold(0, u64::saturating_add)
+            .fold(self.state_bytes, u64::saturating_add)
     }
 
     /// Whether the cache is anything other than every layer attending in full.
@@ -247,6 +265,9 @@ pub fn kv_shape_from_facts(facts: &ArchFacts) -> Option<KvShape> {
         recurrent_layers: recurrent,
         window: per_layer.iter().find_map(|l| l.window),
         per_layer,
+        state_bytes: f
+            .recurrent_state_per_layer
+            .map_or(0, |s| s.saturating_mul(recurrent)),
     })
 }
 
@@ -434,11 +455,47 @@ mod tests {
         assert_eq!(kv.window, Some(1024));
 
         let per_token_layer = 16 * (128 + 128) * 2; // heads x (k + v) x f16
-        let expected = 10 * per_token_layer * 131_072 + 52 * per_token_layer * 1024;
+                                                    // Sliding layers hold window + 512 cells, as llama.cpp allocates them.
+        let expected = 10 * per_token_layer * 131_072 + 52 * per_token_layer * (1024 + 512);
         assert_eq!(kv.bytes_at(131_072, KV_F16_BYTES), expected);
         // The uniform formula would have charged every layer the whole context: 5x more.
         let naive = KvShape::uniform(62, 16, 128, None).bytes_at(131_072, KV_F16_BYTES);
         assert!(naive > expected * 5);
+    }
+
+    #[test]
+    fn kv_sliding_layers_hold_what_llama_cpp_allocates_for_them() {
+        // Measured: llama.cpp allocates 38.00 MiB of KV for gemma-3-1b-it at 4096 tokens —
+        // 16 MiB for its 4 global layers and 22 MiB for its 22 sliding ones, whose cache is
+        // `window + n_ubatch` = 512 + 512 = 1024 cells, not the 512-token window.
+        let mut f = facts(26, 1, 256);
+        f.sliding_window = Some(512);
+        f.layer_kinds = resolve_layer_kinds(26, None, None, default_sliding_pattern("gemma3"));
+        let kv = kv_shape_from_facts(&f).expect("sizeable");
+        assert_eq!((kv.full_layers, kv.sliding_layers), (4, 22));
+        assert_eq!(kv.bytes_at(4096, KV_F16_BYTES), 38 << 20);
+        // A context shorter than window + batch is all the cache can hold.
+        assert_eq!(kv.bytes_at(256, KV_F16_BYTES), 26 * 512 * 256 * 2);
+    }
+
+    #[test]
+    fn kv_recurrent_layers_add_their_fixed_state_as_llama_cpp_allocates_it() {
+        // Measured: granite-4.0-h-350m at 4096 tokens holds 16.00 MiB of KV in its 4
+        // attention layers and 21.57 MiB of recurrent state in its 28 Mamba-2 layers
+        // (S 21.00 + R 0.57). The state does not grow with the context, and it is there.
+        let mut f = facts(32, 4, 64);
+        let mut heads = vec![0u64; 32];
+        for i in [10, 13, 17, 27] {
+            heads[i] = 4;
+        }
+        f.head_count_kv_layers = Some(heads);
+        let per_layer = 128 * 1536 * 4 + 3 * (1536 + 2 * 128) * 4;
+        f.recurrent_state_per_layer = Some(per_layer);
+        let kv = kv_shape_from_facts(&f).expect("sizeable");
+        assert_eq!(kv.state_bytes, 28 * per_layer);
+        assert_eq!(kv.bytes_at(4096, KV_F16_BYTES), (16 << 20) + 28 * per_layer);
+        assert_eq!(kv.bytes_at(8192, KV_F16_BYTES), (32 << 20) + 28 * per_layer);
+        assert!((kv.state_bytes as f64 / 1_048_576.0 - 21.57).abs() < 0.01);
     }
 
     #[test]
@@ -491,7 +548,14 @@ mod tests {
         f.value_length_swa = Some(256);
         f.layer_kinds = Some(vec![LayerKind::Sliding, LayerKind::Full]);
         let kv = kv_shape_from_facts(&f).expect("sizeable");
-        assert_eq!(kv.bytes_at(100, 1), 2 * 512 * 10 + 2 * 1024 * 100);
+        // At 100 tokens the sliding layer's window + 512 cells exceed the context, so it
+        // holds all 100 tokens, at its own narrower width.
+        assert_eq!(kv.bytes_at(100, 1), 2 * 512 * 100 + 2 * 1024 * 100);
+        // Past window + batch it stops growing.
+        assert_eq!(
+            kv.bytes_at(10_000, 1),
+            2 * 512 * (10u64 + 512).div_ceil(256) * 256 + 2 * 1024 * 10_000
+        );
     }
 
     #[test]

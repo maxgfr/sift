@@ -285,6 +285,9 @@ pub fn facts_from_config(config: &serde_json::Value) -> ArchFacts {
         sliding_window,
         layer_kinds,
         mla_latent,
+        // Engines that read config.json each size their state their own way; only the
+        // GGUF one is anchored on llama.cpp's.
+        recurrent_state_per_layer: None,
     }
 }
 
@@ -562,7 +565,8 @@ mod tests {
         let per_layer = 4 * (256 + 256) * 2;
         assert_eq!(
             kv.bytes_at(131_072, 2),
-            5 * per_layer * 131_072 + 29 * per_layer * 1024
+            // Sliding layers hold window + 512 cells, as llama.cpp allocates them.
+            5 * per_layer * 131_072 + 29 * per_layer * (1024 + 512)
         );
         assert_eq!(kv.train_context, Some(131_072));
     }
@@ -599,7 +603,7 @@ mod tests {
         let per_layer = 8 * 256 * 2;
         assert_eq!(
             kv.bytes_at(65_536, 2),
-            per_layer * 65_536 + 3 * per_layer * 8192
+            per_layer * 65_536 + 3 * per_layer * (8192 + 512)
         );
     }
 

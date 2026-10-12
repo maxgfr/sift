@@ -102,6 +102,9 @@ pub struct ArchFacts {
     /// Width of the latent multi-head latent attention caches per token, in place of a K
     /// and a V per head.
     pub mla_latent: Option<u64>,
+    /// Bytes of fixed state one recurrent or linear-attention layer keeps, where the
+    /// metadata sizes it.
+    pub recurrent_state_per_layer: Option<u64>,
 }
 
 impl ModelShape {
@@ -296,7 +299,31 @@ fn gguf_facts(g: &Gguf) -> ArchFacts {
         sliding_window,
         layer_kinds,
         mla_latent,
+        recurrent_state_per_layer: recurrent_state_per_layer(g),
     }
+}
+
+/// Bytes of state one recurrent or linear-attention layer keeps, whatever the context.
+///
+/// llama.cpp's `n_embd_r() + n_embd_s()` f32 values (`llama-hparams.cpp`): the rolling
+/// convolution window and the SSM state. Checked against the 21.57 MiB it allocates for
+/// granite-4.0-h-350m, the 19.27 for Qwen3.5-0.8B and the 0.16 for LFM2-1.2B.
+fn recurrent_state_per_layer(g: &Gguf) -> Option<u64> {
+    let key = |k: &str| g.arch_u64(k).map(u128::from);
+    let values = match key("shortconv.l_cache") {
+        // LFM2: short convolutions over the last `l_cache` tokens, no SSM state.
+        Some(l) => l.saturating_sub(1).saturating_mul(key("embedding_length")?),
+        None => {
+            let inner = key("ssm.inner_size")?;
+            let state = key("ssm.state_size")?;
+            let conv = key("ssm.conv_kernel").unwrap_or(0).saturating_sub(1);
+            let groups = key("ssm.group_count").unwrap_or(0);
+            let conv_width = inner.saturating_add(groups.saturating_mul(state).saturating_mul(2));
+            conv.saturating_mul(conv_width)
+                .saturating_add(state.saturating_mul(inner))
+        }
+    };
+    u64::try_from(values.saturating_mul(4)).ok()
 }
 
 impl Gguf {
@@ -1137,6 +1164,56 @@ mod tests {
         let (traffic, moe) = token_traffic(&shape_of(t, facts));
         assert!(moe.is_some());
         assert_eq!((traffic.expert_bytes, traffic.trunk_bytes), (100, 50));
+    }
+
+    /// A GGUF header holding only `general.architecture` and the given u32 keys.
+    fn gguf_with(arch: &str, keys: &[(&str, u32)]) -> Gguf {
+        let mut b = Vec::new();
+        b.extend_from_slice(b"GGUF");
+        b.extend_from_slice(&3u32.to_le_bytes());
+        b.extend_from_slice(&0u64.to_le_bytes());
+        b.extend_from_slice(&(keys.len() as u64 + 1).to_le_bytes());
+        let key = |b: &mut Vec<u8>, k: &str| {
+            b.extend_from_slice(&(k.len() as u64).to_le_bytes());
+            b.extend_from_slice(k.as_bytes());
+        };
+        key(&mut b, "general.architecture");
+        b.extend_from_slice(&8u32.to_le_bytes());
+        key(&mut b, arch);
+        for (k, v) in keys {
+            key(&mut b, &format!("{arch}.{k}"));
+            b.extend_from_slice(&4u32.to_le_bytes());
+            b.extend_from_slice(&v.to_le_bytes());
+        }
+        Gguf::parse(std::io::Cursor::new(b)).expect("parse")
+    }
+
+    #[test]
+    fn recurrent_state_is_read_from_the_ssm_keys_llama_cpp_uses() {
+        // Qwen3.5-0.8B: llama.cpp allocates S 18.00 + R 1.27 MiB over 18 linear layers.
+        let g = gguf_with(
+            "qwen35",
+            &[
+                ("ssm.state_size", 128),
+                ("ssm.inner_size", 2048),
+                ("ssm.conv_kernel", 4),
+                ("ssm.group_count", 16),
+            ],
+        );
+        let per_layer = gguf_facts(&g).recurrent_state_per_layer.expect("stated");
+        assert_eq!(per_layer, 128 * 2048 * 4 + 3 * (2048 + 2 * 16 * 128) * 4);
+
+        // LFM2's short convolutions keep only a rolling window: 0.16 MiB over 10 layers.
+        let g = gguf_with(
+            "lfm2",
+            &[("shortconv.l_cache", 3), ("embedding_length", 2048)],
+        );
+        assert_eq!(gguf_facts(&g).recurrent_state_per_layer, Some(2 * 2048 * 4));
+
+        assert_eq!(
+            gguf_facts(&gguf_with("llama", &[])).recurrent_state_per_layer,
+            None
+        );
     }
 
     #[test]

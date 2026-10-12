@@ -1042,6 +1042,7 @@ fn cmd_inspect(src: &Source, list_tensors: bool, json: bool) -> Result<()> {
                 "recurrent_layers": k.recurrent_layers,
                 "window": k.window,
                 "train_context": k.train_context,
+                "recurrent_state_bytes": k.state_bytes,
                 "bytes_at_4096_f16": k.bytes_at(4096, model::KV_F16_BYTES),
             })
         });
@@ -1193,10 +1194,18 @@ fn cmd_inspect(src: &Source, list_tensors: bool, json: bool) -> Result<()> {
     // 64x and the cache scales linearly between them.
     match model::infer_kv_shape(&shape) {
         // Mamba, RWKV: every layer recurrent. Zero is the answer, not an unknown.
-        Some(kv) if kv.layers == 0 => println!(
-            "\nkv cache         none: all {} layers are recurrent, with a fixed-size state",
-            kv.recurrent_layers
-        ),
+        Some(kv) if kv.layers == 0 => {
+            println!(
+                "\nkv cache         none: all {} layers are recurrent, with a fixed-size state",
+                kv.recurrent_layers
+            );
+            if kv.state_bytes > 0 {
+                println!(
+                    "  recurrent state  {:.1} MiB f32",
+                    kv.state_bytes as f64 / 1_048_576.0
+                );
+            }
+        }
         Some(kv) => {
             println!("\nkv cache");
             println!("  layers           {}", kv.layers);
@@ -1215,6 +1224,12 @@ fn cmd_inspect(src: &Source, list_tensors: bool, json: bool) -> Result<()> {
                     parts.push(format!("{} linear, no KV", kv.recurrent_layers));
                 }
                 println!("  attention        {}", parts.join(" / "));
+            }
+            if kv.state_bytes > 0 {
+                println!(
+                    "  recurrent state  {:.1} MiB f32, fixed",
+                    kv.state_bytes as f64 / 1_048_576.0
+                );
             }
             println!("  kv heads         {}", kv.kv_heads);
             println!("  head dim         {}", kv.head_dim);
