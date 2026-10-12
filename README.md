@@ -308,7 +308,7 @@ Early, and honest about it.
   implementation per OS behind one seam, so nothing outside `sift_core::platform` carries a
   `cfg`, and all four run the full test suite in CI. In a container, the cgroup memory
   limit is what `fits` is measured against, not the host's RAM.
-- 272 tests on macOS and 284 on Linux, where the Linux platform tests run too; Windows runs
+- 286 tests on macOS and 298 on Linux, where the Linux platform tests run too; Windows runs
   its own platform tests in CI. Clippy clean on all four, and the declared Rust 1.85 is
   checked in CI.
 
