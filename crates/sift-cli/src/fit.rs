@@ -42,6 +42,8 @@ pub struct Candidate {
     pub kv_bytes: u64,
     /// Files this quantization ships as. 1 for the ordinary case.
     pub shard_count: u32,
+    /// Tensors of a dtype this build cannot size, left out of `bits_per_weight`.
+    pub dropped_tensors: u64,
     /// Weight format, carried per candidate rather than assumed for the repo.
     ///
     /// The engine recommendation depends on it: mlx-lm reads safetensors and llama.cpp does
@@ -470,6 +472,7 @@ fn build(
         label,
         download_arg,
         shard_count: shape.shard_count,
+        dropped_tensors: shape.dropped_tensors,
         size_bytes: size,
         traffic,
         regime,
@@ -517,6 +520,7 @@ pub fn report_json(
                 "bytes_per_token": c.traffic.total(),
                 "is_moe": c.is_moe,
                 "shard_count": c.shard_count,
+                "dropped_tensors": c.dropped_tensors,
                 // Null rather than 0 when disk-bound: a consumer that plots this must not
                 // read "we did not estimate" as "zero tokens per second".
                 "estimated_tokens_per_sec": (!c.est_tok_s.is_nan()).then_some(c.est_tok_s),
@@ -612,6 +616,9 @@ pub fn report(
         }
         if !c.meets_quality_floor() {
             notes.push("damaged".to_string());
+        }
+        if c.dropped_tensors > 0 {
+            notes.push(format!("{} unsized tensors", c.dropped_tensors));
         }
 
         println!(
@@ -727,6 +734,7 @@ mod tests {
             // accounted for in whatever the caller passed.
             kv_bytes: 0,
             shard_count: 1,
+            dropped_tensors: 0,
             format: Format::Gguf,
         }
     }

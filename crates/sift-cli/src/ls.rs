@@ -184,6 +184,8 @@ pub struct Row {
     pub bits_per_weight: Option<f64>,
     pub is_moe: bool,
     pub bytes_per_token: u64,
+    /// Tensors of a dtype this build cannot size, left out of `bits_per_weight`.
+    pub dropped_tensors: u64,
     /// `None` when the model does not fit, where memory bandwidth no longer sets the pace.
     pub est_tok_s: Option<f64>,
     /// Set when the header could not be read, so the row still appears rather than
@@ -258,6 +260,7 @@ pub fn evaluate(
                 bits_per_weight: shape.bits_per_weight(),
                 is_moe,
                 bytes_per_token: traffic.total(),
+                dropped_tensors: shape.dropped_tensors,
                 est_tok_s: match regime {
                     Regime::Fits | Regime::Tight => {
                         Some(traffic.tokens_per_sec(mem_bytes_per_sec * efficiency, 0.0))
@@ -277,6 +280,7 @@ fn errored(model: LocalModel, why: String) -> Row {
         bits_per_weight: None,
         is_moe: false,
         bytes_per_token: 0,
+        dropped_tensors: 0,
         est_tok_s: None,
         error: Some(why),
     }
@@ -297,6 +301,7 @@ pub fn report(rows: &[Row], context_tokens: u64, json: bool) -> Result<()> {
                     "bits_per_weight": r.bits_per_weight,
                     "is_moe": r.is_moe,
                     "bytes_per_token": r.bytes_per_token,
+                    "dropped_tensors": r.dropped_tensors,
                     "estimated_tokens_per_sec": r.est_tok_s,
                     "error": r.error,
                 })
@@ -352,7 +357,15 @@ pub fn report(rows: &[Row], context_tokens: u64, json: bool) -> Result<()> {
                 Some(t) => format!("{t:.0}"),
                 None => "disk-bound".into(),
             },
-            if r.is_moe { "moe" } else { "dense" },
+            if r.dropped_tensors > 0 {
+                format!(
+                    "{}, {} unsized tensors",
+                    if r.is_moe { "moe" } else { "dense" },
+                    r.dropped_tensors
+                )
+            } else {
+                (if r.is_moe { "moe" } else { "dense" }).to_string()
+            },
         );
     }
 

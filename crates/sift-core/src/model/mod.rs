@@ -38,6 +38,11 @@ pub struct ModelShape {
     tensors: Vec<TensorEntry>,
     /// Files this model is stored in. 1 for the ordinary case.
     pub shard_count: u32,
+    /// Tensors left out of every total because their dtype could not be sized.
+    ///
+    /// Nonzero means the size, parameter count and bits per weight all describe less than
+    /// the whole file, and callers say so rather than presenting them as complete.
+    pub dropped_tensors: u64,
 }
 
 /// One tensor, reduced to what analysis needs.
@@ -84,26 +89,34 @@ impl ModelShape {
             facts,
             tensors,
             shard_count,
+            dropped_tensors: 0,
         }
     }
 
     /// View a single-file GGUF model.
     pub fn single(g: &Gguf) -> Self {
-        Self::new(gguf_facts(g), gguf_entries(g), 1)
+        Self {
+            dropped_tensors: unsized_tensors(g),
+            ..Self::new(gguf_facts(g), gguf_entries(g), 1)
+        }
     }
 
     /// Merge the parts of a split GGUF model, in shard order.
     ///
-    /// Facts come from the first part: every shard repeats the architecture keys, and the
-    /// first is the one whose presence is guaranteed. Returns `None` for an empty slice,
-    /// since a model with no parts has no shape.
+    /// Facts come from the first part, because only the first part carries them:
+    /// `llama-gguf-split` writes the full metadata into split 0 and little more than the
+    /// `split.*` keys into the rest. Returns `None` for an empty slice, since a model with
+    /// no parts has no shape.
     pub fn sharded(parts: &[Gguf]) -> Option<Self> {
         let first = parts.first()?;
-        Some(Self::new(
-            gguf_facts(first),
-            parts.iter().flat_map(gguf_entries).collect(),
-            parts.len() as u32,
-        ))
+        Some(Self {
+            dropped_tensors: parts.iter().map(unsized_tensors).sum(),
+            ..Self::new(
+                gguf_facts(first),
+                parts.iter().flat_map(gguf_entries).collect(),
+                parts.len() as u32,
+            )
+        })
     }
 
     /// The model architecture string, e.g. `qwen3moe`.
@@ -158,6 +171,14 @@ fn gguf_entries(g: &Gguf) -> Vec<TensorEntry> {
             })
         })
         .collect()
+}
+
+/// Tensors [`gguf_entries`] had to leave out, counted so the omission is visible.
+fn unsized_tensors(g: &Gguf) -> u64 {
+    g.tensors
+        .iter()
+        .filter(|t| t.size_bytes().is_none())
+        .count() as u64
 }
 
 /// Read the architecture-scoped metadata GGUF stores.

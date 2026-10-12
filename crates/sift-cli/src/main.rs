@@ -854,6 +854,13 @@ fn cmd_inspect(src: &Source, list_tensors: bool, json: bool) -> Result<()> {
         shape.architecture().unwrap_or("unknown")
     );
     println!("  tensors          {}", shape.tensors().len());
+    if shape.dropped_tensors > 0 {
+        println!(
+            "  unsized tensors  {} of a dtype this build does not know — left out of the\n\
+             {:>19}payload, parameter count and bits per weight below",
+            shape.dropped_tensors, ""
+        );
+    }
     println!("  tensor payload   {:.2} GiB", sift_core::gib(payload));
     match fetched {
         // Zero bytes over a remote source means the cached header was revalidated with a

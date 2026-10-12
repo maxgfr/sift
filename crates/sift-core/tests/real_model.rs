@@ -236,3 +236,89 @@ fn per_token_traffic_matches_the_activation_ratio() {
         "a model this dense in activation would not benefit from residency planning"
     );
 }
+
+/// Any GGUF on this machine, MoE or dense, for checks that hold for every model.
+///
+/// `SIFT_TEST_GGUF` first, then the MoE fixture, then the first GGUF blob in an Ollama
+/// library, which most machines that run local models already have.
+fn find_any_gguf() -> Option<PathBuf> {
+    if let Some(p) = std::env::var_os("SIFT_TEST_GGUF") {
+        let p = PathBuf::from(p);
+        return p.exists().then_some(p);
+    }
+    if let Some(p) = find_model() {
+        return Some(p);
+    }
+    let home = std::env::var_os("HOME")?;
+    let blobs = PathBuf::from(home).join(".ollama/models/blobs");
+    let mut paths: Vec<PathBuf> = std::fs::read_dir(blobs)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .collect();
+    paths.sort();
+    paths.into_iter().find(|p| {
+        use std::io::Read;
+        let mut magic = [0u8; 4];
+        std::fs::File::open(p)
+            .and_then(|mut f| f.read_exact(&mut magic))
+            .is_ok()
+            && &magic == b"GGUF"
+    })
+}
+
+#[test]
+fn tensor_sizes_tile_the_data_region_exactly() {
+    // The block table is only right if every tensor ends exactly where the next begins
+    // (after alignment padding) and the last one ends at the end of the file. A block size
+    // two bytes short — Q2_K was once written as 82 instead of 84 — fails here on the first
+    // tensor of that type, where every unit test built from the same table would pass.
+    let Some(path) = find_any_gguf() else {
+        eprintln!("skipping: no GGUF (set SIFT_TEST_GGUF to a .gguf path)");
+        return;
+    };
+    let g = Gguf::open(&path).expect("parse");
+    let file_bytes = std::fs::metadata(&path).expect("stat").len();
+    let align = g
+        .metadata
+        .get("general.alignment")
+        .and_then(model::Value::as_u64)
+        .unwrap_or(32);
+
+    let mut tensors: Vec<_> = g.tensors.iter().collect();
+    tensors.sort_by_key(|t| t.rel_offset);
+    for pair in tensors.windows(2) {
+        let (a, b) = (pair[0], pair[1]);
+        let size = a.size_bytes().unwrap_or_else(|| {
+            panic!(
+                "{} has dtype {} this build cannot size",
+                a.name,
+                a.dtype.name()
+            )
+        });
+        let end = (a.rel_offset + size).div_ceil(align) * align;
+        assert_eq!(
+            end,
+            b.rel_offset,
+            "{} ({}, {:?}) should end where {} begins",
+            a.name,
+            a.dtype.name(),
+            a.dims,
+            b.name
+        );
+    }
+    let last = tensors.last().expect("a tensor");
+    let end = g.absolute_offset(last) + last.size_bytes().expect("sized");
+    assert!(end <= file_bytes, "{} ends past the file", last.name);
+    assert!(
+        file_bytes - end < align,
+        "{} ends {} bytes before the end of the file",
+        last.name,
+        file_bytes - end
+    );
+    // And the layout itself: every tensor a whole number of blocks.
+    for t in &g.tensors {
+        let l = t.dtype.block_layout().expect("known dtype");
+        assert_eq!(t.n_elems() % l.elems, 0, "{} is not whole blocks", t.name);
+    }
+}
