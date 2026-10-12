@@ -365,6 +365,7 @@ fn cmd_fit(reference: &str, context_tokens: u64, json: bool) -> Result<()> {
         source::RepoRef::Repo { repo, quant } => (
             fit::Target {
                 repo,
+                quant: quant.as_deref(),
                 ..Default::default()
             },
             quant.as_deref(),
@@ -374,6 +375,7 @@ fn cmd_fit(reference: &str, context_tokens: u64, json: bool) -> Result<()> {
                 repo: &f.repo,
                 revision: Some(&f.revision),
                 only: Some(&f.path),
+                quant: None,
             },
             None,
         ),
@@ -395,10 +397,10 @@ fn cmd_fit(reference: &str, context_tokens: u64, json: bool) -> Result<()> {
     let usable = usable_ram(&facts);
     // Read bandwidth, not copy: decode streams weights in and writes back a small
     // activation, so a copy benchmark measures the wrong access pattern. Fewer iterations
-    // than `doctor` uses — this is one input among many and the user is waiting on network
-    // round-trips anyway.
-    let mem = doctor::measure_read_bandwidth(doctor::BANDWIDTH_BUF_BYTES, 3)
-        .context("measuring memory bandwidth")?;
+    // than `doctor` uses — this is one input among many — and measured on its own thread
+    // while the sweep waits on the network, instead of before it.
+    let bandwidth =
+        std::thread::spawn(|| doctor::measure_read_bandwidth(doctor::BANDWIDTH_BUF_BYTES, 3));
     let installed = sift_core::engine::detect_installed();
 
     // Progress chatter goes to stderr under --json, so stdout stays a single parseable
@@ -406,17 +408,29 @@ fn cmd_fit(reference: &str, context_tokens: u64, json: bool) -> Result<()> {
     if json {
         eprintln!("reading headers from {repo} without downloading…");
     } else {
+        println!("reading headers from {repo} without downloading…");
+    }
+    let swept = fit::sweep(target);
+    let mem = bandwidth
+        .join()
+        .map_err(|_| anyhow::anyhow!("the bandwidth probe panicked"))?
+        .context("measuring memory bandwidth")?;
+    let swept = swept?;
+    if !json {
         println!(
-            "machine: {}, {:.1} GiB RAM, {:.1} GiB usable, {:.0} GB/s memory",
+            "machine: {}, {:.1} GiB RAM, {:.1} GiB usable{}, {:.0} GB/s memory",
             facts.model.as_deref().unwrap_or("unknown"),
             sift_core::gib(facts.ram_bytes),
             sift_core::gib(usable),
+            if facts.accel_memory.is_estimate() {
+                " (estimate)"
+            } else {
+                ""
+            },
             mem.gb_per_sec
         );
-        println!("reading headers from {repo} without downloading…");
     }
-
-    let cands = fit::evaluate(target, mem.gb_per_sec * 1e9, usable, context_tokens)?;
+    let cands = fit::score(swept, mem.gb_per_sec * 1e9, usable, context_tokens);
     // The same answer, and the same exit code, whether or not --json was asked for.
     if cands.is_empty() {
         anyhow::bail!("no readable weight files in `{repo}`");

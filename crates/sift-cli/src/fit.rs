@@ -182,18 +182,52 @@ pub struct Target<'a> {
     pub revision: Option<&'a str>,
     /// Evaluate only the model stored at this path, or the split set it belongs to.
     pub only: Option<&'a str>,
+    /// Evaluate only the quantizations this selects. See [`narrow`].
+    pub quant: Option<&'a str>,
 }
 
-/// Evaluate every quantization a repo offers, at a given context length.
-pub fn evaluate(
-    target: Target,
-    mem_bytes_per_sec: f64,
-    usable_ram: u64,
-    context_tokens: u64,
-) -> Result<Vec<Candidate>> {
+/// A quantization whose headers have been read, waiting to be scored against a machine.
+pub struct Swept {
+    label: String,
+    path: String,
+    download_arg: String,
+    size: u64,
+    shape: model::ModelShape,
+    format: Format,
+}
+
+/// One model to read: a single file, or every part of a split set.
+struct Unit {
+    label: String,
+    path: String,
+    download_arg: String,
+    size: Option<u64>,
+    parts: Vec<String>,
+}
+
+/// A parsed header, of whichever format the part is in.
+enum Header {
+    Gguf(model::Gguf),
+    Safetensors(model::Safetensors),
+}
+
+/// Read every quantization a repo offers, without downloading any of it.
+///
+/// Network-bound from end to end, so it is built to overlap: the repo's `config.json` is
+/// fetched while the listing is, and every *part* of every model is its own unit of work.
+/// One unit per model left a 2-part BF16 set — or DeepSeek-V3's 163 shards — on a single
+/// worker while the other seven sat idle.
+pub fn sweep(target: Target) -> Result<Vec<Swept>> {
     let repo = target.repo;
-    let listing = hub::list_weights(repo, target.revision)?;
-    // Pin every later fetch to the commit the listing describes.
+    // The config is fetched at the revision asked for, alongside the listing rather than
+    // after it: a safetensors repo needs it, and it costs one small request either way.
+    let (listing, config) = std::thread::scope(|scope| {
+        let config = scope.spawn(|| hub::fetch_config(repo, target.revision.unwrap_or("main")));
+        let listing = hub::list_weights(repo, target.revision);
+        (listing, config.join().ok().flatten().map(|(cfg, _)| cfg))
+    });
+    let listing = listing?;
+    // Pin every header fetch to the commit the listing describes.
     let revision = listing.revision(target.revision).to_string();
     let mut files = listing.files;
     if let Some(only) = target.only {
@@ -205,60 +239,128 @@ pub fn evaluate(
         }
     }
     let (whole, sets) = hub::group_shards(&files);
+    // Only safetensors keeps its architecture numbers in `config.json`; a GGUF carries its
+    // own, and a stray config beside it must not override them.
+    let config = config.filter(|_| {
+        files.iter().any(|f| f.is_safetensors()) || sets.iter().any(|s| s.base.is_safetensors())
+    });
 
-    // Safetensors keeps its architecture numbers in a separate `config.json`, so fetch it
-    // once for the whole repo rather than per candidate. `None` means the KV cache cannot
-    // be sized and `fits` covers weights only — reported, not assumed away.
-    let config = if files.iter().any(|f| f.is_safetensors())
-        || sets.iter().any(|s| s.base.is_safetensors())
-    {
-        hub::fetch_config(repo, &revision).map(|(cfg, _)| cfg)
-    } else {
-        None
-    };
-
-    // Everything to evaluate, as one list, so the workers below need no per-kind logic.
-    let work: Vec<Work> = whole
+    let mut units: Vec<Unit> = whole
         .iter()
-        .map(Work::Whole)
-        .chain(sets.iter().map(Work::Split))
+        .map(|f| Unit {
+            label: f.quant_label(),
+            path: f.path.clone(),
+            download_arg: f.path.clone(),
+            size: f.size,
+            parts: vec![f.path.clone()],
+        })
+        .collect();
+    for set in &sets {
+        if !set.is_complete() {
+            eprintln!(
+                "  skipped {}: the repo does not hold all {} parts of it",
+                set.base.quant_label(),
+                set.expected
+            );
+            continue;
+        }
+        // Every part, not just the first. Each shard carries only its own slice of the
+        // tensor directory, so asking part 1 for the model's size or expert layout gives
+        // an answer that is confidently a third of the truth.
+        units.push(Unit {
+            label: set.base.quant_label(),
+            path: set.base.path.clone(),
+            download_arg: shard_glob(&set.base.path),
+            size: set.size(),
+            parts: set.parts.iter().map(|p| p.path.clone()).collect(),
+        });
+    }
+
+    // `repo:QUANT` narrows before a single header is read: the labels come from file
+    // names, and reading 25 headers to show one row was most of the time `fit` took.
+    if let Some(q) = target.quant {
+        let labels: Vec<&str> = units.iter().map(|u| u.label.as_str()).collect();
+        let keep = matching(&labels, q)?;
+        let mut keep = keep.into_iter();
+        units.retain(|_| keep.next().unwrap_or(false));
+    }
+
+    let jobs: Vec<(usize, usize)> = units
+        .iter()
+        .enumerate()
+        .flat_map(|(u, unit)| (0..unit.parts.len()).map(move |p| (u, p)))
+        .collect();
+    let slots: Vec<Vec<std::sync::OnceLock<Result<Header>>>> = units
+        .iter()
+        .map(|u| u.parts.iter().map(|_| std::sync::OnceLock::new()).collect())
         .collect();
 
-    // The sweep is entirely network-bound — 25 quantizations meant 25 serial round-trips,
-    // and a fully split repo like Qwen3-235B is 72 of them. Threads spend their lives
-    // blocked on a socket, so the useful count is set by politeness to the hub rather than
-    // by cores; 8 is enough to hide latency without looking like a scraper.
-    let workers = work.len().clamp(1, 8);
-
-    let queue = std::sync::Mutex::new(work.into_iter());
-    let out = std::sync::Mutex::new(Vec::new());
-
+    // Threads spend their lives blocked on a socket, so the useful count is set by
+    // politeness to the hub rather than by cores; 8 hides latency without looking like a
+    // scraper.
+    let workers = jobs.len().clamp(1, 8);
+    let queue = std::sync::Mutex::new(jobs.into_iter());
     std::thread::scope(|scope| {
         for _ in 0..workers {
             scope.spawn(|| loop {
-                let Some(item) = queue.lock().expect("queue lock").next() else {
+                let Some((u, p)) = queue.lock().expect("queue lock").next() else {
                     return;
                 };
-                if let Some(c) = evaluate_one(
-                    repo,
-                    &revision,
-                    &item,
-                    config.as_ref(),
-                    mem_bytes_per_sec,
-                    usable_ram,
-                    context_tokens,
-                ) {
-                    out.lock().expect("results lock").push(c);
-                }
+                let header = read_part(repo, &revision, &units[u].parts[p], p);
+                let _ = slots[u][p].set(header);
             });
         }
     });
 
-    let mut out = out.into_inner().expect("results lock");
-    // Sort here rather than relying on arrival order, which is now nondeterministic.
+    let mut out = Vec::with_capacity(units.len());
+    for (unit, parts) in units.into_iter().zip(slots) {
+        match assemble(parts, config.as_ref()) {
+            Ok(shape) if is_projector(&shape) => {
+                eprintln!(
+                    "  skipped {}: a vision or audio projector, not a model",
+                    unit.path
+                )
+            }
+            Ok(shape) => out.push(Swept {
+                size: unit.size.unwrap_or_else(|| shape.total_tensor_bytes()),
+                format: engine::format_of(&unit.path, config.as_ref()),
+                label: unit.label,
+                path: unit.path,
+                download_arg: unit.download_arg,
+                shape,
+            }),
+            Err(e) => eprintln!("  skipped {}: {e:#}", unit.label),
+        }
+    }
+    Ok(out)
+}
+
+/// Score swept quantizations against this machine, at a given context length.
+pub fn score(
+    swept: Vec<Swept>,
+    mem_bytes_per_sec: f64,
+    usable_ram: u64,
+    context_tokens: u64,
+) -> Vec<Candidate> {
+    let mut out: Vec<Candidate> = swept
+        .into_iter()
+        .map(|s| {
+            build(
+                s.label,
+                s.path,
+                s.download_arg,
+                s.size,
+                &s.shape,
+                s.format,
+                mem_bytes_per_sec,
+                usable_ram,
+                context_tokens,
+            )
+        })
+        .collect();
     out.sort_by_key(|c| c.size_bytes);
     disambiguate(&mut out);
-    Ok(out)
+    out
 }
 
 /// Give every row a label of its own.
@@ -285,97 +387,49 @@ fn disambiguate(cands: &mut [Candidate]) {
     }
 }
 
-/// One unit of work for the sweep.
-enum Work<'a> {
-    Whole(&'a hub::RepoFile),
-    Split(&'a hub::ShardSet),
+/// Read one part's header. Payload is never fetched.
+///
+/// Both formats are read the same way — a few kilobytes of range requests — but sized
+/// differently up front: a safetensors header is 8 bytes of length and then exactly the
+/// header, and only the first part of a split GGUF carries the tokenizer.
+fn read_part(repo: &str, revision: &str, path: &str, index: usize) -> Result<Header> {
+    let url = hf_url_at(repo, revision, path);
+    if path.ends_with(".safetensors") {
+        let mut remote = RemoteFile::new(url).with_initial_fetch(8);
+        let st =
+            model::Safetensors::parse(&mut remote).with_context(|| format!("reading {path}"))?;
+        remote.persist();
+        return Ok(Header::Safetensors(st));
+    }
+    let mut remote = RemoteFile::new(url);
+    if index > 0 {
+        remote = remote.with_initial_fetch(64 << 10);
+    }
+    let g = model::Gguf::parse(&mut remote).with_context(|| format!("reading {path}"))?;
+    remote.persist();
+    Ok(Header::Gguf(g))
 }
 
-/// Evaluate one quantization, whether it ships as one file or several.
+/// Merge one model's parts, in order, into its shape.
 ///
-/// Returns `None` when the headers could not be read, having said why on stderr. A wrong
-/// row in this table is worse than a missing one, so nothing is guessed at.
-fn evaluate_one(
-    repo: &str,
-    revision: &str,
-    item: &Work,
+/// GGUF carries its architecture numbers in its own first part; safetensors in the repo's
+/// `config.json`, fetched once for the whole sweep.
+fn assemble(
+    parts: Vec<std::sync::OnceLock<Result<Header>>>,
     config: Option<&serde_json::Value>,
-    mem_bytes_per_sec: f64,
-    usable_ram: u64,
-    context_tokens: u64,
-) -> Option<Candidate> {
-    match item {
-        Work::Whole(f) => {
-            let shape = match read_shape(repo, revision, std::slice::from_ref(&f.path), config) {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("  skipped {}: {e:#}", f.quant_label());
-                    return None;
-                }
-            };
-            if is_projector(&shape) {
-                eprintln!(
-                    "  skipped {}: a vision or audio projector, not a model",
-                    f.path
-                );
-                return None;
-            }
-            let size = f.size.unwrap_or_else(|| shape.total_tensor_bytes());
-            Some(build(
-                f.quant_label(),
-                f.path.clone(),
-                f.path.clone(),
-                size,
-                &shape,
-                engine::format_of(&f.path, config),
-                mem_bytes_per_sec,
-                usable_ram,
-                context_tokens,
-            ))
-        }
-        Work::Split(set) => {
-            if !set.is_complete() {
-                eprintln!(
-                    "  skipped {}: {} of {} shards present in the repo",
-                    set.base.quant_label(),
-                    set.parts.len(),
-                    set.expected
-                );
-                return None;
-            }
-
-            // Read every part, not just the first. Each shard carries only its own slice
-            // of the tensor directory, so asking part 1 for the model's size or expert
-            // layout gives an answer that is confidently a third of the truth.
-            let paths: Vec<String> = set.parts.iter().map(|p| p.path.clone()).collect();
-            let shape = match read_shape(repo, revision, &paths, config) {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("  skipped {}: {e:#}", set.base.quant_label());
-                    return None;
-                }
-            };
-            if is_projector(&shape) {
-                eprintln!(
-                    "  skipped {}: a vision or audio projector, not a model",
-                    set.base.path
-                );
-                return None;
-            }
-            let size = set.size().unwrap_or_else(|| shape.total_tensor_bytes());
-            Some(build(
-                set.base.quant_label(),
-                set.base.path.clone(),
-                shard_glob(&set.base.path),
-                size,
-                &shape,
-                engine::format_of(&set.base.path, config),
-                mem_bytes_per_sec,
-                usable_ram,
-                context_tokens,
-            ))
+) -> Result<model::ModelShape> {
+    let mut ggufs = Vec::new();
+    let mut safetensors = Vec::new();
+    for part in parts {
+        match part.into_inner().context("a part was never read")?? {
+            Header::Gguf(g) => ggufs.push(g),
+            Header::Safetensors(st) => safetensors.push(st),
         }
     }
+    if !safetensors.is_empty() {
+        return Ok(model::safetensors::model_shape(safetensors, config));
+    }
+    model::ModelShape::sharded(&ggufs).context("a model with no parts")
 }
 
 /// Whether a GGUF is a multimodal projector rather than a language model.
@@ -403,49 +457,6 @@ fn shard_glob(base_path: &str) -> String {
     format!("--include \"{base_path}-*\"")
 }
 
-/// Read every part's header and merge them into one shape.
-///
-/// Dispatches on extension. Both formats are read the same way — a few kilobytes of range
-/// requests, no payload — but they carry their architecture numbers in different places:
-/// GGUF in its own header, safetensors in the repo's `config.json`, which the caller has
-/// already fetched once for the whole sweep.
-fn read_shape(
-    repo: &str,
-    revision: &str,
-    paths: &[String],
-    config: Option<&serde_json::Value>,
-) -> Result<model::ModelShape> {
-    let first = paths.first().context("a model with no files")?;
-
-    if first.ends_with(".safetensors") {
-        let mut parts = Vec::with_capacity(paths.len());
-        for p in paths {
-            // Eight bytes of length, then exactly the header: two requests, no slack.
-            let mut remote = RemoteFile::new(hf_url_at(repo, revision, p)).with_initial_fetch(8);
-            parts.push(
-                model::Safetensors::parse(&mut remote).with_context(|| format!("reading {p}"))?,
-            );
-            remote.persist();
-        }
-        return Ok(model::safetensors::model_shape(parts, config));
-    }
-
-    let mut parts = Vec::with_capacity(paths.len());
-    for (i, p) in paths.iter().enumerate() {
-        let mut remote = RemoteFile::new(hf_url_at(repo, revision, p));
-        // Only the first shard of a split model carries the tokenizer; the rest are a
-        // tensor directory and little else.
-        if i > 0 {
-            remote = remote.with_initial_fetch(64 << 10);
-        }
-        parts.push(
-            sift_core::model::Gguf::parse(&mut remote).with_context(|| format!("reading {p}"))?,
-        );
-        remote.persist();
-    }
-    model::ModelShape::sharded(&parts).context("no parts to merge")
-}
-
 /// Keep only the candidates whose quantization matches `quant`.
 ///
 /// `sift fit repo:Q4_K_M` asks a narrower question than `sift fit repo` — does *this* file
@@ -457,36 +468,41 @@ pub fn narrow(cands: Vec<Candidate>, quant: &str) -> Result<Vec<Candidate>> {
     if cands.is_empty() {
         anyhow::bail!("no readable weight files in this repo to match `{quant}` against");
     }
-    let want = quant.to_ascii_uppercase();
-    let exact: Vec<&Candidate> = cands
-        .iter()
-        .filter(|c| c.label.to_ascii_uppercase() == want)
-        .collect();
-    let keep: Vec<bool> = if exact.is_empty() {
-        cands
-            .iter()
-            .map(|c| c.label.to_ascii_uppercase().contains(&want))
-            .collect()
-    } else {
-        cands
-            .iter()
-            .map(|c| c.label.to_ascii_uppercase() == want)
-            .collect()
-    };
-
-    if !keep.iter().any(|&k| k) {
-        let available: Vec<&str> = cands.iter().map(|c| c.label.as_str()).collect();
-        anyhow::bail!(
-            "no quantization matching `{quant}` in this repo. Available: {}",
-            available.join(", ")
-        );
-    }
-
+    let labels: Vec<&str> = cands.iter().map(|c| c.label.as_str()).collect();
+    let keep = matching(&labels, quant)?;
     Ok(cands
         .into_iter()
         .zip(keep)
         .filter_map(|(c, k)| k.then_some(c))
         .collect())
+}
+
+/// Which of `labels` a quantization request selects: the exact label if any matches, else
+/// every label containing it, case-insensitively throughout.
+///
+/// Shared by the sweep, which narrows before reading a single header, and [`narrow`], so
+/// the two cannot select differently.
+fn matching(labels: &[&str], quant: &str) -> Result<Vec<bool>> {
+    let want = quant.to_ascii_uppercase();
+    let exact = labels.iter().any(|l| l.to_ascii_uppercase() == want);
+    let keep: Vec<bool> = labels
+        .iter()
+        .map(|l| {
+            let l = l.to_ascii_uppercase();
+            if exact {
+                l == want
+            } else {
+                l.contains(&want)
+            }
+        })
+        .collect();
+    if !keep.iter().any(|&k| k) {
+        anyhow::bail!(
+            "no quantization matching `{quant}` in this repo. Available: {}",
+            labels.join(", ")
+        );
+    }
+    Ok(keep)
 }
 
 /// Turn a model's shape into an evaluated candidate.
@@ -1101,6 +1117,52 @@ mod calibration_tests {
         for f in [DENSE_EFFICIENCY, MOE_EFFICIENCY] {
             assert!(f > 0.0 && f <= 1.0, "efficiency {f} is not a fraction");
         }
+    }
+}
+
+#[cfg(test)]
+mod sweep_tests {
+    use super::*;
+    use std::sync::OnceLock;
+
+    fn safetensors(name: &str) -> model::Safetensors {
+        let header =
+            format!(r#"{{"{name}":{{"dtype":"BF16","shape":[4,4],"data_offsets":[0,32]}}}}"#);
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend_from_slice(header.as_bytes());
+        model::Safetensors::parse(&mut std::io::Cursor::new(bytes)).expect("parse")
+    }
+
+    fn slot(h: Result<Header>) -> OnceLock<Result<Header>> {
+        let s = OnceLock::new();
+        let _ = s.set(h);
+        s
+    }
+
+    #[test]
+    fn parts_read_separately_merge_into_one_model() {
+        let parts = vec![
+            slot(Ok(Header::Safetensors(safetensors("a.weight")))),
+            slot(Ok(Header::Safetensors(safetensors("b.weight")))),
+        ];
+        let shape = assemble(parts, None).expect("merged");
+        assert_eq!(shape.tensors().len(), 2);
+        assert_eq!(shape.shard_count, 2);
+    }
+
+    #[test]
+    fn one_unreadable_part_makes_the_whole_model_unreadable() {
+        // Two parts of three is a model that cannot load; reporting it would be a row
+        // that is wrong by a third.
+        let parts = vec![
+            slot(Ok(Header::Safetensors(safetensors("a.weight")))),
+            slot(Err(anyhow::anyhow!("HTTP 401"))),
+        ];
+        match assemble(parts, None) {
+            Err(e) => assert!(e.to_string().contains("401"), "{e}"),
+            Ok(_) => panic!("a model with an unreadable part was assembled"),
+        }
+        assert!(assemble(vec![OnceLock::new()], None).is_err(), "never read");
     }
 }
 
