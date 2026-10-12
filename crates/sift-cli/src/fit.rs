@@ -211,13 +211,26 @@ enum Header {
     Safetensors(model::Safetensors),
 }
 
-/// Read every quantization a repo offers, without downloading any of it.
+/// What a repo offers, listed but not yet read.
+pub struct Listed<'a> {
+    repo: &'a str,
+    revision: String,
+    units: Vec<Unit>,
+    config: Option<serde_json::Value>,
+}
+
+/// List a repo and decide what to read, without reading a single header.
 ///
-/// Network-bound from end to end, so it is built to overlap: the repo's `config.json` is
-/// fetched while the listing is, and every *part* of every model is its own unit of work.
-/// One unit per model left a 2-part BF16 set — or DeepSeek-V3's 163 shards — on a single
-/// worker while the other seven sat idle.
-pub fn sweep(target: Target) -> Result<Vec<Swept>> {
+/// Together with [`read`], this reads every quantization a repo offers without
+/// downloading any of it. Both are network-bound and built to overlap: the repo's
+/// `config.json` is fetched while the listing is, and every *part* of every model is its
+/// own unit of work in [`read`]. One unit per model left a 2-part BF16 set — or
+/// DeepSeek-V3's 163 shards — on a single worker while the other seven sat idle.
+///
+/// This half is pure network wait: the listing and `config.json` round-trips. `fit` runs its bandwidth
+/// probe during this phase and not during [`read`], whose header parsing would compete
+/// with the probe for the memory bus and make the machine look slower than it is.
+pub fn list(target: Target) -> Result<Listed> {
     let repo = target.repo;
     // The config is fetched at the revision asked for, alongside the listing rather than
     // after it: a safetensors repo needs it, and it costs one small request either way.
@@ -285,6 +298,22 @@ pub fn sweep(target: Target) -> Result<Vec<Swept>> {
         units.retain(|_| keep.next().unwrap_or(false));
     }
 
+    Ok(Listed {
+        repo,
+        revision,
+        units,
+        config,
+    })
+}
+
+/// Read every listed model's headers, one part per unit of work.
+pub fn read(listed: Listed) -> Result<Vec<Swept>> {
+    let Listed {
+        repo,
+        revision,
+        units,
+        config,
+    } = listed;
     let jobs: Vec<(usize, usize)> = units
         .iter()
         .enumerate()

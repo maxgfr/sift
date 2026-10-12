@@ -398,7 +398,7 @@ fn cmd_fit(reference: &str, context_tokens: u64, json: bool) -> Result<()> {
     // Read bandwidth, not copy: decode streams weights in and writes back a small
     // activation, so a copy benchmark measures the wrong access pattern. Fewer iterations
     // than `doctor` uses — this is one input among many — and measured on its own thread
-    // while the sweep waits on the network, instead of before it.
+    // while the listing waits on the network, instead of before it.
     let bandwidth =
         std::thread::spawn(|| doctor::measure_read_bandwidth(doctor::BANDWIDTH_BUF_BYTES, 3));
     let installed = sift_core::engine::detect_installed();
@@ -410,12 +410,14 @@ fn cmd_fit(reference: &str, context_tokens: u64, json: bool) -> Result<()> {
     } else {
         println!("reading headers from {repo} without downloading…");
     }
-    let swept = fit::sweep(target);
+    // The probe overlaps the listing, which is all network wait, and is finished before
+    // the headers are parsed: parsing on eight threads alongside it read the bus low.
+    let listed = fit::list(target);
     let mem = bandwidth
         .join()
         .map_err(|_| anyhow::anyhow!("the bandwidth probe panicked"))?
         .context("measuring memory bandwidth")?;
-    let swept = swept?;
+    let swept = fit::read(listed?)?;
     if !json {
         println!(
             "machine: {}, {:.1} GiB RAM, {:.1} GiB usable{}, {:.0} GB/s memory",
