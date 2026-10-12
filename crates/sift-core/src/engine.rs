@@ -78,6 +78,11 @@ impl Regime {
     ///
     /// `usable` is not physical RAM: the OS, the window server and the KV cache all take a
     /// share, and on Apple Silicon the GPU wired limit binds first.
+    ///
+    /// Below 80% of usable memory it fits; up to 100% it is tight; past 100% it does not
+    /// fit, full stop. Tight used to stretch to 120%, which put "tight" — and a
+    /// recommendation — on models up to a fifth larger than the memory they were said to
+    /// fit in.
     pub fn classify(model_bytes: u64, usable: u64) -> Self {
         if usable == 0 {
             return Regime::Oversized;
@@ -85,7 +90,7 @@ impl Regime {
         let ratio = model_bytes as f64 / usable as f64;
         if ratio < 0.8 {
             Regime::Fits
-        } else if ratio < 1.2 {
+        } else if ratio <= 1.0 {
             Regime::Tight
         } else {
             Regime::Oversized
@@ -320,21 +325,27 @@ pub fn route(
         .or(suitable.first())
         .map(|e| (*e).clone());
 
+    // One complete sentence per situation. The engine's `sweet_spot` is a clause written
+    // to stand alone in `sift engines`, and spliced into the middle of another sentence it
+    // produced "it only just fits — models that fit; on Apple Silicon … — so expect …".
     let reason = match (&chosen, regime) {
         (None, Regime::Oversized) => format!(
-            "at {:.1} GiB this exceeds what the machine can hold, and no installed engine \
-             streams weights from disk",
+            "at {:.1} GiB it exceeds what this machine can hold, and no known engine streams \
+             this format from disk",
             crate::gib(model_bytes)
         ),
         (None, _) => "no known engine reads this format".to_string(),
-        (Some(e), Regime::Fits) => format!("it fits in memory, and {}", e.sweet_spot),
-        (Some(e), Regime::Tight) => format!(
-            "it only just fits — {} — so expect trouble once the KV cache grows",
-            e.sweet_spot
-        ),
+        (Some(_), Regime::Fits) => {
+            "it fits in memory, with room left for the context to grow".to_string()
+        }
+        (Some(_), Regime::Tight) => {
+            "it only just fits, so a longer context or another application can push it over"
+                .to_string()
+        }
         (Some(e), Regime::Oversized) => format!(
-            "it exceeds memory, and {} is the one that {}",
-            e.name, e.sweet_spot
+            "it exceeds memory, and {} streams weights from disk instead of paging: slow, \
+             but it keeps running",
+            e.name
         ),
     };
 
@@ -375,6 +386,56 @@ mod tests {
         assert_eq!(Regime::classify(5 * GIB, usable), Regime::Fits);
         assert_eq!(Regime::classify(11 * GIB, usable), Regime::Tight);
         assert_eq!(Regime::classify(30 * GIB, usable), Regime::Oversized);
+    }
+
+    #[test]
+    fn regimes_at_the_edges() {
+        // 0.8 and 1.0 are the boundaries: tight starts at 80% and ends at 100% inclusive.
+        let usable = 100 * GIB;
+        let at = |pct: u64| Regime::classify(pct * GIB, usable);
+        assert_eq!(at(79), Regime::Fits);
+        assert_eq!(at(80), Regime::Tight);
+        assert_eq!(at(100), Regime::Tight);
+        assert_eq!(at(101), Regime::Oversized);
+        assert_eq!(at(110), Regime::Oversized);
+    }
+
+    #[test]
+    fn a_model_ten_percent_over_memory_is_not_recommended_in_memory() {
+        // Regression: tight stretched to 1.2x, so this was "tight" and sent to LM Studio.
+        let r = route(
+            110 * GIB,
+            Format::Gguf,
+            100 * GIB,
+            &installed(&["lm-studio", "ollama"]),
+        );
+        assert!(
+            r.engine
+                .as_ref()
+                .is_none_or(|e| e.oversized == Oversized::Streams),
+            "recommended {:?}",
+            r.engine.map(|e| e.id)
+        );
+        let avoid: Vec<&str> = r.avoid.iter().map(|(e, _)| e.id).collect();
+        assert!(avoid.contains(&"lm-studio") && avoid.contains(&"ollama"));
+    }
+
+    #[test]
+    fn every_reason_is_one_readable_sentence() {
+        // The sweet-spot clause used to be spliced into the reason mid-sentence.
+        for gb in [10, 90, 300] {
+            let r = route(
+                gb * GIB,
+                Format::Gguf,
+                100 * GIB,
+                &installed(&["lm-studio"]),
+            );
+            assert!(!r.reason.contains(" — "), "{}", r.reason);
+            assert!(!r.reason.contains(';'), "{}", r.reason);
+            if let Some(e) = &r.engine {
+                assert!(!r.reason.contains(e.sweet_spot), "{}", r.reason);
+            }
+        }
     }
 
     #[test]
