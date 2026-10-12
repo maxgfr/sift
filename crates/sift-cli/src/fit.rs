@@ -940,6 +940,10 @@ pub fn report(
                 if !rec.installed {
                     println!("    not installed: {}", e.install);
                 }
+            } else {
+                // Say why nothing can take over, rather than stopping at "nothing fits":
+                // on Linux a safetensors repo has no engine at all, not just no room.
+                println!("    no engine can take over: {}.", rec.reason);
             }
             for (e, why) in &rec.avoid {
                 println!("    avoid {}: {why}", e.name);
