@@ -236,6 +236,11 @@ pub fn group_models(
             .iter()
             .filter_map(|p| files.iter().find(|f| &f.path == p).cloned())
             .collect();
+        // An index none of whose files exist is a leftover from another conversion, not
+        // a model with every part missing; the files actually there are grouped by name.
+        if found.is_empty() {
+            continue;
+        }
         for p in parts {
             claimed.insert(p.as_str());
         }
@@ -773,6 +778,31 @@ mod shard_tests {
         )];
         let (_, sets) = group_models(&[sized("a.safetensors", 1)], &missing);
         assert!(!sets[0].is_complete());
+    }
+
+    #[test]
+    fn an_index_naming_none_of_the_repos_files_is_stale_and_ignored() {
+        // mlx-community/gemma-3-12b-it-4bit ships two shards and an index left over from
+        // a five-shard conversion. The index describes files that are not there; the
+        // shards it ignores are the model.
+        let files = vec![
+            sized("model-00001-of-00002.safetensors", 4),
+            sized("model-00002-of-00002.safetensors", 4),
+        ];
+        let stale = vec![(
+            "model.safetensors.index.json".to_string(),
+            (1..=5)
+                .map(|i| format!("model-{i:05}-of-00005.safetensors"))
+                .collect(),
+        )];
+        let (_, sets) = group_models(&files, &stale);
+        assert_eq!(
+            sets.len(),
+            1,
+            "only the real model, no phantom incomplete one"
+        );
+        assert!(sets[0].is_complete());
+        assert_eq!(sets[0].parts.len(), 2);
     }
 
     #[test]
