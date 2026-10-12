@@ -689,13 +689,15 @@ mod tests {
         let mut models = collect_weights(d.path(), "LM Studio");
         models.sort_by(|a, b| a.name.cmp(&b.name));
         let names: Vec<&str> = models.iter().map(|m| m.name.as_str()).collect();
-        assert_eq!(
-            names,
-            [
-                "org/Model-GGUF/Model-Q4_K_M.gguf",
-                "org/Model-GGUF/Model-Q8_0.gguf"
-            ]
-        );
+        // Names are paths relative to the library, in the platform's own separator.
+        let rel = |f: &str| {
+            Path::new("org")
+                .join("Model-GGUF")
+                .join(f)
+                .to_string_lossy()
+                .to_string()
+        };
+        assert_eq!(names, [rel("Model-Q4_K_M.gguf"), rel("Model-Q8_0.gguf")]);
         assert_eq!(models[1].paths.len(), 2);
         assert_eq!(models[1].size_bytes, 2);
     }
