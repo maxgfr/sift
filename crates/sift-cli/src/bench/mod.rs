@@ -100,7 +100,7 @@ fn log_path() -> Option<PathBuf> {
 ///
 /// Best effort. A measurement that was taken and printed should not be lost to an error
 /// message about a log file, but a silent failure would be worse — the caller is told.
-pub fn record(runs: &[Run], stamp: &str) -> Result<PathBuf> {
+pub fn record(runs: &[Run], recorded_at: u64) -> Result<PathBuf> {
     use std::io::Write;
 
     let path = log_path().context("HOME is not set, so there is nowhere to record results")?;
@@ -114,7 +114,9 @@ pub fn record(runs: &[Run], stamp: &str) -> Result<PathBuf> {
 
     for r in runs {
         let mut line = serde_json::to_value(r)?;
-        line["recorded_at"] = serde_json::Value::String(stamp.to_string());
+        // Seconds since the epoch, as a number: a string had to be parsed back before two
+        // records could be compared.
+        line["recorded_at"] = serde_json::json!(recorded_at);
         writeln!(f, "{line}")?;
     }
     Ok(path)

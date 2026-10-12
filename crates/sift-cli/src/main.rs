@@ -587,7 +587,7 @@ fn cmd_bench(
                 None => bench::lmstudio::loaded_models(lms_port)?
                     .first()
                     .cloned()
-                    .context("no model is loaded; run `lms load <model>` first")?,
+                    .context("no text model is loaded; run `lms load <model>` first")?,
             };
             (
                 bench::lmstudio::measure(lms_port, &model, prompt, max_tokens, repeats)?,
@@ -597,10 +597,21 @@ fn cmd_bench(
         bench::Target::Ollama => {
             let model = match model {
                 Some(m) => m,
-                None => bench::ollama::local_models(ollama_port)?
-                    .first()
-                    .cloned()
-                    .context("Ollama has no local models; run `ollama pull <model>` first")?,
+                None => match bench::ollama::loaded_models(ollama_port)?.first() {
+                    Some(m) => m.clone(),
+                    None => {
+                        let local = bench::ollama::local_models(ollama_port).unwrap_or_default();
+                        anyhow::bail!(
+                            "no model is loaded in Ollama; load one with `ollama run <model>` or \
+                             pass --model. Pulled here: {}",
+                            if local.is_empty() {
+                                "none".to_string()
+                            } else {
+                                local.join(", ")
+                            }
+                        );
+                    }
+                },
             };
             (
                 bench::ollama::measure(ollama_port, &model, prompt, max_tokens, repeats)?,
@@ -614,7 +625,7 @@ fn cmd_bench(
 
     // Recorded before printing: a measurement that reaches the terminal and not the log is
     // one that cannot replace an estimate later, which is the whole reason to take it.
-    let recorded = bench::record(&runs, &stamp());
+    let recorded = bench::record(&runs, stamp());
 
     if json {
         println!(
@@ -625,29 +636,37 @@ fn cmd_bench(
                 "median_tokens_per_sec": median,
                 "runs": runs,
                 "recorded_to": recorded.as_ref().ok().map(|p| p.display().to_string()),
+                // Why it was not recorded, so a script does not read a null path as success.
+                "recorded_error": recorded.as_ref().err().map(|e| format!("{e:#}")),
             }))?
         );
         return Ok(());
     }
 
     println!("{engine_name}: {}", runs[0].model);
-    println!("  {:>3}  {:>10}  {:>9}", "run", "tok/s", "tokens");
+    println!(
+        "  {:>3}  {:>10}  {:>9}  {:>6}",
+        "run", "tok/s", "tokens", "clock"
+    );
     for (i, r) in runs.iter().enumerate() {
         println!(
-            "  {:>3}  {:>10.2}  {:>9}",
+            "  {:>3}  {:>10.2}  {:>9}  {:>6}",
             i + 1,
             r.tokens_per_sec,
-            r.completion_tokens
+            r.completion_tokens,
+            if r.engine_timed { "engine" } else { "wall" }
         );
     }
     println!(
         "
   median {median:.2} tok/s"
     );
-    if !runs[0].engine_timed {
-        // Say which clock produced the number. LM Studio's API reports no decode duration,
-        // so this includes prompt processing and HTTP overhead and reads slightly low.
-        println!("  wall clock, including prompt processing — this engine reports no decode time");
+    if runs.iter().any(|r| !r.engine_timed) {
+        // Say which clock produced the number. A wall-clock run includes prompt processing
+        // and HTTP overhead and reads slightly low.
+        println!(
+            "  wall-clock runs include prompt processing — the engine reported no decode time"
+        );
     }
     match &recorded {
         Ok(path) => println!("  recorded to {}", path.display()),
@@ -661,11 +680,11 @@ fn cmd_bench(
 /// Derived from the wall clock rather than a date crate: the log needs runs to be
 /// orderable and attributable, and seconds since the epoch does both without adding a
 /// dependency to a binary that otherwise has none at runtime.
-fn stamp() -> String {
-    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
-        Ok(d) => format!("{}", d.as_secs()),
-        Err(_) => "0".to_string(),
-    }
+fn stamp() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 fn cmd_engines(json: bool) -> Result<()> {

@@ -24,48 +24,65 @@ use super::Run;
 pub const DEFAULT_PORT: u16 = 11434;
 
 /// Is the Ollama server reachable?
+///
+/// `--fail`, so a web server that happens to be on the port and answers 404 is not taken
+/// for Ollama.
 pub fn server_is_up(port: u16) -> bool {
     Command::new("curl")
         .args([
-            "-s",
+            "-sS",
+            "--fail",
             "-o",
             "/dev/null",
             "--max-time",
             "2",
             &format!("http://127.0.0.1:{port}/api/tags"),
         ])
-        .status()
-        .map(|s| s.success())
+        .output()
+        .map(|o| o.status.success())
         .unwrap_or(false)
 }
 
-/// Models Ollama has pulled locally.
+/// Models Ollama has loaded right now.
+///
+/// `/api/ps`, not `/api/tags`: the first pulled model is whatever sorts first — on this
+/// machine an embedding model that cannot generate at all — while a loaded one is the
+/// model the user is actually running.
+pub fn loaded_models(port: u16) -> Result<Vec<String>> {
+    Ok(model_names(&get_json(port, "/api/ps")?))
+}
+
+/// Models Ollama has pulled locally, for telling the user what they could load.
 pub fn local_models(port: u16) -> Result<Vec<String>> {
-    let out = Command::new("curl")
-        .args([
-            "-s",
-            "--max-time",
-            "5",
-            &format!("http://127.0.0.1:{port}/api/tags"),
-        ])
-        .output()
-        .context("running curl")?;
+    Ok(model_names(&get_json(port, "/api/tags")?))
+}
 
-    if !out.status.success() {
-        bail!("Ollama did not respond on port {port}; start it with `ollama serve`");
-    }
-
-    let json: serde_json::Value =
-        serde_json::from_slice(&out.stdout).context("parsing /api/tags response")?;
-
-    Ok(json["models"]
+fn model_names(json: &serde_json::Value) -> Vec<String> {
+    json["models"]
         .as_array()
         .map(|arr| {
             arr.iter()
                 .filter_map(|m| m["name"].as_str().map(str::to_owned))
                 .collect()
         })
-        .unwrap_or_default())
+        .unwrap_or_default()
+}
+
+fn get_json(port: u16, path: &str) -> Result<serde_json::Value> {
+    let out = Command::new("curl")
+        .args([
+            "-sS",
+            "--fail",
+            "--max-time",
+            "5",
+            &format!("http://127.0.0.1:{port}{path}"),
+        ])
+        .output()
+        .context("running curl")?;
+    if !out.status.success() {
+        bail!("Ollama did not respond on port {port}; start it with `ollama serve`");
+    }
+    serde_json::from_slice(&out.stdout).with_context(|| format!("parsing {path}"))
 }
 
 /// Send one generation request and measure it.
@@ -83,7 +100,7 @@ pub fn measure_once(port: u16, model: &str, prompt: &str, max_tokens: u32) -> Re
     let started = Instant::now();
     let out = Command::new("curl")
         .args([
-            "-s",
+            "-sS",
             "--max-time",
             "600",
             "-H",
@@ -157,4 +174,16 @@ pub fn measure(
         );
     }
     Ok(runs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn loaded_models_are_read_from_ps() {
+        let ps = serde_json::json!({"models": [{"name": "qwen3:4b", "model": "qwen3:4b"}]});
+        assert_eq!(model_names(&ps), ["qwen3:4b"]);
+        assert!(model_names(&serde_json::json!({"models": []})).is_empty());
+    }
 }
