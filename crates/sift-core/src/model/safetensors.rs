@@ -152,6 +152,7 @@ const TEXT_BLOCKS: [&str; 3] = ["text_config", "llm_config", "language_config"];
 /// - Nemotron-H: `hybrid_override_pattern`, one character per layer, `*` for attention,
 ///   `M` for Mamba 2, `-` for an MLP-only layer.
 /// - Jamba: one attention layer every `attn_layer_period`, at `attn_layer_offset`.
+/// - Kimi Linear: `linear_attn_config.full_attn_layers`, counted from 1.
 fn hybrid_layer_kinds<'a>(
     get: &impl Fn(&str) -> Option<&'a serde_json::Value>,
     n: u64,
@@ -167,6 +168,12 @@ fn hybrid_layer_kinds<'a>(
         let attends: std::collections::HashSet<u64> =
             idxs.iter().filter_map(serde_json::Value::as_u64).collect();
         return Some((0..n).map(|i| kind(attends.contains(&i))).collect());
+    }
+    // Kimi Linear numbers its attention layers from 1.
+    if let Some(full) = get("linear_attn_config").and_then(|c| c["full_attn_layers"].as_array()) {
+        let attends: std::collections::HashSet<u64> =
+            full.iter().filter_map(serde_json::Value::as_u64).collect();
+        return Some((0..n).map(|i| kind(attends.contains(&(i + 1)))).collect());
     }
     if let Some(pattern) = get("hybrid_override_pattern").and_then(|v| v.as_str()) {
         if pattern.chars().count() as u64 == n {
@@ -658,6 +665,17 @@ mod tests {
             "attn_layer_period": 8, "attn_layer_offset": 4,
         }));
         assert_eq!((jamba.full_layers, jamba.recurrent_layers), (4, 28));
+
+        // moonshotai/Kimi-Linear: MLA on the layers `linear_attn_config.full_attn_layers`
+        // names, counted from 1 (27 is listed for 27 layers); KDA linear attention on the
+        // rest.
+        let kimi = kv_of(serde_json::json!({
+            "model_type": "kimi_linear", "num_hidden_layers": 27, "num_attention_heads": 32,
+            "kv_lora_rank": 512, "qk_rope_head_dim": 64,
+            "linear_attn_config": {"full_attn_layers": [4, 8, 12, 16, 20, 24, 27]},
+        }));
+        assert_eq!((kimi.full_layers, kimi.recurrent_layers), (7, 20));
+        assert_eq!(kimi.bytes_at(4096, 2), 7 * 576 * 4096 * 2);
     }
 
     #[test]
