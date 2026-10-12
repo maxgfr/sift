@@ -40,6 +40,9 @@ pub struct Loaded {
     pub fetched: Option<Fetched>,
     /// The weight format, which routing depends on.
     pub format: sift_core::engine::Format,
+    /// The parsed GGUF directory, kept so a caller that needs its byte offsets does not
+    /// fetch the header a second time.
+    pub gguf: Option<Gguf>,
 }
 
 /// The `config.json` beside a local safetensors file, if there is one.
@@ -194,6 +197,7 @@ impl Source {
                 shape: g.shape(),
                 fetched: fetched.map(|header| Fetched { header, config: 0 }),
                 format: sift_core::engine::Format::Gguf,
+                gguf: Some(g),
             });
         }
 
@@ -206,9 +210,10 @@ impl Source {
                 (st, local_config(p), None, p.to_string_lossy().to_string())
             }
             Source::Remote { url, repo, .. } => {
-                let mut f = RemoteFile::new(url.clone());
+                let mut f = RemoteFile::new(url.clone()).with_initial_fetch(8);
                 let st = sift_core::model::Safetensors::parse(&mut f)
                     .with_context(|| format!("reading {url}"))?;
+                f.persist();
                 // Counted, but separately from the header: "nothing was downloaded" is a
                 // claim that should include every request made to back it, and a 660-byte
                 // config must not turn a revalidated header into "0.00 MiB of the model
@@ -228,11 +233,12 @@ impl Source {
             shape: sift_core::model::safetensors::model_shape(vec![st], config.as_ref()),
             fetched,
             format: sift_core::engine::format_of(&name, config.as_ref()),
+            gguf: None,
         })
     }
 
     /// Read the model's GGUF tensor directory. Payload is never fetched.
-    pub fn read_gguf(&self) -> Result<(Gguf, Option<u64>)> {
+    fn read_gguf(&self) -> Result<(Gguf, Option<u64>)> {
         match self {
             Source::Local(p) => {
                 let g = Gguf::open(p).with_context(|| format!("reading {}", p.display()))?;
@@ -241,6 +247,7 @@ impl Source {
             Source::Remote { url, .. } => {
                 let mut f = RemoteFile::new(url.clone());
                 let g = Gguf::parse(&mut f).with_context(|| format!("reading {url}"))?;
+                f.persist();
                 Ok((g, Some(f.bytes_fetched())))
             }
         }

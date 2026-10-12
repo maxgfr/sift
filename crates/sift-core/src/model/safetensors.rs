@@ -35,7 +35,7 @@ const MAX_HEADER_BYTES: u64 = 256 << 20;
 /// Errors from reading a safetensors header.
 #[derive(Debug, thiserror::Error)]
 pub enum SafetensorsError {
-    #[error("reading safetensors header: {0}")]
+    #[error(transparent)]
     Io(#[from] io::Error),
     #[error("header claims {0} bytes, which is not a safetensors file")]
     ImplausibleHeader(u64),

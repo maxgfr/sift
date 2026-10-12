@@ -339,20 +339,28 @@ fn read_shape(
     if first.ends_with(".safetensors") {
         let mut parts = Vec::with_capacity(paths.len());
         for p in paths {
-            let mut remote = RemoteFile::new(hf_url(repo, p));
+            // Eight bytes of length, then exactly the header: two requests, no slack.
+            let mut remote = RemoteFile::new(hf_url(repo, p)).with_initial_fetch(8);
             parts.push(
                 model::Safetensors::parse(&mut remote).with_context(|| format!("reading {p}"))?,
             );
+            remote.persist();
         }
         return Ok(model::safetensors::model_shape(parts, config));
     }
 
     let mut parts = Vec::with_capacity(paths.len());
-    for p in paths {
+    for (i, p) in paths.iter().enumerate() {
         let mut remote = RemoteFile::new(hf_url(repo, p));
+        // Only the first shard of a split model carries the tokenizer; the rest are a
+        // tensor directory and little else.
+        if i > 0 {
+            remote = remote.with_initial_fetch(64 << 10);
+        }
         parts.push(
             sift_core::model::Gguf::parse(&mut remote).with_context(|| format!("reading {p}"))?,
         );
+        remote.persist();
     }
     model::ModelShape::sharded(&parts).context("no parts to merge")
 }

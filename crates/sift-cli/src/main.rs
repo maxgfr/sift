@@ -782,16 +782,14 @@ fn cmd_doctor(disk_sample: Option<PathBuf>, json: bool) -> Result<()> {
 }
 
 fn cmd_inspect(src: &Source, list_tensors: bool, json: bool) -> Result<()> {
+    // GGUF carries a format version and per-tensor dtypes that safetensors does not, so
+    // those lines appear only where they exist rather than being filled with a placeholder.
     let source::Loaded {
         shape,
         fetched,
         format,
+        gguf,
     } = src.read_shape()?;
-    // GGUF carries a format version and per-tensor dtypes that safetensors does not, so
-    // those lines appear only where they exist rather than being filled with a placeholder.
-    let gguf = (format == sift_core::engine::Format::Gguf)
-        .then(|| src.read_gguf().map(|(g, _)| g))
-        .transpose()?;
 
     // Payload size is authoritative for remote files: the server's Content-Length covers
     // the whole file, but only the directory was read.

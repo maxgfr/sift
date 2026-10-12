@@ -127,7 +127,7 @@ pub struct Gguf {
 /// Errors that can arise reading a GGUF directory.
 #[derive(Debug, thiserror::Error)]
 pub enum GgufError {
-    #[error("io error: {0}")]
+    #[error(transparent)]
     Io(#[from] io::Error),
     #[error("not a GGUF file: magic was {0:#010x}, expected {MAGIC:#010x}")]
     BadMagic(u32),
