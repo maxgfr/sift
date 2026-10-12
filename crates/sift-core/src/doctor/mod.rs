@@ -32,8 +32,11 @@ pub struct DiskSample {
     pub seconds: f64,
     /// Achieved throughput in GB/s (decimal GB, matching how drives are marketed).
     pub gb_per_sec: f64,
-    /// Mean latency per read operation, in milliseconds.
+    /// Mean time one read took, in milliseconds, as a thread waiting on it saw it.
     pub ms_per_read: f64,
+    /// Fraction of the sample file already in the page cache before this measurement,
+    /// where the platform can tell.
+    pub resident_before: Option<f64>,
 }
 
 /// Bandwidth above which a memory measurement is not believable on consumer hardware.
@@ -62,8 +65,18 @@ impl DiskSample {
     /// rather than trusting the caller to remember.
     pub fn looks_cached(&self) -> bool {
         self.gb_per_sec > IMPLAUSIBLE_DISK_GB_S
+            || self
+                .resident_before
+                .is_some_and(|f| f > RESIDENT_SAMPLE_LIMIT)
     }
 }
+
+/// Fraction of a sample file that may already be cached before a disk read stops being a
+/// disk measurement.
+///
+/// The throughput test above catches a fully cached file. This catches the partly cached
+/// one, whose reads are a blend of RAM and SSD and read as a fast, plausible drive.
+pub const RESIDENT_SAMPLE_LIMIT: f64 = 0.10;
 
 /// Memory bandwidth, measured STREAM-style.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -109,7 +122,8 @@ fn align_down(v: u64) -> u64 {
 ///
 /// `path` must point at a file the machine has **not** recently read, otherwise resident
 /// pages turn this into a memory benchmark. [`CachePolicy::Uncached`] prevents new
-/// caching but cannot evict what is already there.
+/// caching but cannot evict what is already there, so the file's residency is checked
+/// first and recorded on the sample.
 ///
 /// Offsets are strided by a large odd multiple of the block size rather than drawn
 /// randomly, which keeps the access pattern scattered without needing an RNG dependency
@@ -120,6 +134,21 @@ pub fn measure_random_read(
     threads: usize,
     reads_per_thread: usize,
 ) -> std::io::Result<DiskSample> {
+    let invalid = |msg: String| std::io::Error::new(std::io::ErrorKind::InvalidInput, msg);
+    if threads == 0 || reads_per_thread == 0 {
+        return Err(invalid(format!(
+            "{threads} threads x {reads_per_thread} reads measures nothing"
+        )));
+    }
+    // Unbuffered reads (O_DIRECT, FILE_FLAG_NO_BUFFERING) refuse a length that is not a
+    // sector multiple, so refuse it here, on every OS, with a message.
+    if block_bytes == 0 || block_bytes as u64 % OFFSET_ALIGN != 0 {
+        return Err(invalid(format!(
+            "block size {block_bytes} is not a multiple of {OFFSET_ALIGN}"
+        )));
+    }
+
+    let resident_before = crate::platform::resident_fraction(path);
     let file = WeightFile::open(path, CachePolicy::Uncached)?;
     let len = file.len();
 
@@ -128,109 +157,101 @@ pub fn measure_random_read(
     // costs an extra I/O — so the sample would describe a pattern nobody asked to measure.
     let span = (len.saturating_sub(block_bytes as u64) / OFFSET_ALIGN) * OFFSET_ALIGN;
     if span == 0 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!(
-                "file is {len} bytes, too small for a {block_bytes}-byte block; \
-                 use a larger sample file"
-            ),
-        ));
+        return Err(invalid(format!(
+            "file is {len} bytes, too small for a {block_bytes}-byte block; \
+             use a larger sample file"
+        )));
     }
 
-    // Spawning threads costs tens of microseconds each. With a small read count that
-    // overhead lands inside the timed region and reports throughput far above what the
-    // hardware can do — 33 GB/s from an NVMe drive, in one observed run. So: spawn every
-    // thread first, hold them at a barrier, and only start the clock once all of them are
-    // ready to issue their first read.
-    let barrier = std::sync::Arc::new(std::sync::Barrier::new(threads + 1));
-    let mut handles = Vec::with_capacity(threads);
+    // Every handle is opened before any thread starts. Opening inside the spawn loop left
+    // the threads already started waiting forever at the barrier when a later open failed.
+    // A handle each, not a shared one: Windows `seek_read` moves the file pointer, so
+    // threads sharing a handle would read each other's offsets.
+    let handles: Vec<WeightFile> = (0..threads)
+        .map(|_| file.try_clone())
+        .collect::<std::io::Result<_>>()?;
 
-    for t in 0..threads {
-        // A handle of its own, not a shared one. Windows `seek_read` moves the file
-        // pointer, so threads sharing a handle would read each other's offsets and report
-        // throughput from a pattern nobody asked for. Opening per thread costs one syscall
-        // and is done before the barrier, so it stays outside the timed region.
-        let file = file.try_clone()?;
-        let barrier = std::sync::Arc::clone(&barrier);
-        handles.push(std::thread::spawn(move || -> std::io::Result<u64> {
-            let mut buf = AlignedBuf::new(block_bytes);
-            let mut read = 0u64;
-            // A large odd stride walks the file without repeating quickly and without
-            // degenerating into a sequential scan the readahead could predict. Each
-            // thread starts a different fraction of the way in so they do not convoy.
-            // Both are rounded to `OFFSET_ALIGN`, which keeps every offset a sector
-            // multiple however odd the caller's block size is.
-            let stride = align_down(block_bytes as u64 * 7 + OFFSET_ALIGN).max(OFFSET_ALIGN);
-            let start = (span / threads.max(1) as u64).wrapping_mul(t as u64) % span;
-            let mut off = align_down(start);
+    // Spawning threads costs tens of microseconds each, so every thread is spawned first,
+    // held at a barrier, and only then starts. Each worker records when its own first
+    // read was issued and its last returned; the sample spans the earliest start to the
+    // latest end. The main thread holds no clock at all — it can be descheduled while the
+    // workers run, and its view of the start is not when the reads began.
+    let barrier = std::sync::Barrier::new(threads);
+    let results: Vec<std::io::Result<(Instant, Instant, u64)>> = std::thread::scope(|scope| {
+        let workers: Vec<_> = handles
+            .into_iter()
+            .enumerate()
+            .map(|(t, file)| {
+                let barrier = &barrier;
+                scope.spawn(move || -> std::io::Result<(Instant, Instant, u64)> {
+                    let mut buf = AlignedBuf::new(block_bytes);
+                    let mut read = 0u64;
+                    // A large odd stride walks the file without repeating quickly and
+                    // without degenerating into a sequential scan readahead could predict.
+                    // Each thread starts a different fraction of the way in so they do
+                    // not convoy.
+                    let stride =
+                        align_down(block_bytes as u64 * 7 + OFFSET_ALIGN).max(OFFSET_ALIGN);
+                    let start = (span / threads as u64).wrapping_mul(t as u64) % span;
+                    let mut off = align_down(start);
 
-            // Allocation and first-touch of `buf` are done; wait for everyone.
-            barrier.wait();
+                    // Allocation and first-touch of `buf` are done; wait for everyone.
+                    barrier.wait();
+                    let began = Instant::now();
+                    for _ in 0..reads_per_thread {
+                        file.read_at(buf.as_mut_slice(), off)?;
+                        read += block_bytes as u64;
+                        off = (off + stride) % span;
+                    }
+                    Ok((began, Instant::now(), read))
+                })
+            })
+            .collect();
+        workers
+            .into_iter()
+            .map(|w| {
+                w.join()
+                    .unwrap_or_else(|_| Err(std::io::Error::other("reader thread panicked")))
+            })
+            .collect()
+    });
 
-            for _ in 0..reads_per_thread {
-                file.read_at(buf.as_mut_slice(), off)?;
-                read += block_bytes as u64;
-                off = (off + stride) % span;
-            }
-            Ok(read)
-        }));
-    }
-
-    barrier.wait();
-    let started = Instant::now();
-
+    let mut spans = Vec::with_capacity(threads);
     let mut total_bytes = 0u64;
-    for h in handles {
-        total_bytes += h
-            .join()
-            .map_err(|_| std::io::Error::other("reader thread panicked"))??;
+    for r in results {
+        let (began, ended, bytes) = r?;
+        spans.push((began, ended));
+        total_bytes += bytes;
     }
-
-    let seconds = started.elapsed().as_secs_f64();
-    let ops = (threads * reads_per_thread) as f64;
+    let seconds = wall_seconds(&spans);
     Ok(DiskSample {
         block_bytes,
         threads,
         total_bytes,
         seconds,
         gb_per_sec: total_bytes as f64 / seconds / 1e9,
-        ms_per_read: seconds * 1000.0 / ops,
+        // Each thread issues its reads one after another, so one read takes the whole
+        // span divided by that thread's count — not by every thread's, which would be the
+        // inverse of throughput and shrink as threads were added.
+        ms_per_read: seconds * 1000.0 / reads_per_thread as f64,
+        resident_before,
     })
 }
 
-/// Measure sequential read throughput with a single reader.
-pub fn measure_sequential_read(
-    path: &Path,
-    block_bytes: usize,
-    blocks: usize,
-) -> std::io::Result<DiskSample> {
-    let file = WeightFile::open(path, CachePolicy::Uncached)?;
-    let mut buf = AlignedBuf::new(block_bytes);
-
-    let want = block_bytes as u64 * blocks as u64;
-    if file.len() < want {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("need {want} bytes, file has {}", file.len()),
-        ));
-    }
-
-    let started = Instant::now();
-    let mut off = 0u64;
-    for _ in 0..blocks {
-        file.read_at(buf.as_mut_slice(), off)?;
-        off += block_bytes as u64;
-    }
-    let seconds = started.elapsed().as_secs_f64();
-
-    Ok(DiskSample {
-        block_bytes,
-        threads: 1,
-        total_bytes: want,
-        seconds,
-        gb_per_sec: want as f64 / seconds / 1e9,
-        ms_per_read: seconds * 1000.0 / blocks as f64,
-    })
+/// Seconds from the earliest start to the latest end of a set of worker spans.
+///
+/// That is the wall clock of the parallel region seen from inside it. Any scheduling gap
+/// before a worker starts or after one finishes only widens it, so noise can understate
+/// the machine but never overstate it.
+fn wall_seconds(spans: &[(Instant, Instant)]) -> f64 {
+    let (Some(first), Some(last)) = (
+        spans.iter().map(|s| s.0).min(),
+        spans.iter().map(|s| s.1).max(),
+    ) else {
+        return 0.0;
+    };
+    // A zero-length region would divide to infinity; a nanosecond is below any real read.
+    last.duration_since(first).as_secs_f64().max(1e-9)
 }
 
 /// Buffer size that reliably escapes the last-level cache.
@@ -241,23 +262,8 @@ pub fn measure_sequential_read(
 /// that the measurement is partly cache bandwidth, which reads as an implausibly fast
 /// machine.
 ///
-/// 512 MiB is over 5× the largest consumer LLC, and [`bandwidth_escapes_cache`] checks
-/// empirically rather than trusting this constant.
+/// 512 MiB is over 5× the largest consumer LLC.
 pub const BANDWIDTH_BUF_BYTES: usize = 512 << 20;
-
-/// Whether a bandwidth measurement has genuinely escaped the cache.
-///
-/// Run the kernel at two sizes: if the larger one is materially slower, the smaller was
-/// still partly served by cache. A tool that publishes bandwidth numbers should be able to
-/// prove it measured memory.
-pub fn bandwidth_escapes_cache() -> (MemorySample, MemorySample, bool) {
-    let small = measure_memory_bandwidth(BANDWIDTH_BUF_BYTES / 2, 3);
-    let large = measure_memory_bandwidth(BANDWIDTH_BUF_BYTES, 3);
-    // Within 5% means the plateau has been reached.
-    let ratio = large.gb_per_sec / small.gb_per_sec.max(f64::MIN_POSITIVE);
-    let escaped = ratio > 0.95;
-    (small, large, escaped)
-}
 
 /// Measure memory bandwidth, STREAM-copy style.
 ///
@@ -322,20 +328,29 @@ pub fn measure_memory_bandwidth(bytes: usize, iterations: usize) -> MemorySample
 /// deschedule it for several milliseconds while ten worker threads saturate memory. Those
 /// milliseconds fall outside the timed window, and the whole window is only ~12 ms.
 ///
-/// Each worker now times its own loop, and the sample takes the **slowest** of them: that
-/// is the wall clock of the parallel region as measured from inside it, and choosing the
-/// maximum means scheduling noise can only ever understate the machine.
+/// Each worker now records its own start and end, and the sample spans the earliest start
+/// to the latest end: the wall clock of the parallel region as measured from inside it.
+/// Taking the slowest worker's own duration instead — what this did next — still missed
+/// any skew between workers' starts, and so could overstate the machine.
 ///
 /// The lesson generalises to the rest of this module. A wrong number here is not caught by
 /// any test that asks whether the code runs — only by asking whether the answer is possible.
-pub fn measure_read_bandwidth(bytes: usize, iterations: usize) -> MemorySample {
+pub fn measure_read_bandwidth(bytes: usize, iterations: usize) -> std::io::Result<MemorySample> {
     let threads = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1);
 
     let n = bytes / std::mem::size_of::<u64>();
-    let src = vec![1u64; n];
-    let chunk = (n / threads).max(1);
+    if iterations == 0 || n < threads * 4 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "{bytes} bytes x {iterations} passes over {threads} threads is too small to \
+                 measure"
+            ),
+        ));
+    }
+    let chunk = n / threads;
 
     // Sum a slice with four independent accumulators. With one, each load waits on the
     // previous add and the loop measures latency; with four, the memory system sees four
@@ -363,63 +378,75 @@ pub fn measure_read_bandwidth(bytes: usize, iterations: usize) -> MemorySample {
         a ^ b ^ c ^ d
     }
 
-    // One pass of the whole measurement: warm up, then time `iterations` sweeps in every
-    // thread and take the slowest, which is the wall clock of the parallel region.
-    //
-    // The barrier covers the workers only. Thread creation and first-touch page faults are
-    // real work, and timing them reports a slower machine than the one you have — the first
-    // sample of an unwarmed run came in 40% low — so every thread warms up before any of
-    // them starts a clock.
+    // Each worker allocates and first-touches its own segment, once, so on a NUMA machine
+    // the pages land on the node of the core reading them — a buffer filled by the main
+    // thread sits on one node and every other node reads it across the interconnect. The
+    // segments outlive the three samples below, so the repeats measure memory rather than
+    // the allocator.
+    let segments: Vec<Vec<u64>> = std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..threads)
+            .map(|t| {
+                let len = if t == threads - 1 {
+                    n - chunk * (threads - 1)
+                } else {
+                    chunk
+                };
+                scope.spawn(move || vec![1u64; len])
+            })
+            .collect();
+        workers
+            .into_iter()
+            .map(|w| w.join().expect("allocation worker panicked"))
+            .collect()
+    });
+
+    // One pass of the whole measurement. Every worker warms up before any starts its
+    // clock, then records its own start and end; the sample spans the earliest start to
+    // the latest end. See [`wall_seconds`].
     let sample = || -> f64 {
         let barrier = std::sync::Barrier::new(threads);
-        std::thread::scope(|scope| {
-            let handles: Vec<_> = (0..threads)
-                .map(|t| {
-                    let start = t * chunk;
-                    let end = if t == threads - 1 { n } else { start + chunk };
-                    let slice = &src[start..end];
+        let spans: Vec<(Instant, Instant)> = std::thread::scope(|scope| {
+            let workers: Vec<_> = segments
+                .iter()
+                .map(|segment| {
                     let barrier = &barrier;
                     scope.spawn(move || {
                         // One untimed pass: faults every page in and lets the CPU reach its
                         // steady-state clock before anything is measured.
-                        let mut acc = sweep(slice, 0);
+                        let mut acc = sweep(segment, 0);
                         barrier.wait();
-                        let started = Instant::now();
+                        let began = Instant::now();
                         for _ in 0..iterations {
-                            acc = sweep(std::hint::black_box(slice), acc);
+                            acc = sweep(std::hint::black_box(segment), acc);
                         }
-                        let elapsed = started.elapsed();
+                        let ended = Instant::now();
                         std::hint::black_box(acc);
-                        elapsed
+                        (began, ended)
                     })
                 })
                 .collect();
-
-            handles
+            workers
                 .into_iter()
                 .map(|h| h.join().expect("bandwidth worker panicked"))
-                .max()
-                .unwrap_or_default()
-                .as_secs_f64()
-        })
+                .collect()
+        });
+        wall_seconds(&spans)
     };
 
     // Median of three, because one sample is one roll of the scheduler. The timed region is
     // ~12 ms; a background process waking inside it drags that sample down, and a single
-    // low read halves every tok/s figure the tool prints from it. Three costs 25 ms more
-    // and cannot be moved by one outlier. The buffer is allocated once and reused, so the
-    // repeats measure memory rather than the allocator.
+    // low read halves every tok/s figure the tool prints from it.
     let mut samples = [sample(), sample(), sample()];
-    samples.sort_by(|a, b| a.partial_cmp(b).expect("a duration is never NaN"));
+    samples.sort_by(|a, b| a.total_cmp(b));
     let seconds = samples[1];
 
     // Read-only: one pass over the buffer per iteration, per thread's share.
     let total_bytes = (n * std::mem::size_of::<u64>()) as u64 * iterations as u64;
-    MemorySample {
+    Ok(MemorySample {
         total_bytes,
         seconds,
         gb_per_sec: total_bytes as f64 / seconds / 1e9,
-    }
+    })
 }
 
 /// Peak resident set size of this process so far, in bytes.
@@ -453,6 +480,84 @@ mod tests {
         assert_eq!(s.threads, 2);
         assert!(s.gb_per_sec > 0.0);
         assert!(s.ms_per_read >= 0.0);
+    }
+
+    #[test]
+    fn nonsense_parameters_are_refused_instead_of_panicking_or_dividing_by_zero() {
+        let mut f = tempfile::NamedTempFile::new().expect("temp file");
+        f.write_all(&vec![0u8; 1 << 20]).expect("write");
+        f.flush().expect("flush");
+        for (block, threads, reads) in [(4096, 0, 8), (4096, 2, 0), (5000, 2, 8), (0, 1, 1)] {
+            let err =
+                measure_random_read(f.path(), block, threads, reads).expect_err("must refuse");
+            assert_eq!(
+                err.kind(),
+                std::io::ErrorKind::InvalidInput,
+                "{block} {threads} {reads}"
+            );
+        }
+        assert_eq!(
+            measure_read_bandwidth(64, 4).expect_err("too small").kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+        assert!(
+            measure_read_bandwidth(4 << 20, 0).is_err(),
+            "zero passes is 0/0"
+        );
+    }
+
+    #[test]
+    fn a_missing_sample_file_is_an_error_and_starts_no_thread() {
+        let err = measure_random_read(Path::new("/nonexistent/sift-sample"), 4096, 4, 4)
+            .expect_err("no file");
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn the_wall_clock_spans_the_earliest_start_to_the_latest_end() {
+        // Two workers that each ran 10 ms, 5 ms apart: the region took 15 ms, and taking
+        // either worker's own 10 ms would overstate the machine by half.
+        let t0 = Instant::now();
+        let ms = std::time::Duration::from_millis;
+        let spans = [(t0, t0 + ms(10)), (t0 + ms(5), t0 + ms(15))];
+        assert!((wall_seconds(&spans) - 0.015).abs() < 1e-9);
+        assert_eq!(wall_seconds(&[]), 0.0);
+    }
+
+    #[test]
+    fn latency_per_read_does_not_shrink_as_threads_are_added() {
+        // Regression: ms_per_read divided by every thread's reads, so it was the inverse of
+        // throughput and halved each time threads doubled.
+        let s = DiskSample {
+            block_bytes: 4096,
+            threads: 8,
+            total_bytes: 0,
+            seconds: 1.0,
+            gb_per_sec: 0.0,
+            ms_per_read: 1000.0 / 100.0,
+            resident_before: None,
+        };
+        assert_eq!(s.ms_per_read, 10.0);
+        let mut f = tempfile::NamedTempFile::new().expect("temp file");
+        f.write_all(&vec![0u8; 1 << 20]).expect("write");
+        f.flush().expect("flush");
+        let one = measure_random_read(f.path(), 4096, 1, 16).expect("one");
+        assert!((one.ms_per_read - one.seconds * 1000.0 / 16.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_sample_already_in_the_page_cache_is_flagged() {
+        let mut f = tempfile::NamedTempFile::new().expect("temp file");
+        f.write_all(&vec![7u8; 4 << 20]).expect("write");
+        f.flush().expect("flush");
+        let s = measure_random_read(f.path(), 64 << 10, 1, 4).expect("measure");
+        if s.resident_before.is_some() {
+            assert!(
+                s.looks_cached(),
+                "just written, so resident: {:?}",
+                s.resident_before
+            );
+        }
     }
 
     #[test]
@@ -523,7 +628,7 @@ mod bandwidth_tests {
 
     #[test]
     fn read_bandwidth_is_positive_and_counts_one_pass_per_iteration() {
-        let s = measure_read_bandwidth(4 << 20, 4);
+        let s = measure_read_bandwidth(4 << 20, 4).expect("measure");
         assert!(s.gb_per_sec > 0.0 && s.gb_per_sec.is_finite());
         assert_eq!(
             s.total_bytes,
@@ -543,7 +648,7 @@ mod bandwidth_tests {
         // is a property of the hardware and a test that pins it would be a test of the
         // machine, not of this code.
         let copy = measure_memory_bandwidth(64 << 20, 4);
-        let read = measure_read_bandwidth(64 << 20, 4);
+        let read = measure_read_bandwidth(64 << 20, 4).expect("measure");
         assert!(copy.gb_per_sec > 0.0 && read.gb_per_sec > 0.0);
         assert_ne!(copy.total_bytes, read.total_bytes);
     }

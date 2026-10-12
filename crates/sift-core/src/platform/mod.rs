@@ -259,6 +259,64 @@ pub fn open_uncached(path: &Path) -> std::io::Result<std::fs::File> {
     imp::open_uncached(path)
 }
 
+/// Fraction of a file's pages that are resident in the page cache right now.
+///
+/// What every "uncached" open above cannot do — evict — this at least detects: a disk
+/// sample taken from a file that is already in memory measures RAM, and `doctor` uses this
+/// to say so instead of publishing it. `None` where the platform cannot tell (Windows) or
+/// the file cannot be mapped.
+pub fn resident_fraction(path: &Path) -> Option<f64> {
+    #[cfg(unix)]
+    {
+        unix_resident_fraction(path)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
+    }
+}
+
+/// `mmap` + `mincore`, which Linux, macOS and the BSDs all have.
+///
+/// The mapping is never touched, so it faults nothing in: `mincore` only reports which
+/// pages are already there.
+#[cfg(unix)]
+fn unix_resident_fraction(path: &Path) -> Option<f64> {
+    use std::os::unix::io::AsRawFd;
+    let file = std::fs::File::open(path).ok()?;
+    let len = usize::try_from(file.metadata().ok()?.len()).ok()?;
+    if len == 0 {
+        return None;
+    }
+    let page = page_size();
+    let pages = len.div_ceil(page);
+    let mut vec = vec![0u8; pages];
+    // SAFETY: mapping a regular file read-only and shared; the pointer is checked against
+    // MAP_FAILED, never dereferenced, and unmapped before returning. `vec` holds one byte
+    // per page of the mapping, which is what `mincore` writes.
+    unsafe {
+        let addr = libc::mmap(
+            std::ptr::null_mut(),
+            len,
+            libc::PROT_READ,
+            libc::MAP_SHARED,
+            file.as_raw_fd(),
+            0,
+        );
+        if addr == libc::MAP_FAILED {
+            return None;
+        }
+        let rc = libc::mincore(addr, len, vec.as_mut_ptr() as *mut _);
+        libc::munmap(addr, len);
+        if rc != 0 {
+            return None;
+        }
+    }
+    let resident = vec.iter().filter(|&&b| b & 1 != 0).count();
+    Some(resident as f64 / pages as f64)
+}
+
 /// Open a file for positional reads with normal caching.
 pub fn open_cached(path: &Path) -> std::io::Result<std::fs::File> {
     std::fs::File::open(path)
@@ -289,6 +347,20 @@ mod tests {
             "page size {} outside the plausible range",
             f.page_bytes
         );
+    }
+
+    #[test]
+    fn a_file_just_written_is_reported_resident() {
+        use std::io::Write;
+        let mut f = tempfile::NamedTempFile::new().expect("temp file");
+        f.write_all(&vec![1u8; 1 << 20]).expect("write");
+        f.flush().expect("flush");
+        if let Some(frac) = resident_fraction(f.path()) {
+            assert!(
+                frac > 0.5,
+                "a freshly written file is in the page cache: {frac}"
+            );
+        }
     }
 
     #[test]

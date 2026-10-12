@@ -226,6 +226,26 @@ pub fn peak_rss_bytes() -> u64 {
 }
 
 pub fn open_uncached(path: &Path) -> io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    // O_DIRECT bypasses the page cache for real: no page is read into it, so a cold sample
+    // stays cold and the sweep does not warm its own later rows. Reads must then be
+    // aligned, which every caller's 2 MiB-aligned buffers and 4 KiB-multiple offsets and
+    // lengths are. Filesystems that refuse it (tmpfs, some FUSE) answer EINVAL, and get the
+    // advisory path below instead.
+    match File::options()
+        .read(true)
+        .custom_flags(libc::O_DIRECT)
+        .open(path)
+    {
+        Ok(file) => {
+            // SAFETY: `file` owns a live descriptor; the hint is advisory.
+            unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_RANDOM) };
+            return Ok(file);
+        }
+        Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {}
+        Err(e) => return Err(e),
+    }
+
     let file = File::open(path)?;
     let fd = file.as_raw_fd();
 

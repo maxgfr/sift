@@ -330,7 +330,8 @@ fn cmd_fit(repo: &str, context_tokens: u64, json: bool) -> Result<()> {
     // activation, so a copy benchmark measures the wrong access pattern. Fewer iterations
     // than `doctor` uses — this is one input among many and the user is waiting on network
     // round-trips anyway.
-    let mem = doctor::measure_read_bandwidth(doctor::BANDWIDTH_BUF_BYTES, 3);
+    let mem = doctor::measure_read_bandwidth(doctor::BANDWIDTH_BUF_BYTES, 3)
+        .context("measuring memory bandwidth")?;
     let installed = sift_core::engine::detect_installed();
 
     // Progress chatter goes to stderr under --json, so stdout stays a single parseable
@@ -449,7 +450,8 @@ fn cmd_route(src: &Source, json: bool) -> Result<()> {
 fn cmd_ls(context_tokens: u64, json: bool) -> Result<()> {
     let facts = MachineFacts::collect();
     let usable = usable_ram(&facts);
-    let mem = doctor::measure_read_bandwidth(doctor::BANDWIDTH_BUF_BYTES, 3);
+    let mem = doctor::measure_read_bandwidth(doctor::BANDWIDTH_BUF_BYTES, 3)
+        .context("measuring memory bandwidth")?;
 
     let models = ls::discover();
     let rows = ls::evaluate(models, mem.gb_per_sec * 1e9, usable, context_tokens);
@@ -610,7 +612,8 @@ fn cmd_doctor(disk_sample: Option<PathBuf>, json: bool) -> Result<()> {
     let mem = doctor::measure_memory_bandwidth(256 << 20, 8);
     // The read figure is the one that sets the decode ceiling; the copy figure is kept
     // alongside it because seeing both is what makes the difference legible.
-    let read = doctor::measure_read_bandwidth(doctor::BANDWIDTH_BUF_BYTES, 4);
+    let read = doctor::measure_read_bandwidth(doctor::BANDWIDTH_BUF_BYTES, 4)
+        .context("measuring memory bandwidth")?;
 
     let mut disk = Vec::new();
     if let Some(path) = &disk_sample {
@@ -751,21 +754,25 @@ fn cmd_doctor(disk_sample: Option<PathBuf>, json: bool) -> Result<()> {
 
     if disk.is_empty() {
         println!("\ndisk: not measured (pass --disk-sample <file>)");
-        println!("  Use a file this machine has NOT read recently. F_NOCACHE stops new");
+        println!("  Use a file this machine has NOT read recently. Uncached reads stop new");
         println!("  caching but cannot evict resident pages, so a warm file reports RAM.");
     } else {
         println!("\ndisk, cold random read");
         println!(
-            "  {:>8}  {:>7}  {:>9}  {:>10}",
-            "block", "threads", "GB/s", "ms/read"
+            "  {:>8}  {:>7}  {:>9}  {:>10}  {:>8}",
+            "block", "threads", "GB/s", "ms/read", "cached"
         );
         for s in &disk {
             println!(
-                "  {:>7}K  {:>7}  {:>9.2}  {:>10.3}{}",
+                "  {:>7}K  {:>7}  {:>9.2}  {:>10.3}  {:>8}{}",
                 s.block_bytes / 1024,
                 s.threads,
                 s.gb_per_sec,
                 s.ms_per_read,
+                match s.resident_before {
+                    Some(f) => format!("{:.0}%", f * 100.0),
+                    None => "?".to_string(),
+                },
                 if s.looks_cached() {
                     "   <- page cache, not disk"
                 } else {
@@ -774,25 +781,9 @@ fn cmd_doctor(disk_sample: Option<PathBuf>, json: bool) -> Result<()> {
             );
         }
 
-        // The sweep warms its own sample: each configuration reads real bytes, so by the
-        // last row much of a small file is resident and the numbers drift upward. Say so
-        // rather than letting the reader assume all rows are equally cold.
-        let swept_bytes: u64 = disk.iter().map(|s| s.total_bytes).sum();
-        let sample_bytes = disk_sample
-            .as_ref()
-            .and_then(|p| std::fs::metadata(p).ok())
-            .map(|m| m.len())
-            .unwrap_or(0);
-        if sample_bytes > 0 && swept_bytes > sample_bytes / 4 {
-            println!(
-                "\n  caveat: this sweep read {:.1} GiB of a {:.1} GiB sample, so later rows\n  \
-                 are partly page-cache hits. Earlier rows are the trustworthy ones.\n  \
-                 For a clean sweep use a sample at least 4x your RAM.",
-                sift_core::gib(swept_bytes),
-                sift_core::gib(sample_bytes)
-            );
-        }
-
+        // Each row's residency is measured before it runs, so a sweep that warms its own
+        // sample — on a platform where reads cannot bypass the cache — flags the rows it
+        // warmed instead of letting them pass as disk.
         let cached = disk.iter().filter(|s| s.looks_cached()).count();
         // Take the best *trustworthy* sample. A cached row is not a disk measurement, and
         // quoting it would inflate every downstream ceiling.
@@ -803,12 +794,14 @@ fn cmd_doctor(disk_sample: Option<PathBuf>, json: bool) -> Result<()> {
 
         if cached > 0 {
             println!(
-                "\n  {cached} of {} samples exceeded {:.0} GB/s, which no consumer NVMe can do.",
+                "\n  {cached} of {} samples read from memory, not disk: more than {:.0}% of the\n  \
+                 file was already cached, or the rate passed {:.0} GB/s, which no consumer\n  \
+                 NVMe reaches. Uncached reads stop new caching but cannot evict. For a real\n  \
+                 cold number, reboot or use a file this machine has not read.",
                 disk.len(),
+                sift_core::doctor::RESIDENT_SAMPLE_LIMIT * 100.0,
                 sift_core::doctor::IMPLAUSIBLE_DISK_GB_S
             );
-            println!("  Those pages were already resident: F_NOCACHE stops new caching but");
-            println!("  cannot evict. For a real cold number, reboot or use an untouched file.");
         }
 
         if best > 0.0 {
@@ -1087,7 +1080,8 @@ fn cmd_plan(src: &Source, hit_rate: f64, json: bool) -> Result<()> {
     };
 
     if json {
-        let mem = doctor::measure_read_bandwidth(doctor::BANDWIDTH_BUF_BYTES, 3);
+        let mem = doctor::measure_read_bandwidth(doctor::BANDWIDTH_BUF_BYTES, 3)
+            .context("measuring memory bandwidth")?;
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
@@ -1139,7 +1133,8 @@ fn cmd_plan(src: &Source, hit_rate: f64, json: bool) -> Result<()> {
     // small activation, and a copy moves a byte each way — so a copy-based roofline is not
     // merely conservative, it is below what an engine actually reaches. This line used to
     // print 70 tok/s as the "ceiling" for a model LM Studio decodes at 129.
-    let mem = doctor::measure_read_bandwidth(doctor::BANDWIDTH_BUF_BYTES, 3);
+    let mem = doctor::measure_read_bandwidth(doctor::BANDWIDTH_BUF_BYTES, 3)
+        .context("measuring memory bandwidth")?;
     println!("\nceilings at hit rate {:.0}%", hit_rate * 100.0);
     println!(
         "  resident  @ {:>6.1} GB/s measured memory : {:>6.1} tok/s",
