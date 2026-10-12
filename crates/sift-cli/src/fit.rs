@@ -527,15 +527,17 @@ fn download_glob(base_path: &str, parts: &[String]) -> String {
         }
     }
     let first = parts.first().map(String::as_str).unwrap_or(base_path);
+    // Compared by character, so the prefix ends on a character boundary: two names can
+    // share the first bytes of different multibyte characters.
     let mut common = first.len();
     for p in parts {
-        common = common.min(
-            first
-                .bytes()
-                .zip(p.bytes())
-                .take_while(|(a, b)| a == b)
-                .count(),
-        );
+        let shared: usize = first
+            .chars()
+            .zip(p.chars())
+            .take_while(|(a, b)| a == b)
+            .map(|(a, _)| a.len_utf8())
+            .sum();
+        common = common.min(shared);
     }
     let ext = std::path::Path::new(first)
         .extension()
@@ -711,7 +713,6 @@ pub fn recommended(cands: &[Candidate]) -> Option<&Candidate> {
         .max_by_key(|c| c.rank())
 }
 
-/// Emit the same evaluation as [`report`], as one JSON document on stdout.
 /// The command that downloads a candidate.
 ///
 /// `hf`, the HuggingFace CLI that replaced the deprecated `huggingface-cli`.
@@ -728,16 +729,27 @@ fn beyond_training(cands: &[Candidate], context_tokens: u64) -> Option<u64> {
         .filter(|&t| context_tokens > t)
 }
 
-#[allow(clippy::too_many_arguments)]
+/// The machine a report is about, as `report_json` describes it.
+pub struct Machine<'a> {
+    pub facts: &'a sift_core::doctor::MachineFacts,
+    pub usable_ram: u64,
+    pub installed: &'a [Installed],
+    pub memory_gb_per_sec: f64,
+}
+
+/// Emit the same evaluation as [`report`], as one JSON document on stdout.
 pub fn report_json(
     repo: &str,
     cands: &[Candidate],
-    facts: &sift_core::doctor::MachineFacts,
-    usable_ram: u64,
-    installed: &[Installed],
-    memory_gb_per_sec: f64,
+    machine: &Machine,
     context_tokens: u64,
 ) -> Result<()> {
+    let Machine {
+        facts,
+        usable_ram,
+        installed,
+        memory_gb_per_sec,
+    } = *machine;
     let rows: Vec<_> = cands
         .iter()
         .map(|c| {
@@ -1303,6 +1315,19 @@ mod sweep_tests {
         assert_eq!(
             units[0].download_arg,
             "--include \"model_pp0_ep*.safetensors\""
+        );
+    }
+
+    #[test]
+    fn a_download_pattern_never_cuts_a_character_in_half() {
+        // 一 and 二 share their first UTF-8 byte; a byte-wise prefix sliced inside it.
+        let parts = vec![
+            "第一.safetensors".to_string(),
+            "第二.safetensors".to_string(),
+        ];
+        assert_eq!(
+            download_glob("model.safetensors", &parts),
+            "--include \"第*.safetensors\""
         );
     }
 

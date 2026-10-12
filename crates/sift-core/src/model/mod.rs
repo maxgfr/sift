@@ -243,7 +243,7 @@ fn gguf_facts(g: &Gguf) -> ArchFacts {
     let sliding_window = g
         .arch_u64("attention.sliding_window")
         .or_else(|| kv::default_sliding_window(arch));
-    let layer_kinds = block_count.and_then(|n| {
+    let layer_kinds = block_count.filter(|&n| n <= kv::MAX_LAYERS).and_then(|n| {
         // Stated per layer, as bool arrays: recurrent layers, sliding layers.
         let flags = |suffix: &str| per_layer(suffix).filter(|v| v.len() as u64 == n);
         let recurrent = flags("attention.recurrent_layers");

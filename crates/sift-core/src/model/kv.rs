@@ -88,6 +88,12 @@ pub struct KvShape {
     pub per_layer: Vec<KvLayer>,
 }
 
+/// More layers than this is not a model but a corrupt or hostile header.
+///
+/// The largest published models have under 200. Sizing is per layer, so an unchecked
+/// `block_count` of 2^40 would allocate a vector that large and abort the process.
+pub const MAX_LAYERS: u64 = 1 << 16;
+
 /// Bytes per KV element at the precision engines default to.
 ///
 /// f16. Engines can be told to use 8- or 4-bit KV, which is why
@@ -144,7 +150,7 @@ impl KvShape {
 /// the safe direction to be wrong in.
 pub fn kv_shape_from_facts(facts: &ArchFacts) -> Option<KvShape> {
     let f = facts;
-    let n = f.block_count.filter(|&n| n > 0)?;
+    let n = f.block_count.filter(|&n| n > 0 && n <= MAX_LAYERS)?;
 
     // Grouped-query attention means K/V heads are usually fewer than query heads. Fall
     // back to `head_count` only when `head_count_kv` is absent, which means multi-head
@@ -259,6 +265,9 @@ pub fn resolve_layer_kinds(
 ) -> Option<Vec<LayerKind>> {
     if let Some(kinds) = explicit {
         return Some(kinds);
+    }
+    if n_layers > MAX_LAYERS {
+        return None;
     }
     let n = n_layers as usize;
     if let Some(every) = full_attention_interval.filter(|&k| k > 0) {
@@ -501,6 +510,19 @@ mod tests {
             ..Default::default()
         };
         assert!(kv_shape_from_facts(&f).is_none(), "no heads, no width");
+    }
+
+    #[test]
+    fn kv_an_absurd_layer_count_is_refused_rather_than_allocated() {
+        // A hostile header can claim 2^40 layers; sizing it per layer would allocate a
+        // vector that large and abort the process.
+        let f = facts(1 << 40, 8, 128);
+        assert!(kv_shape_from_facts(&f).is_none());
+        assert_eq!(
+            resolve_layer_kinds(1 << 40, None, Some(4), None),
+            None,
+            "no per-layer vector for an implausible model"
+        );
     }
 
     #[test]

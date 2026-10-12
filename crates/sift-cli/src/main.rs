@@ -444,15 +444,13 @@ fn cmd_fit(reference: &str, context_tokens: u64, json: bool) -> Result<()> {
         None => cands,
     };
     if json {
-        return fit::report_json(
-            repo,
-            &cands,
-            &facts,
-            usable,
-            &installed,
-            mem.gb_per_sec,
-            context_tokens,
-        );
+        let machine = fit::Machine {
+            facts: &facts,
+            usable_ram: usable,
+            installed: &installed,
+            memory_gb_per_sec: mem.gb_per_sec,
+        };
+        return fit::report_json(repo, &cands, &machine, context_tokens);
     }
     fit::report(repo, &cands, usable, &installed, context_tokens)
 }

@@ -219,7 +219,7 @@ pub fn facts_from_config(config: &serde_json::Value) -> ArchFacts {
         _ => u("sliding_window").or_else(|| u("attention_chunk_size")),
     };
 
-    let layer_kinds = block_count.and_then(|n| {
+    let layer_kinds = block_count.filter(|&n| n <= kv::MAX_LAYERS).and_then(|n| {
         let explicit = get("layer_types")
             .and_then(|v| v.as_array())
             .map(|types| {
@@ -676,6 +676,18 @@ mod tests {
         }));
         assert_eq!((kimi.full_layers, kimi.recurrent_layers), (7, 20));
         assert_eq!(kimi.bytes_at(4096, 2), 7 * 576 * 4096 * 2);
+    }
+
+    #[test]
+    fn a_config_claiming_an_absurd_layer_count_is_not_sized() {
+        for cfg in [
+            serde_json::json!({"model_type": "mamba", "num_hidden_layers": 1u64 << 40}),
+            serde_json::json!({"num_hidden_layers": 1u64 << 40, "full_attn_idxs": [1]}),
+        ] {
+            let f = facts_from_config(&cfg);
+            assert_eq!(f.layer_kinds, None);
+            assert!(crate::model::kv::kv_shape_from_facts(&f).is_none());
+        }
     }
 
     #[test]

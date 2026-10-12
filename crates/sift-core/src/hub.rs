@@ -68,7 +68,8 @@ impl RepoFile {
     /// Speculative-decoding heads are adjuncts too: an EAGLE3 or DFlash draft runs only
     /// beside the model it was trained on, and a 1.7 GB one "fitted" and was recommended.
     pub fn is_adjunct(&self) -> bool {
-        let file = self.path.rsplit('/').next().unwrap_or(&self.path);
+        // Cut at either separator: `ls` passes local paths, backslashed on Windows.
+        let file = self.path.rsplit(['/', '\\']).next().unwrap_or(&self.path);
         let lower = file.to_ascii_lowercase();
         lower.starts_with("mmproj")
             || lower.contains("imatrix")
@@ -641,6 +642,8 @@ mod tests {
             !f("Draftsman-7B-Q4_K_M.gguf").is_adjunct(),
             "a model may be called that"
         );
+        // `ls` hands over local paths, which on Windows use backslashes.
+        assert!(f("C:\\Users\\u\\.lmstudio\\models\\o\\r\\mmproj-F16.gguf").is_adjunct());
     }
 
     #[test]

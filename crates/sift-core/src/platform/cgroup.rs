@@ -8,8 +8,6 @@
 //! Written against a root directory rather than `/`, so the reader is tested on fixture
 //! trees on every OS — none of which needs to be Linux, or inside a container.
 
-#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
-
 use std::path::{Path, PathBuf};
 
 /// Limits at or above this are "no limit": cgroup v1 writes `PAGE_COUNTER_MAX`, a number

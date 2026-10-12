@@ -37,6 +37,8 @@
 
 use std::path::Path;
 
+// Read only on Linux; compiled everywhere under test so its fixtures run on every OS.
+#[cfg(any(target_os = "linux", test))]
 mod cgroup;
 #[cfg(target_os = "macos")]
 mod darwin;
