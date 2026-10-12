@@ -4,51 +4,77 @@
 
 ```console
 $ sift fit unsloth/Qwen3-30B-A3B-GGUF
-machine: Mac17,2, 16.0 GiB RAM, 12.0 GiB usable, 132 GB/s memory
 reading headers from unsloth/Qwen3-30B-A3B-GGUF without downloading…
+machine: Mac17,2, 16.0 GiB RAM, 10.7 GiB usable (estimate), 101 GB/s memory
 
   fits assumes 4096 tokens of context: 0.40 GB of f16 KV cache, counted
   alongside the weights. Change it with --ctx.
 
   quant               size     fits    bpw    GB/token  est tok/s
-  UD-IQ1_S         9.04 GB      yes   2.37       1.427         70  moe, damaged
-  Q2_K            11.26 GB    tight   2.91       1.399         72  moe, damaged
-  Q3_K_M          14.71 GB    tight   3.85       1.753         57  moe
+  UD-IQ1_S         9.04 GB    tight   2.37       1.427         54  moe, damaged
+  UD-IQ2_M        10.87 GB    tight   2.85       1.613         47  moe, damaged
+  Q2_K            11.26 GB       no   2.95       1.414   disk-bound  moe, damaged
+  UD-Q2_K_XL      11.81 GB       no   3.09       1.694   disk-bound  moe
+  Q3_K_M          14.71 GB       no   3.85       1.753   disk-bound  moe
   Q4_K_M          18.56 GB       no   4.86       2.095   disk-bound  moe
   Q8_0            32.48 GB       no   8.51       3.600   disk-bound  moe
 
-  recommended: Q3_K_M
+  recommended: UD-IQ2_M
+    engine     LM Studio — it only just fits, so a longer context or another application can push it over
+
+    warning    at 2.85 bits per weight this is below the 3.0-bit
+               floor where quantization stops degrading gracefully. Nothing
+               better fits here. Expect noticeably worse output than the same
+               model at 4 bits — consider a smaller model instead.
+    download   hf download unsloth/Qwen3-30B-A3B-GGUF Qwen3-30B-A3B-UD-IQ2_M.gguf
 ```
 
-Twenty-six quantizations evaluated. **Nothing downloaded.**
+Twenty-six quantizations evaluated (seven shown). **Nothing downloaded.**
 
 Today that answer costs an hour: pull 18 GB, find out it's too slow, delete, guess again.
 
 ## Two ways this table is not the obvious one
 
-**It does not recommend the biggest file that fits.** `UD-IQ1_S` is the only row marked
-`yes`, and it is the wrong answer: at 2.37 bits per weight the model is damaged. Bits per
-weight is *measured from each file's own tensor directory* rather than looked up from its
-name — so it is right about a quant family invented this morning, and it distinguishes two
-files both labelled `Q4_K_M` that a dynamic quantization made genuinely different.
+**It ranks on quality, not on size, and says when quality is out of reach.** On a 16 GB Mac
+the GPU can wire about 10.7 GiB, and nothing above 3 bits per weight fits in that. `sift`
+names the least damaged file that does — `UD-IQ2_M` at 2.85 bits, not the smallest
+`UD-IQ1_S` at 2.37 — and says plainly what you are accepting. Bits per weight is *measured
+from each file's own tensor directory* rather than looked up from its name — so it is right
+about a quant family invented this morning, and it distinguishes two files both labelled
+`Q4_K_M` that a dynamic quantization made genuinely different.
+
+`tight` means between 80% and 100% of usable memory; past 100% a row is `no`, never
+`tight`.
 
 **`fits` counts the KV cache.** Raise the context and the answer changes, because it should:
 
 ```console
 $ sift fit unsloth/Qwen3-30B-A3B-GGUF --ctx 65536
-  fits assumes 65536 tokens of context: 6.44 GB of f16 KV cache…
-  nothing here fits in 12.0 GiB of usable memory.
+  fits assumes 65536 tokens of context: 6.44 GB of f16 KV cache, counted
+  warning: 65536 tokens is past the 40960 this model was trained for;
+  nothing here fits in 10.7 GiB of usable memory.
 ```
 
 Same machine, same model, opposite advice. A tool that answers only the 4k question and
 does not say so is not being conservative, it is being wrong quietly.
 
+The cache is sized layer by layer, because modern models do not give every layer the same
+attention: Gemma 3's sliding-window layers keep 1024 tokens, Qwen3.5's linear-attention
+layers keep none, and DeepSeek's latent attention caches 576 values per token instead of
+a K and a V per head. Gemma-3-4B at 128k is 2.6 GiB of cache, not the 17 GiB a uniform
+formula gives.
+
 ## No bundled model list
 
-`sift` reads the **real GGUF header of the real file at the real URL** over HTTP range
-requests. A model uploaded ten minutes ago works exactly like one from last year.
+`sift` reads the **real header of the real file at the real URL** over HTTP range
+requests — GGUF, or safetensors with its `config.json`. A model uploaded ten minutes ago
+works exactly like one from last year.
 
-Measured on a 17.28 GiB model: **15 MiB read, 0.0848% of the file.**
+Measured on a 17.28 GiB model: **8 MiB read, 0.0452% of the file.** A safetensors header
+costs tens of kilobytes; all 163 shards of DeepSeek-V3 cost 12 MB.
+
+Gated repos work with your HuggingFace token: `sift` reads `HF_TOKEN` (or the file
+`hf auth login` writes) and sends it to `huggingface.co` only, never in a command line.
 
 This matters because the alternative — shipping a catalog — rots. The most popular tool in
 this space compiles a model list into its binary, and its top user complaint is that it
@@ -59,20 +85,31 @@ recommends two-year-old models as perfect matches.
 `sift` never runs a model. It tells you which one to get and which engine should run it.
 
 ```console
-$ sift route ~/.sift/models/olmoe-q4km.gguf
-  size             3.92 GiB
-  usable memory    12.00 GiB
+$ sift route mlx-community/Qwen3-4B-4bit
+mlx-community/Qwen3-4B-4bit:model
+  size             2.11 GiB
+  kv cache         0.56 GiB at 4096 tokens (f16), counted
+  usable memory    10.67 GiB
+
   use LM Studio (installed)
-  because it fits in memory
+  because it fits in memory, with room left for the context to grow
 ```
 
 Routing knows what to **avoid**, not just what to use — an engine that thrashes looks like
 it's working, which is how people lose an afternoon:
 
 ```console
+$ sift route unsloth/Qwen3-30B-A3B-GGUF:Q4_K_M
+  use colibri (NOT installed)
+  because it exceeds memory, and colibri streams weights from disk instead of paging: slow, but it keeps running
+
   installed, but do not use for this model:
     LM Studio    will load, then page against the OS and slow to a crawl
+    Ollama       will load, then page against the OS and slow to a crawl
 ```
+
+It also knows where an engine can run: MLX weights go to LM Studio or mlx-lm on Apple
+Silicon, and nowhere on Linux or Windows.
 
 Adding an engine is a row in a table (`crates/sift-core/src/engine.rs`), not a code change.
 That's deliberate: the runtime landscape churns, and absorbing churn has to be trivial.
@@ -119,7 +156,7 @@ Or `cargo build --release` — Rust 1.85+, no runtime dependencies beyond `curl`
 ```
 sift fit <hf-repo>[:QUANT] [--ctx N]   which quantization to download, and why
 sift ls [--ctx N]                      every local model, across every engine
-sift route <model>                     which engine should run it
+sift route <model> [--ctx N]           which engine should run it
 sift inspect <path|hf-repo>            model shape and KV cache, local or remote, no download
 sift plan <model>                      per-token traffic and speed ceilings
 sift bench [--engine E]                measure a real engine, and record it
@@ -128,22 +165,30 @@ sift engines                           which runtimes are installed here
 sift cache [--clear]                   what the header cache holds, and empty it
 ```
 
-`<model>` accepts a path, `org/repo`, `org/repo:QUANT`, or a URL, in GGUF **or
-safetensors** — a safetensors repo is sized from `data_offsets` and its `config.json`, and
-routed to an engine that can actually open it. Every command takes `--json`.
+`<model>` accepts a path, `org/repo`, `org/repo:QUANT`, a HuggingFace page URL (the
+`/blob/` one your browser shows works), or any URL, in GGUF **or safetensors** — a
+safetensors repo is sized from `data_offsets` and its `config.json` (MLX, GPTQ and AWQ
+weights counted unpacked), split across as many files as it likes, and routed to an engine
+that can actually open it. Every command takes `--json`, and under `--json` even a failure
+is a JSON object on stdout.
 
-`sift ls` is the one view across tools that cannot see each other — LM Studio, Ollama,
-colibri and `~/.sift` in one table, each scored against this machine:
+`sift ls` is the one view across tools that cannot see each other — LM Studio (wherever
+its settings put the models), Ollama, colibri and `~/.sift` in one table, each scored
+against this machine:
 
 ```console
 $ sift ls
-  engine       model                                    size    fits    bpw  est tok/s
-  LM Studio    …Qwen3.5-9B-GGUF/Qwen3.5-9B-Q4_K_M.gguf  5.63 GB  yes   5.02   21  dense
-  sift         olmoe-q4km.gguf                          4.21 GB  yes   4.87  125  moe
+  engine       model                                             size    fits    bpw  est tok/s
+  LM Studio    …sm-ml/Bonsai-27B-mlx-1bit/model.safetensors   5.13 GB     yes   1.50         21  dense, mlx
+  Ollama       all-minilm:latest                              0.05 GB     yes  16.02          —  dense, embedding
+  Ollama       qwen3-embedding:0.6b                           0.64 GB     yes   8.50          —  dense, embedding
+  Ollama       qwen3-vl:2b-instruct                           1.89 GB     yes   7.08         56  dense
+  Ollama       qwen3:4b                                       2.50 GB     yes   4.95         43  dense
 ```
 
-Both rows have since been checked against the engine actually running them: 21.11 and
-129.10 tok/s measured. See [Accuracy](#accuracy-predicted-versus-measured).
+`qwen3:4b` measured 37.06 tok/s with `sift bench --engine ollama`; `ls` estimated it at
+41–43 over the same hour, as the live bandwidth reading moved on a busy machine. See
+[Accuracy](#accuracy-predicted-versus-measured) for the calibration runs.
 
 Headers are cached in `~/.sift/cache/` and revalidated by ETag, so a repeated sweep costs
 one small conditional request per file instead of the bytes again — 3.42s to 0.68s on a
@@ -182,9 +227,11 @@ the SSD**, and that ratio is why "does it fit" is the question that matters.
 ### On honest disk numbers
 
 `F_NOCACHE` prevents *new* caching but cannot evict resident pages, so a file the machine
-touched recently reads at memory speed and looks like a spectacular SSD. `sift doctor`
-flags any sample above 20 GB/s as a page-cache hit and excludes it, and warns when a sweep
-has warmed its own sample.
+touched recently reads at memory speed and looks like a spectacular SSD. Before each row
+`sift doctor` asks the kernel (`mincore`) how much of the sample is already in memory, and
+flags any row whose file is more than 10% cached, or that reads above 20 GB/s, as a
+page-cache hit and excludes it. On Linux reads go through `O_DIRECT`, so the sweep does not
+warm its own sample.
 
 At least one established project in this space discarded four of its own published results
 after finding it had measured RAM.
@@ -219,10 +266,10 @@ each pass into the next fixed that — and the number *still* came back impossib
 
 That last one was not the optimiser. The clock was started by the main thread just after it
 released a barrier, and a thread with nothing to do is exactly what the OS deschedules; the
-milliseconds it spent asleep fell outside a window only ~12 ms wide. Every worker now times
-its own loop and the slowest one is the sample, so scheduling noise can only ever understate
-the machine. The measurement is the median of three, because one sample is one roll of the
-scheduler.
+milliseconds it spent asleep fell outside a window only ~12 ms wide. Every worker now records
+its own start and end, and the sample runs from the earliest start to the latest end, so
+scheduling noise can only ever understate the machine. The measurement is the median of
+three, because one sample is one roll of the scheduler.
 
 This is the failure that argues for the whole approach. A benchmark cannot check itself: the
 bug surfaced because `sift ls` claimed 306 tok/s for a model LM Studio was sitting there
@@ -255,11 +302,15 @@ replace them.
 Early, and honest about it.
 
 - Works and tested: measurement, GGUF reading (local and remote, single-file and split),
-  safetensors reading, MoE traffic, KV cache sizing, quality-first recommendation, routing.
+  safetensors reading (quantized MLX, GPTQ and AWQ included), MoE traffic in every layout
+  publishers ship, per-layer KV cache sizing, quality-first recommendation, routing.
 - macOS, Linux, Windows x64 and Windows on ARM. The measurement layer has a real
   implementation per OS behind one seam, so nothing outside `sift_core::platform` carries a
-  `cfg`, and all four run the full test suite in CI.
-- 157 tests, clippy clean on all four.
+  `cfg`, and all four run the full test suite in CI. In a container, the cgroup memory
+  limit is what `fits` is measured against, not the host's RAM.
+- 272 tests on macOS and 284 on Linux, where the Linux platform tests run too; Windows runs
+  its own platform tests in CI. Clippy clean on all four, and the declared Rust 1.85 is
+  checked in CI.
 
 ### Two kinds of accelerator memory, never added together
 
@@ -267,9 +318,11 @@ Conflating them is what has one competing tool telling a 16 GB laptop with a 24 
 that a 20 GB model fits.
 
 - **A ceiling on host memory.** macOS `iogpu.wired_limit_mb`: unified memory, so it binds
-  what a model may occupy in RAM. `fits` is computed against it.
+  what a model may occupy in RAM. `fits` is computed against it — and when it is unset,
+  against an estimate of macOS's own default, reported as an estimate.
 - **A separate pool.** NVIDIA and AMD VRAM, read from `nvidia-smi` and amdgpu sysfs on
-  Linux and from the display driver's registry entry on Windows. `sift doctor` reports it
+  Linux and from the display driver's registry entry on Windows. An integrated GPU's
+  carve-out of system RAM is reported as such, not as VRAM. `sift doctor` reports it
   and **nothing else touches it**, so `fits` stays conservative on a box with a dedicated
   GPU. Modelling what an engine can offload there is a different calculation — it depends
   on the engine, the layer split and where the KV cache lives — and until `sift` does that
@@ -301,9 +354,12 @@ Shipped and imperfect, recorded rather than hidden.
   smaller experts would gather less efficiently and the estimate would read high.
 - **VRAM is reported, not used.** See above — offload is not modelled, so `fits` understates
   what a discrete GPU can actually run.
-- **`sift inspect` refuses a repo that ships only split shards.** A single shard's header
-  describes a fraction of a model, and summing across parts is `fit`'s job — so `inspect`
-  says what it found rather than answering about a third of a model. Use `sift fit` there.
+- **On macOS with no wired limit set, the ceiling is an estimate.** Apple does not publish
+  the default: `sift` assumes two thirds of RAM up to 36 GiB and three quarters above, and
+  says it is an estimate. Set `iogpu.wired_limit_mb` and it uses the real figure.
+- **Sliding windows follow llama.cpp.** A model whose sliding-window layers llama.cpp does
+  not recognise is sized as if every layer attended in full — the safe direction, but an
+  overstatement.
 - **The header cache has a bound, not a policy.** Entries are validated by ETag and never
   expire, so age is not evidence of staleness and nothing is evicted automatically.
   `sift cache` shows what it holds and `sift cache --clear` empties it.
