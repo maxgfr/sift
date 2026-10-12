@@ -1,36 +1,130 @@
 //! Working out what the user meant by a model reference.
 //!
-//! One argument covers three things a user might reasonably type:
+//! One argument covers everything a user might reasonably type:
 //!
 //! ```text
-//! ./model.gguf                       a local file
-//! unsloth/Qwen3-30B-A3B-GGUF         a repo — pick a file from it
-//! unsloth/Qwen3-30B-A3B-GGUF:Q4_K_M  a repo and a quantization
-//! https://…/model.gguf               a direct URL
+//! ./model.gguf  ~/models/x.gguf  C:\m\x.gguf   a local file
+//! unsloth/Qwen3-30B-A3B-GGUF                   a repo — pick a model from it
+//! unsloth/Qwen3-30B-A3B-GGUF:Q4_K_M            a repo and a quantization
+//! https://huggingface.co/org/repo/blob/main/x  a file on the hub, as a browser shows it
+//! https://…/model.gguf                         any other URL
 //! ```
 //!
-//! Resolution is deliberately ordered so that a path that exists always wins. Someone with
-//! a directory named `org/repo` should get their file, not a network request.
+//! [`RepoRef::parse`] reads all of these, for every command, so `fit` and `inspect` cannot
+//! disagree about what `org/repo:Q4_K_M` means. Resolution is ordered so that a path that
+//! exists always wins: someone with a directory named `org/repo` should get their file,
+//! not a network request.
 
 use anyhow::{bail, Context, Result};
-use sift_core::hub::{self, RepoFile};
+use sift_core::hub::{self, HubFile, RepoFile};
 use sift_core::model::{hf_url_at, Gguf, RemoteFile};
 use std::path::{Path, PathBuf};
+
+/// What a model reference names, before anything is fetched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RepoRef {
+    /// A path on this machine. It exists, or was unmistakably meant as a path.
+    Path(PathBuf),
+    /// A file on HuggingFace, at a revision.
+    HubFile(HubFile),
+    /// Any other URL.
+    Url(String),
+    /// An `org/repo`, optionally narrowed to one quantization.
+    Repo { repo: String, quant: Option<String> },
+}
+
+impl RepoRef {
+    /// Read a user-supplied reference. `quant_flag` is `--quant`, which may also be given
+    /// inline as `repo:QUANT` — but not both differently.
+    pub fn parse(reference: &str, quant_flag: Option<&str>) -> Result<Self> {
+        let expanded = expand_home(reference);
+        let as_path = Path::new(&expanded);
+        if as_path.exists() {
+            return Ok(RepoRef::Path(as_path.to_path_buf()));
+        }
+
+        if let Some(f) = hub::parse_hub_url(reference) {
+            return Ok(RepoRef::HubFile(f));
+        }
+        if let Some(repo) = hub_repo_url(reference) {
+            return Ok(RepoRef::Repo {
+                repo,
+                quant: quant_flag.map(str::to_owned),
+            });
+        }
+        if reference.starts_with("http://") || reference.starts_with("https://") {
+            return Ok(RepoRef::Url(reference.to_string()));
+        }
+
+        // A path that does not exist is a typo, not a hub repo. Asking HuggingFace about
+        // `/models/x.gguf` produces a 404 that reads as a network problem.
+        if looks_like_path(reference) {
+            bail!("no such file: {}", as_path.display());
+        }
+
+        let (repo, inline) = split_quant(reference);
+        let quant = match (inline, quant_flag) {
+            (Some(a), Some(b)) if !a.eq_ignore_ascii_case(b) => {
+                bail!("`{reference}` asks for {a} and --quant asks for {b}; name one quantization")
+            }
+            (a, b) => a.or(b).map(str::to_owned),
+        };
+        let parts: Vec<&str> = repo.split('/').collect();
+        if parts.len() != 2
+            || parts
+                .iter()
+                .any(|p| p.is_empty() || p.contains(char::is_whitespace))
+        {
+            bail!(
+                "`{reference}` is neither an existing path nor an `org/repo` reference.\n\
+                 Try:  sift inspect ./model.gguf\n   \
+                 or:  sift inspect unsloth/Qwen3-30B-A3B-GGUF:Q4_K_M"
+            );
+        }
+        Ok(RepoRef::Repo {
+            repo: repo.to_string(),
+            quant,
+        })
+    }
+}
+
+/// `~` and `~/…` expanded to the home directory; anything else unchanged.
+fn expand_home(reference: &str) -> String {
+    let rest = match reference.strip_prefix('~') {
+        Some(r) if r.is_empty() || r.starts_with('/') || r.starts_with('\\') => r,
+        _ => return reference.to_string(),
+    };
+    match std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
+        Some(home) => format!("{}{rest}", PathBuf::from(home).display()),
+        None => reference.to_string(),
+    }
+}
+
+/// `https://huggingface.co/org/repo` — a repo's page, with nothing after it.
+fn hub_repo_url(url: &str) -> Option<String> {
+    let rest = url
+        .strip_prefix("https://huggingface.co/")
+        .or_else(|| url.strip_prefix("https://hf.co/"))?;
+    let rest = rest.split(['?', '#']).next()?.trim_end_matches('/');
+    let mut it = rest.split('/');
+    let (org, name) = (it.next()?, it.next()?);
+    (it.next().is_none() && !org.is_empty() && !name.is_empty()).then(|| format!("{org}/{name}"))
+}
 
 /// A resolved model reference.
 #[derive(Debug)]
 pub enum Source {
     /// A file on this machine.
     Local(PathBuf),
-    /// A URL, plus the repo and file it came from when known.
+    /// A model on the network: one URL, or every part of a split model in order.
     Remote {
-        url: String,
+        urls: Vec<String>,
         label: String,
         /// The `org/repo` this was resolved from, when it was. A safetensors file keeps
         /// its architecture numbers in the repo's `config.json`, so knowing the repo is
         /// what makes KV sizing possible for that format.
         repo: Option<String>,
-        /// The revision `url` is pinned to, for fetching the matching `config.json`.
+        /// The revision the URLs are pinned to, for fetching the matching `config.json`.
         revision: String,
     },
 }
@@ -42,8 +136,8 @@ pub struct Loaded {
     pub fetched: Option<Fetched>,
     /// The weight format, which routing depends on.
     pub format: sift_core::engine::Format,
-    /// The parsed GGUF directory, kept so a caller that needs its byte offsets does not
-    /// fetch the header a second time.
+    /// The parsed GGUF directory of the first part, kept so a caller that needs its byte
+    /// offsets does not fetch the header a second time.
     pub gguf: Option<Gguf>,
 }
 
@@ -79,9 +173,7 @@ impl Fetched {
 /// Split a `repo:QUANT` reference into its two halves.
 ///
 /// Splits on the last colon so a URL-ish repo name is not mangled, and refuses a suffix
-/// containing `/`, which would mean the colon was part of something else. Shared by every
-/// command that takes a model reference, so `fit` and `route` cannot disagree about what
-/// `org/repo:Q4_K_M` means.
+/// containing `/`, which would mean the colon was part of something else.
 pub fn split_quant(reference: &str) -> (&str, Option<&str>) {
     match reference.rsplit_once(':') {
         // A trailing colon with nothing after it is a slip of the finger, not a
@@ -100,106 +192,120 @@ pub fn split_quant(reference: &str) -> (&str, Option<&str>) {
 /// prefix all settle it.
 fn looks_like_path(reference: &str) -> bool {
     let lower = reference.to_ascii_lowercase();
+    let b = reference.as_bytes();
     lower.ends_with(".gguf")
         || lower.ends_with(".safetensors")
         || reference.starts_with('/')
         || reference.starts_with("./")
         || reference.starts_with("../")
+        || reference.starts_with(".\\")
+        || reference.starts_with("..\\")
         || reference.starts_with('~')
         || reference.starts_with('\\')
-        || reference
-            .as_bytes()
-            .get(1)
-            .is_some_and(|&b| b == b':' && reference.as_bytes()[0].is_ascii_alphabetic())
-            && reference.len() > 2
+        || (b.len() > 2
+            && b[0].is_ascii_alphabetic()
+            && b[1] == b':'
+            && matches!(b[2], b'\\' | b'/'))
+}
+
+/// One model a repo offers: a single file, or every part of a split set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Model {
+    label: String,
+    /// Where the label came from, to tell two models of the same label apart.
+    path: String,
+    parts: Vec<String>,
+    size: u64,
+    split: bool,
+}
+
+/// Every model a repo listing holds. Incomplete sets are not models: two of three shards
+/// describe a model that cannot be loaded.
+fn models(files: &[RepoFile]) -> Vec<Model> {
+    let (whole, sets) = hub::group_shards(files);
+    whole
+        .iter()
+        .map(|f| Model {
+            label: f.quant_label(),
+            path: f.path.clone(),
+            parts: vec![f.path.clone()],
+            size: f.size.unwrap_or(0),
+            split: false,
+        })
+        .chain(sets.iter().filter(|s| s.is_complete()).map(|s| Model {
+            label: s.base.quant_label(),
+            path: s.base.path.clone(),
+            parts: s.parts.iter().map(|p| p.path.clone()).collect(),
+            size: s.size().unwrap_or(0),
+            split: true,
+        }))
+        .collect()
 }
 
 impl Source {
-    /// Parse a user-supplied reference.
+    /// Resolve a user-supplied reference to something readable.
     ///
     /// `quant` optionally narrows a repo reference; it is also accepted inline as
     /// `repo:QUANT`.
     pub fn resolve(reference: &str, quant: Option<&str>) -> Result<Self> {
-        // A real path always wins over a network guess.
-        let as_path = Path::new(reference);
-        if as_path.exists() {
-            return Ok(Source::Local(as_path.to_path_buf()));
-        }
-
-        // A HuggingFace page URL — the `blob` form a browser shows, or `resolve` — names a
-        // repo, a revision and a file. Read as a raw URL, the `blob` form fetched an HTML
-        // page; read this way it is the file, with the repo's config.json in reach.
-        if let Some(f) = hub::parse_hub_url(reference) {
-            let label = RepoFile {
-                path: f.path.clone(),
-                size: None,
+        match RepoRef::parse(reference, quant)? {
+            RepoRef::Path(p) => {
+                if p.is_dir() {
+                    bail!("{}", directory_hint(&p));
+                }
+                Ok(Source::Local(p))
             }
-            .quant_label();
-            return Ok(Source::Remote {
-                url: hf_url_at(&f.repo, &f.revision, &f.path),
-                label: format!("{}:{label}", f.repo),
-                repo: Some(f.repo),
-                revision: f.revision,
-            });
-        }
-
-        if reference.starts_with("http://") || reference.starts_with("https://") {
-            return Ok(Source::Remote {
-                url: reference.to_string(),
-                label: reference
-                    .rsplit('/')
-                    .next()
-                    .unwrap_or(reference)
-                    .to_string(),
+            // A HuggingFace page URL — the `blob` form a browser shows, or `resolve` —
+            // names a repo, a revision and a file. Read as a raw URL, the `blob` form
+            // fetched an HTML page; read this way it is the file, with the repo's
+            // config.json in reach.
+            RepoRef::HubFile(f) => {
+                let label = RepoFile {
+                    path: f.path.clone(),
+                    size: None,
+                }
+                .quant_label();
+                Ok(Source::Remote {
+                    urls: vec![hf_url_at(&f.repo, &f.revision, &f.path)],
+                    label: format!("{}:{label}", f.repo),
+                    repo: Some(f.repo),
+                    revision: f.revision,
+                })
+            }
+            RepoRef::Url(url) => Ok(Source::Remote {
+                label: url.rsplit('/').next().unwrap_or(&url).to_string(),
+                urls: vec![url],
                 repo: None,
                 revision: "main".to_string(),
-            });
+            }),
+            RepoRef::Repo { repo, quant } => {
+                let listing = hub::list_weights(&repo, None)?;
+                let offered = models(&listing.files);
+                let chosen = pick(&offered, quant.as_deref())
+                    .with_context(|| format!("choosing a model from `{repo}`"))?;
+                let revision = listing.revision(None).to_string();
+                Ok(Source::Remote {
+                    urls: chosen
+                        .parts
+                        .iter()
+                        .map(|p| hf_url_at(&repo, &revision, p))
+                        .collect(),
+                    label: format!("{repo}:{}", chosen.label),
+                    repo: Some(repo),
+                    revision,
+                })
+            }
         }
-
-        // A path that does not exist is a typo, not a hub repo. Asking HuggingFace about
-        // `/models/x.gguf` produces a 404 that reads as a network problem.
-        if looks_like_path(reference) {
-            bail!("no such file: {reference}");
-        }
-
-        let (repo, inline_quant) = split_quant(reference);
-        let wanted = quant.or(inline_quant);
-
-        if !repo.contains('/') {
-            bail!(
-                "`{reference}` is neither an existing path nor an `org/repo` reference.\n\
-                 Try:  sift inspect ./model.gguf\n   \
-                 or:  sift inspect unsloth/Qwen3-30B-A3B-GGUF:Q4_K_M"
-            );
-        }
-
-        let listing = hub::list_weights(repo, None)?;
-        let files = &listing.files;
-        let chosen = pick(files, wanted).with_context(|| {
-            let available: Vec<String> = files.iter().take(12).map(RepoFile::quant_label).collect();
-            format!(
-                "choosing a file from `{repo}`. Available: {}",
-                available.join(", ")
-            )
-        })?;
-        let revision = listing.revision(None).to_string();
-
-        Ok(Source::Remote {
-            url: hf_url_at(repo, &revision, &chosen.path),
-            label: format!("{repo}:{}", chosen.quant_label()),
-            repo: Some(repo.to_string()),
-            revision,
-        })
     }
 
-    /// Whether this source names a safetensors file rather than a GGUF.
+    /// Whether this source names safetensors rather than GGUF.
     ///
     /// Matched anywhere in the name, since a signed CDN URL carries its query string after
     /// the filename.
     fn is_safetensors(&self) -> bool {
         match self {
             Source::Local(p) => p.to_string_lossy().contains(".safetensors"),
-            Source::Remote { url, .. } => url.contains(".safetensors"),
+            Source::Remote { urls, .. } => urls.iter().any(|u| u.contains(".safetensors")),
         }
     }
 
@@ -207,41 +313,55 @@ impl Source {
     ///
     /// Returns the shape, its format and, for remote sources, how many bytes crossed the
     /// network — which callers print, because "we did not download the model" is a claim
-    /// that should come with evidence.
+    /// that should come with evidence. A split model is read part by part and merged,
+    /// since each part carries only its own slice of the tensor directory.
     ///
     /// GGUF carries its architecture facts in its own header. A safetensors file keeps them
     /// in `config.json`: the repo's, when the reference named a repo, or the one beside a
     /// local file — the layout every MLX and HF download has. A bare file or URL with
     /// neither is reported as unsized, not guessed at.
     pub fn read_shape(&self) -> Result<Loaded> {
-        if !self.is_safetensors() {
-            let (g, fetched) = self.read_gguf()?;
-            return Ok(Loaded {
-                shape: g.shape(),
-                fetched: fetched.map(|header| Fetched { header, config: 0 }),
-                format: sift_core::engine::Format::Gguf,
-                gguf: Some(g),
-            });
-        }
-
-        let (st, config, fetched, name) = match self {
-            Source::Local(p) => {
+        let safetensors = self.is_safetensors();
+        match self {
+            Source::Local(p) if safetensors => {
                 let mut f =
                     std::fs::File::open(p).with_context(|| format!("opening {}", p.display()))?;
                 let st = sift_core::model::Safetensors::parse(&mut f)
                     .with_context(|| format!("reading {}", p.display()))?;
-                (st, local_config(p), None, p.to_string_lossy().to_string())
+                let config = local_config(p);
+                Ok(Loaded {
+                    shape: sift_core::model::safetensors::model_shape(vec![st], config.as_ref()),
+                    fetched: None,
+                    format: sift_core::engine::format_of(&p.to_string_lossy(), config.as_ref()),
+                    gguf: None,
+                })
+            }
+            Source::Local(p) => {
+                let g = Gguf::open(p).with_context(|| format!("reading {}", p.display()))?;
+                Ok(Loaded {
+                    shape: g.shape(),
+                    fetched: None,
+                    format: sift_core::engine::Format::Gguf,
+                    gguf: Some(g),
+                })
             }
             Source::Remote {
-                url,
+                urls,
                 repo,
                 revision,
                 ..
-            } => {
-                let mut f = RemoteFile::new(url.clone()).with_initial_fetch(8);
-                let st = sift_core::model::Safetensors::parse(&mut f)
-                    .with_context(|| format!("reading {url}"))?;
-                f.persist();
+            } if safetensors => {
+                let mut parts = Vec::with_capacity(urls.len());
+                let mut header = 0;
+                for url in urls {
+                    let mut f = RemoteFile::new(url.clone()).with_initial_fetch(8);
+                    parts.push(
+                        sift_core::model::Safetensors::parse(&mut f)
+                            .with_context(|| format!("reading {url}"))?,
+                    );
+                    f.persist();
+                    header += f.bytes_fetched();
+                }
                 // Counted, but separately from the header: "nothing was downloaded" is a
                 // claim that should include every request made to back it, and a 660-byte
                 // config must not turn a revalidated header into "0.00 MiB of the model
@@ -251,33 +371,34 @@ impl Source {
                     Some((cfg, n)) => (Some(cfg), n),
                     None => (None, 0),
                 };
-                let fetched = Fetched {
-                    header: f.bytes_fetched(),
-                    config: n,
-                };
-                (st, config, Some(fetched), url.clone())
+                Ok(Loaded {
+                    shape: sift_core::model::safetensors::model_shape(parts, config.as_ref()),
+                    fetched: Some(Fetched { header, config: n }),
+                    format: sift_core::engine::format_of(&urls[0], config.as_ref()),
+                    gguf: None,
+                })
             }
-        };
-        Ok(Loaded {
-            shape: sift_core::model::safetensors::model_shape(vec![st], config.as_ref()),
-            fetched,
-            format: sift_core::engine::format_of(&name, config.as_ref()),
-            gguf: None,
-        })
-    }
-
-    /// Read the model's GGUF tensor directory. Payload is never fetched.
-    fn read_gguf(&self) -> Result<(Gguf, Option<u64>)> {
-        match self {
-            Source::Local(p) => {
-                let g = Gguf::open(p).with_context(|| format!("reading {}", p.display()))?;
-                Ok((g, None))
-            }
-            Source::Remote { url, .. } => {
-                let mut f = RemoteFile::new(url.clone());
-                let g = Gguf::parse(&mut f).with_context(|| format!("reading {url}"))?;
-                f.persist();
-                Ok((g, Some(f.bytes_fetched())))
+            Source::Remote { urls, .. } => {
+                let mut parts = Vec::with_capacity(urls.len());
+                let mut header = 0;
+                for (i, url) in urls.iter().enumerate() {
+                    let mut f = RemoteFile::new(url.clone());
+                    // Only the first part of a split model carries the tokenizer.
+                    if i > 0 {
+                        f = f.with_initial_fetch(64 << 10);
+                    }
+                    parts.push(Gguf::parse(&mut f).with_context(|| format!("reading {url}"))?);
+                    f.persist();
+                    header += f.bytes_fetched();
+                }
+                let shape = sift_core::model::ModelShape::sharded(&parts)
+                    .context("a model with no parts")?;
+                Ok(Loaded {
+                    shape,
+                    fetched: Some(Fetched { header, config: 0 }),
+                    format: sift_core::engine::Format::Gguf,
+                    gguf: parts.into_iter().next(),
+                })
             }
         }
     }
@@ -291,42 +412,111 @@ impl Source {
     }
 }
 
-/// Choose one file from a repo's weight listing.
+/// What to say when a directory is passed where a model file was expected.
+fn directory_hint(dir: &Path) -> String {
+    let mut weights: Vec<String> = std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.extension()
+                        .is_some_and(|e| e == "gguf" || e == "safetensors")
+                })
+                .map(|p| p.display().to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    weights.sort();
+    match weights.first() {
+        Some(first) => format!(
+            "{} is a directory; pass one of its weight files, e.g.\n  {first}",
+            dir.display()
+        ),
+        None => format!(
+            "{} is a directory with no .gguf or .safetensors file in it",
+            dir.display()
+        ),
+    }
+}
+
+/// Choose one model from a repo.
 ///
-/// With no preference, prefers the largest non-shard file, on the reasoning that a repo's
-/// flagship quantization is usually its biggest single file. Split shards are excluded:
-/// shard 2 of 3 is not a model, and its header describes only part of one.
-fn pick<'a>(files: &'a [RepoFile], quant: Option<&str>) -> Result<&'a RepoFile> {
-    let whole: Vec<&RepoFile> = files.iter().filter(|f| !f.is_shard()).collect();
-    if whole.is_empty() {
+/// With no preference, the largest single file, on the reasoning that a repo's flagship
+/// quantization is usually its biggest one; a repo of split sets only (every safetensors
+/// repo past a few GB) gets its largest complete set.
+///
+/// With a preference, an exact label wins, case-insensitively. Failing that a substring
+/// match is accepted only when it is the only one: `Q4` against `IQ4_XS`, `Q4_0` and
+/// `Q4_K_M` is a question, and answering it with the smallest silently inspected a
+/// different file from the one meant.
+fn pick<'a>(models: &'a [Model], quant: Option<&str>) -> Result<&'a Model> {
+    if models.is_empty() {
         bail!(
-            "this repo only contains split shards, which cannot be inspected individually — \
-             `sift fit` sums the parts of a split model"
+            "no complete model in this repo: only some parts of a split model are listed, \
+             which cannot be read as a model"
         );
     }
-
-    match quant {
-        Some(want) => {
-            let want_up = want.to_ascii_uppercase();
-            whole
-                .iter()
-                .find(|f| f.quant_label() == want_up)
-                // Fall back to a substring match so `Q4` finds `Q4_K_M`.
-                .or_else(|| whole.iter().find(|f| f.quant_label().contains(&want_up)))
-                .copied()
-                .with_context(|| format!("no file matching quantization `{want}`"))
-        }
-        None => whole
+    let labels = || {
+        models
             .iter()
-            .max_by_key(|f| f.size.unwrap_or(0))
-            .copied()
-            .context("no candidate files"),
+            .map(|m| m.label.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let Some(want) = quant else {
+        return models
+            .iter()
+            .filter(|m| !m.split)
+            .max_by_key(|m| m.size)
+            .or_else(|| models.iter().max_by_key(|m| m.size))
+            .context("no candidate models");
+    };
+
+    let exact: Vec<&Model> = models
+        .iter()
+        .filter(|m| m.label.eq_ignore_ascii_case(want))
+        .collect();
+    let matches = if exact.is_empty() {
+        let up = want.to_ascii_uppercase();
+        models
+            .iter()
+            .filter(|m| m.label.to_ascii_uppercase().contains(&up))
+            .collect()
+    } else {
+        exact
+    };
+    match matches.as_slice() {
+        [one] => Ok(one),
+        [] => bail!(
+            "no file matching quantization `{want}`. Available: {}",
+            labels()
+        ),
+        several => bail!(
+            "`{want}` matches {}; name one",
+            several
+                .iter()
+                .map(
+                    |m| if several.iter().filter(|o| o.label == m.label).count() > 1 {
+                        m.path.as_str()
+                    } else {
+                        m.label.as_str()
+                    }
+                )
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// [`pick`] over a listing, owning its answer.
+    fn choose(files: &[RepoFile], quant: Option<&str>) -> Result<Model> {
+        pick(&models(files), quant).cloned()
+    }
 
     fn f(path: &str, size: u64) -> RepoFile {
         RepoFile {
@@ -338,19 +528,25 @@ mod tests {
     #[test]
     fn an_explicit_quant_is_honoured() {
         let files = vec![f("M-Q2_K.gguf", 10), f("M-Q4_K_M.gguf", 20)];
-        assert_eq!(pick(&files, Some("Q4_K_M")).unwrap().path, "M-Q4_K_M.gguf");
+        assert_eq!(
+            choose(&files, Some("Q4_K_M")).unwrap().path,
+            "M-Q4_K_M.gguf"
+        );
     }
 
     #[test]
     fn a_partial_quant_matches_by_substring() {
         let files = vec![f("M-Q2_K.gguf", 10), f("M-Q4_K_M.gguf", 20)];
-        assert_eq!(pick(&files, Some("Q4")).unwrap().path, "M-Q4_K_M.gguf");
+        assert_eq!(choose(&files, Some("Q4")).unwrap().path, "M-Q4_K_M.gguf");
     }
 
     #[test]
     fn quant_matching_is_case_insensitive() {
         let files = vec![f("M-Q4_K_M.gguf", 20)];
-        assert_eq!(pick(&files, Some("q4_k_m")).unwrap().path, "M-Q4_K_M.gguf");
+        assert_eq!(
+            choose(&files, Some("q4_k_m")).unwrap().path,
+            "M-Q4_K_M.gguf"
+        );
     }
 
     #[test]
@@ -358,23 +554,121 @@ mod tests {
         // A shard's header describes part of a model; reporting it as the model would be
         // wrong in a way the user cannot see.
         let files = vec![f("M-BF16-00001-of-00002.gguf", 100), f("M-Q4_K_M.gguf", 20)];
-        assert_eq!(pick(&files, None).unwrap().path, "M-Q4_K_M.gguf");
+        assert_eq!(choose(&files, None).unwrap().path, "M-Q4_K_M.gguf");
     }
 
     #[test]
     fn a_repo_of_only_shards_is_an_error_not_a_silent_wrong_answer() {
         let files = vec![f("M-BF16-00001-of-00002.gguf", 100)];
-        assert!(pick(&files, None).is_err());
+        assert!(choose(&files, None).is_err());
     }
 
     #[test]
     fn an_unknown_quant_lists_what_was_available() {
         let files = vec![f("M-Q2_K.gguf", 10)];
-        let err = pick(&files, Some("Q8_0")).unwrap_err().to_string();
+        let err = choose(&files, Some("Q8_0")).unwrap_err().to_string();
         assert!(
             err.contains("Q8_0"),
             "the error should name what was asked for: {err}"
         );
+    }
+
+    #[test]
+    fn an_ambiguous_partial_quant_asks_rather_than_picking_the_smallest() {
+        // Regression: `Q4` silently became IQ4_XS, the smallest of five matches.
+        let files = vec![
+            f("M-IQ4_XS.gguf", 16),
+            f("M-Q4_0.gguf", 17),
+            f("M-Q4_K_M.gguf", 18),
+        ];
+        let err = choose(&files, Some("Q4")).unwrap_err().to_string();
+        assert!(err.contains("name one"), "{err}");
+        assert!(err.contains("IQ4_XS") && err.contains("Q4_K_M"), "{err}");
+    }
+
+    #[test]
+    fn the_model_label_of_a_safetensors_repo_matches_without_case() {
+        let files = vec![
+            f("model-00001-of-00002.safetensors", 5),
+            f("model-00002-of-00002.safetensors", 5),
+        ];
+        let m = choose(&files, Some("MODEL")).unwrap();
+        assert_eq!(m.parts.len(), 2, "every part of the set, in order");
+        assert_eq!(m.parts[0], "model-00001-of-00002.safetensors");
+    }
+
+    #[test]
+    fn a_split_safetensors_repo_is_one_readable_model() {
+        // Regression: a repo holding only `model-0000x-of-0000N.safetensors` could not be
+        // inspected at all — "this repo only contains split shards".
+        let files = vec![
+            f("model-00002-of-00002.safetensors", 4),
+            f("model-00001-of-00002.safetensors", 4),
+        ];
+        let m = choose(&files, None).unwrap();
+        assert!(m.split);
+        assert_eq!(m.size, 8);
+    }
+
+    #[test]
+    fn an_inline_quant_and_a_conflicting_flag_are_refused() {
+        let err = RepoRef::parse("org/repo:Q4_K_M", Some("Q8_0"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("name one"), "{err}");
+        // The same quantization twice is not a conflict.
+        assert_eq!(
+            RepoRef::parse("org/repo:q8_0", Some("Q8_0")).unwrap(),
+            RepoRef::Repo {
+                repo: "org/repo".into(),
+                quant: Some("q8_0".into())
+            }
+        );
+    }
+
+    #[test]
+    fn references_are_classified_without_touching_the_network() {
+        assert!(matches!(
+            RepoRef::parse("https://huggingface.co/o/r/blob/main/x.gguf", None).unwrap(),
+            RepoRef::HubFile(_)
+        ));
+        assert_eq!(
+            RepoRef::parse("https://huggingface.co/unsloth/Qwen3-30B-A3B-GGUF", None).unwrap(),
+            RepoRef::Repo {
+                repo: "unsloth/Qwen3-30B-A3B-GGUF".into(),
+                quant: None
+            }
+        );
+        assert!(matches!(
+            RepoRef::parse("https://example.com/m.gguf", None).unwrap(),
+            RepoRef::Url(_)
+        ));
+        assert!(RepoRef::parse("org/repo/extra", None).is_err());
+    }
+
+    #[test]
+    fn a_tilde_is_expanded_to_the_home_directory() {
+        let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
+        if let Some(home) = home {
+            let want = format!("{}/models/x.gguf", PathBuf::from(home).display());
+            assert_eq!(expand_home("~/models/x.gguf"), want);
+        }
+        assert_eq!(
+            expand_home("~user/x"),
+            "~user/x",
+            "only the caller's own home"
+        );
+    }
+
+    #[test]
+    fn a_directory_is_answered_with_the_weight_files_inside_it() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("model.safetensors"), b"x").unwrap();
+        let err = Source::resolve(d.path().to_str().unwrap(), None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("is a directory"), "{err}");
+        assert!(err.contains("model.safetensors"), "{err}");
     }
 
     #[test]
@@ -397,10 +691,10 @@ mod tests {
         .unwrap();
         match s {
             Source::Remote {
-                url, label, repo, ..
+                urls, label, repo, ..
             } => {
                 assert_eq!(
-                    url,
+                    urls[0],
                     "https://huggingface.co/unsloth/Qwen3-30B-A3B-GGUF/resolve/main/Qwen3-30B-A3B-Q4_K_M.gguf"
                 );
                 assert_eq!(label, "unsloth/Qwen3-30B-A3B-GGUF:Q4_K_M");
@@ -428,6 +722,8 @@ mod tests {
             "models/missing.gguf",
             "org/repo.safetensors",
             "C:\\models\\missing.gguf",
+            "C:\\x.gguf",
+            ".\\missing.gguf",
         ] {
             let err = Source::resolve(reference, None).unwrap_err().to_string();
             assert!(
@@ -442,6 +738,11 @@ mod tests {
         assert!(!looks_like_path("unsloth/Qwen3-30B-A3B-GGUF"));
         assert!(!looks_like_path("unsloth/Qwen3-30B-A3B-GGUF:Q4_K_M"));
         assert!(!looks_like_path("Qwen/Qwen2.5-0.5B-Instruct"));
+        assert!(
+            looks_like_path("C:\\models"),
+            "a drive path without an extension"
+        );
+        assert!(!looks_like_path("C:x"), "not a drive path");
     }
 
     #[test]

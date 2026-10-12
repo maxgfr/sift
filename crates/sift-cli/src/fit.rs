@@ -27,7 +27,7 @@ pub struct Candidate {
     pub label: String,
     /// The file this row describes, or the path a split set would have as one file.
     pub path: String,
-    /// What to pass `huggingface-cli download` to get this quantization.
+    /// What to pass `hf download` to get this quantization.
     ///
     /// A path for a single file, a `--include` glob for a split set. Naming one shard
     /// would fetch a third of a model that then fails to load, which is a worse outcome
@@ -44,6 +44,11 @@ pub struct Candidate {
     pub bits_per_weight: Option<f64>,
     /// KV cache bytes at the context this evaluation assumed.
     pub kv_bytes: u64,
+    /// Whether the metadata was enough to size the KV cache at all. A sized cache can be
+    /// zero (an all-recurrent model); an unsized one is unknown, not zero.
+    pub kv_known: bool,
+    /// The context the model was trained for, when it says so.
+    pub train_context: Option<u64>,
     /// Files this quantization ships as. 1 for the ordinary case.
     pub shard_count: u32,
     /// Tensors of a dtype this build cannot size, left out of `bits_per_weight`.
@@ -519,7 +524,9 @@ fn build(
 
     // A model that fits only with an empty context is a model that fails an hour in.
     // Classify on weights plus cache, not on the file size.
-    let kv_bytes = model::infer_kv_shape(shape)
+    let kv_shape = model::infer_kv_shape(shape);
+    let kv_bytes = kv_shape
+        .as_ref()
         .map(|kv| kv.bytes_at(context_tokens, model::KV_F16_BYTES))
         .unwrap_or(0);
 
@@ -551,6 +558,8 @@ fn build(
         top_k_assumed,
         bits_per_weight: shape.bits_per_weight(),
         kv_bytes,
+        kv_known: kv_shape.is_some(),
+        train_context: kv_shape.and_then(|kv| kv.train_context),
         format,
     }
 }
@@ -567,11 +576,29 @@ pub fn recommended(cands: &[Candidate]) -> Option<&Candidate> {
 }
 
 /// Emit the same evaluation as [`report`], as one JSON document on stdout.
+/// The command that downloads a candidate.
+///
+/// `hf`, the HuggingFace CLI that replaced the deprecated `huggingface-cli`.
+pub fn download_command(repo: &str, c: &Candidate) -> String {
+    format!("hf download {repo} {}", c.download_arg)
+}
+
+/// Whether the context asked for runs past what the model was trained on.
+fn beyond_training(cands: &[Candidate], context_tokens: u64) -> Option<u64> {
+    cands
+        .iter()
+        .filter_map(|c| c.train_context)
+        .min()
+        .filter(|&t| context_tokens > t)
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn report_json(
     repo: &str,
     cands: &[Candidate],
     facts: &sift_core::doctor::MachineFacts,
     usable_ram: u64,
+    installed: &[Installed],
     memory_gb_per_sec: f64,
     context_tokens: u64,
 ) -> Result<()> {
@@ -581,7 +608,8 @@ pub fn report_json(
             serde_json::json!({
                 "quant": c.label,
                 "size_bytes": c.size_bytes,
-                "kv_cache_bytes": c.kv_bytes,
+                // Null when the metadata cannot size it: "unknown" is not "zero".
+                "kv_cache_bytes": c.kv_known.then_some(c.kv_bytes),
                 "footprint_bytes": c.footprint_bytes(),
                 "regime": c.regime,
                 "bits_per_weight": c.bits_per_weight,
@@ -616,11 +644,19 @@ pub fn report_json(
             "context_tokens": context_tokens,
             "quality_floor_bits_per_weight": QUALITY_FLOOR_BPW,
             "candidates": rows,
-            "recommended": best.map(|c| serde_json::json!({
-                "quant": c.label,
-                "download_arg": c.download_arg,
-                "below_quality_floor": !c.meets_quality_floor(),
-            })),
+            "context_exceeds_training": beyond_training(cands, context_tokens).is_some(),
+            "recommended": best.map(|c| {
+                let rec = engine::route(c.footprint_bytes(), c.format, usable_ram, installed);
+                serde_json::json!({
+                    "quant": c.label,
+                    "download_arg": c.download_arg,
+                    "download_command": download_command(repo, c),
+                    "below_quality_floor": !c.meets_quality_floor(),
+                    "engine": rec.engine.as_ref().map(|e| e.id),
+                    "installed": rec.installed,
+                    "reason": rec.reason,
+                })
+            }),
             "estimates": {
                 "dense_efficiency": DENSE_EFFICIENCY,
                 "moe_efficiency": MOE_EFFICIENCY,
@@ -640,14 +676,15 @@ pub fn report(
     context_tokens: u64,
 ) -> Result<()> {
     if cands.is_empty() {
-        anyhow::bail!("no readable GGUF files in `{repo}`");
+        anyhow::bail!("no readable weight files in `{repo}`");
     }
 
     // State the assumption before the table, because `fits` is only meaningful relative to
     // it. The same model fits at 4k and does not at 128k, and a table that hides which one
-    // it answered is worse than no table.
+    // it answered is worse than no table. Whether the cache was sized is a fact about the
+    // metadata, not about the number: a cache sized at zero is still sized.
     let kv = cands.iter().map(|c| c.kv_bytes).max().unwrap_or(0);
-    if kv > 0 {
+    if cands.iter().any(|c| c.kv_known) {
         println!(
             "\n  fits assumes {} tokens of context: {:.2} GB of f16 KV cache, counted\n  \
              alongside the weights. Change it with --ctx.",
@@ -658,6 +695,12 @@ pub fn report(
         println!(
             "\n  KV cache not counted: this model's metadata does not state its attention\n  \
              shape, so `fits` covers weights only and is optimistic at long context."
+        );
+    }
+    if let Some(trained) = beyond_training(cands, context_tokens) {
+        println!(
+            "  warning: {context_tokens} tokens is past the {trained} this model was trained for;\n  \
+             quality past that point depends on how the engine extends the context."
         );
     }
 
@@ -747,10 +790,7 @@ pub fn report(
                     ""
                 );
             }
-            println!(
-                "    download   huggingface-cli download {repo} {}",
-                c.download_arg
-            );
+            println!("    download   {}", download_command(repo, c));
         }
         None => {
             println!(
@@ -813,6 +853,8 @@ mod tests {
             // The regime is supplied directly by these tests, so the cache is already
             // accounted for in whatever the caller passed.
             kv_bytes: 0,
+            kv_known: true,
+            train_context: None,
             shard_count: 1,
             dropped_tensors: 0,
             format: Format::Gguf,

@@ -115,7 +115,7 @@ enum Command {
         /// Defaults to 4096, which is roughly what engines start at. Not the model's
         /// trained maximum: sizing for 262k would report that almost nothing fits, which
         /// is true and useless. Raise it to see what your actual workload costs.
-        #[arg(long, default_value_t = DEFAULT_CONTEXT_TOKENS)]
+        #[arg(long, default_value_t = DEFAULT_CONTEXT_TOKENS, value_parser = clap::value_parser!(u64).range(1..))]
         ctx: u64,
         /// Emit JSON instead of a human-readable report.
         #[arg(long)]
@@ -129,6 +129,9 @@ enum Command {
         /// Pick a quantization when `model` is a repo.
         #[arg(long)]
         quant: Option<String>,
+        /// Context length to size the KV cache for, in tokens, as `fit` does.
+        #[arg(long, default_value_t = DEFAULT_CONTEXT_TOKENS, value_parser = clap::value_parser!(u64).range(1..))]
+        ctx: u64,
         /// Emit JSON instead of a human-readable report.
         #[arg(long)]
         json: bool,
@@ -137,7 +140,7 @@ enum Command {
     /// Every local model, across LM Studio, Ollama, colibri and ~/.sift.
     Ls {
         /// Context length to size the KV cache for, in tokens.
-        #[arg(long, default_value_t = DEFAULT_CONTEXT_TOKENS)]
+        #[arg(long, default_value_t = DEFAULT_CONTEXT_TOKENS, value_parser = clap::value_parser!(u64).range(1..))]
         ctx: u64,
         /// Emit JSON instead of a human-readable report.
         #[arg(long)]
@@ -156,10 +159,10 @@ enum Command {
         #[arg(long)]
         model: Option<String>,
         /// Tokens to generate per run.
-        #[arg(long, default_value_t = 128)]
+        #[arg(long, default_value_t = 128, value_parser = clap::value_parser!(u32).range(1..))]
         max_tokens: u32,
         /// Measured runs, after a discarded warm-up.
-        #[arg(long, default_value_t = 3)]
+        #[arg(long, default_value_t = 3, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
         repeats: usize,
         /// Prompt to send.
         #[arg(long, default_value = "Explain what a mixture-of-experts layer does.")]
@@ -200,7 +203,7 @@ enum Command {
         #[arg(long)]
         quant: Option<String>,
         /// Expert-cache hit rate to assume, 0.0 to 1.0.
-        #[arg(long, default_value_t = 0.0)]
+        #[arg(long, default_value_t = 0.0, value_parser = parse_fraction)]
         hit_rate: f64,
         /// Emit JSON instead of a human-readable report.
         #[arg(long)]
@@ -208,8 +211,49 @@ enum Command {
     },
 }
 
-fn main() -> Result<()> {
-    match Cli::parse().command {
+/// A fraction from 0 to 1, as `--hit-rate` takes. NaN and anything outside are refused
+/// rather than clamped: a 200% hit rate is a typo, and printing ceilings for it is a lie.
+fn parse_fraction(s: &str) -> Result<f64, String> {
+    let v: f64 = s.parse().map_err(|_| format!("`{s}` is not a number"))?;
+    if !(0.0..=1.0).contains(&v) {
+        return Err(format!("{s} is not between 0 and 1"));
+    }
+    Ok(v)
+}
+
+impl Command {
+    /// Whether this invocation asked for JSON.
+    fn json(&self) -> bool {
+        match self {
+            Command::Doctor { json, .. }
+            | Command::Inspect { json, .. }
+            | Command::Fit { json, .. }
+            | Command::Route { json, .. }
+            | Command::Ls { json, .. }
+            | Command::Bench { json, .. }
+            | Command::Engines { json }
+            | Command::Cache { json, .. }
+            | Command::Plan { json, .. } => *json,
+        }
+    }
+}
+
+fn main() {
+    let command = Cli::parse().command;
+    let json = command.json();
+    if let Err(e) = run(command) {
+        // Under --json stdout stays one parseable document even on failure, so a script
+        // reading it gets an error object instead of nothing.
+        if json {
+            println!("{}", serde_json::json!({ "error": format!("{e:#}") }));
+        }
+        eprintln!("Error: {e:?}");
+        std::process::exit(1);
+    }
+}
+
+fn run(command: Command) -> Result<()> {
+    match command {
         Command::Doctor { disk_sample, json } => cmd_doctor(disk_sample, json),
         Command::Inspect {
             model,
@@ -224,9 +268,12 @@ fn main() -> Result<()> {
             json,
         } => cmd_plan(&Source::resolve(&model, quant.as_deref())?, hit_rate, json),
         Command::Fit { repo, ctx, json } => cmd_fit(&repo, ctx, json),
-        Command::Route { model, quant, json } => {
-            cmd_route(&Source::resolve(&model, quant.as_deref())?, json)
-        }
+        Command::Route {
+            model,
+            quant,
+            ctx,
+            json,
+        } => cmd_route(&Source::resolve(&model, quant.as_deref())?, ctx, json),
         Command::Ls { ctx, json } => cmd_ls(ctx, json),
         Command::Bench {
             engine,
@@ -307,22 +354,42 @@ fn cmd_cache(clear: bool, json: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_fit(repo: &str, context_tokens: u64, json: bool) -> Result<()> {
+fn cmd_fit(reference: &str, context_tokens: u64, json: bool) -> Result<()> {
     // `fit repo:QUANT` asks about one quantization. The suffix is stripped here rather than
     // reaching the hub: it used to be sent as part of the repo name, and HuggingFace answers
-    // a 401 for a repo that does not exist, so a valid request read as an auth failure.
-    // A HuggingFace file URL — the `blob` form a browser shows, or `resolve` — narrows
-    // the sweep to that one file, at the revision the URL names.
-    let hub_file = sift_core::hub::parse_hub_url(repo);
-    let (repo, quant) = match &hub_file {
-        Some(f) => (f.repo.as_str(), None),
-        None => source::split_quant(repo),
+    // a 401 for a repo that does not exist, so a valid request read as an auth failure. A
+    // HuggingFace file URL — the `blob` form a browser shows, or `resolve` — narrows the
+    // sweep to that one file, at the revision the URL names.
+    let parsed = source::RepoRef::parse(reference, None)?;
+    let (target, quant) = match &parsed {
+        source::RepoRef::Repo { repo, quant } => (
+            fit::Target {
+                repo,
+                ..Default::default()
+            },
+            quant.as_deref(),
+        ),
+        source::RepoRef::HubFile(f) => (
+            fit::Target {
+                repo: &f.repo,
+                revision: Some(&f.revision),
+                only: Some(&f.path),
+            },
+            None,
+        ),
+        // `fit` sweeps a repo's quantizations. A file already on disk has one, and
+        // sending its path to the hub as a repo name produced a 401.
+        source::RepoRef::Path(p) => anyhow::bail!(
+            "{} is a local file; `fit` compares the quantizations a HuggingFace repo offers.\n\
+             For a file you have:  sift inspect {0}   or   sift route {0}",
+            p.display()
+        ),
+        source::RepoRef::Url(u) => anyhow::bail!(
+            "{u} is not a HuggingFace repo; `fit` compares the quantizations a repo offers.\n\
+             For one file:  sift inspect {u}   or   sift route {u}"
+        ),
     };
-    let target = fit::Target {
-        repo,
-        revision: hub_file.as_ref().map(|f| f.revision.as_str()),
-        only: hub_file.as_ref().map(|f| f.path.as_str()),
-    };
+    let repo = target.repo;
 
     let facts = MachineFacts::collect();
     let usable = usable_ram(&facts);
@@ -350,6 +417,10 @@ fn cmd_fit(repo: &str, context_tokens: u64, json: bool) -> Result<()> {
     }
 
     let cands = fit::evaluate(target, mem.gb_per_sec * 1e9, usable, context_tokens)?;
+    // The same answer, and the same exit code, whether or not --json was asked for.
+    if cands.is_empty() {
+        anyhow::bail!("no readable weight files in `{repo}`");
+    }
     // Narrow after the sweep, not before it: the hub listing is what knows which labels
     // exist, so an unmatched suffix can be answered with the ones that do.
     let cands = match quant {
@@ -357,12 +428,20 @@ fn cmd_fit(repo: &str, context_tokens: u64, json: bool) -> Result<()> {
         None => cands,
     };
     if json {
-        return fit::report_json(repo, &cands, &facts, usable, mem.gb_per_sec, context_tokens);
+        return fit::report_json(
+            repo,
+            &cands,
+            &facts,
+            usable,
+            &installed,
+            mem.gb_per_sec,
+            context_tokens,
+        );
     }
     fit::report(repo, &cands, usable, &installed, context_tokens)
 }
 
-fn cmd_route(src: &Source, json: bool) -> Result<()> {
+fn cmd_route(src: &Source, context_tokens: u64, json: bool) -> Result<()> {
     let loaded = src.read_shape()?;
     let shape = loaded.shape;
     let facts = MachineFacts::collect();
@@ -373,7 +452,11 @@ fn cmd_route(src: &Source, json: bool) -> Result<()> {
     // assuming GGUF here would recommend an engine that cannot open the file.
     let format = loaded.format;
     let size = shape.total_tensor_bytes();
-    let rec = sift_core::engine::route(size, format, usable, &installed);
+    // Route on weights plus the KV cache, as `fit` does. Routing on the file alone sent a
+    // model to an in-memory engine that `fit` had just said does not fit at this context.
+    let kv = model::infer_kv_shape(&shape).map(|k| k.bytes_at(context_tokens, model::KV_F16_BYTES));
+    let footprint = size.saturating_add(kv.unwrap_or(0));
+    let rec = sift_core::engine::route(footprint, format, usable, &installed);
 
     if json {
         println!(
@@ -381,9 +464,14 @@ fn cmd_route(src: &Source, json: bool) -> Result<()> {
             serde_json::to_string_pretty(&serde_json::json!({
                 "model": src.label(),
                 "size_bytes": size,
+                "context_tokens": context_tokens,
+                // Null when the metadata cannot size it, rather than a zero that reads as
+                // "no cache".
+                "kv_cache_bytes": kv,
+                "footprint_bytes": footprint,
                 "usable_memory_bytes": usable,
                 "format": format,
-                "regime": sift_core::engine::Regime::classify(size, usable),
+                "regime": sift_core::engine::Regime::classify(footprint, usable),
                 "engine": rec.engine.as_ref().map(|e| serde_json::json!({
                     "id": e.id,
                     "name": e.name,
@@ -411,6 +499,13 @@ fn cmd_route(src: &Source, json: bool) -> Result<()> {
 
     println!("{}", src.label());
     println!("  size             {:.2} GiB", sift_core::gib(size));
+    match kv {
+        Some(kv) => println!(
+            "  kv cache         {:.2} GiB at {context_tokens} tokens (f16), counted",
+            sift_core::gib(kv)
+        ),
+        None => println!("  kv cache         not sizeable from this model's metadata"),
+    }
     println!("  usable memory    {:.2} GiB", sift_core::gib(usable));
 
     match &rec.engine {
@@ -605,6 +700,11 @@ fn cmd_engines(json: bool) -> Result<()> {
 }
 
 fn cmd_doctor(disk_sample: Option<PathBuf>, json: bool) -> Result<()> {
+    // Refused before anything is measured: a missing file used to print twelve "skipped"
+    // lines after the memory probes and exit 0.
+    if let Some(path) = disk_sample.as_ref().filter(|p| !p.is_file()) {
+        anyhow::bail!("--disk-sample {}: no such file", path.display());
+    }
     let facts = MachineFacts::collect_with_vram();
     let usable = usable_ram(&facts);
 
@@ -1066,16 +1166,17 @@ fn cmd_inspect(src: &Source, list_tensors: bool, json: bool) -> Result<()> {
 
 fn cmd_plan(src: &Source, hit_rate: f64, json: bool) -> Result<()> {
     let model_shape = src.read_shape()?.shape;
-    let shape = model::infer_moe_shape(&model_shape)
-        .context("this model has no expert tensors; planning targets MoE models")?;
+    let moe = model::infer_moe_shape(&model_shape);
 
     // Everything that is not a routed expert is read on every token regardless of routing.
+    // A dense model is all trunk: its ceiling is simpler, not absent, and refusing to
+    // print it sent people to work it out by hand.
     let trunk_bytes = model_shape
         .total_tensor_bytes()
-        .saturating_sub(shape.total_expert_bytes());
+        .saturating_sub(moe.as_ref().map_or(0, |m| m.total_expert_bytes()));
 
     let traffic = model::TokenTraffic {
-        expert_bytes: shape.expert_bytes_per_token(),
+        expert_bytes: moe.as_ref().map_or(0, |m| m.expert_bytes_per_token()),
         trunk_bytes,
     };
 
@@ -1087,8 +1188,9 @@ fn cmd_plan(src: &Source, hit_rate: f64, json: bool) -> Result<()> {
             serde_json::to_string_pretty(&serde_json::json!({
                 "model": src.label(),
                 "hit_rate": hit_rate,
-                "experts_per_token": shape.experts_per_token,
-                "experts_per_token_assumed": shape.experts_per_token_assumed,
+                "is_moe": moe.is_some(),
+                "experts_per_token": moe.as_ref().map(|m| m.experts_per_token),
+                "experts_per_token_assumed": moe.as_ref().map(|m| m.experts_per_token_assumed),
                 "per_token_bytes": {
                     "routed_experts": traffic.expert_bytes,
                     "always_active": trunk_bytes,
@@ -1101,8 +1203,11 @@ fn cmd_plan(src: &Source, hit_rate: f64, json: bool) -> Result<()> {
                 },
                 // Stated in the payload, not only in the prose, so a consumer that never
                 // reads the human output cannot mistake a roofline for a prediction.
-                "note": "roofline ceilings, not predictions; measured MoE decode lands at \
-                         ~76% of the resident figure",
+                "note": format!(
+                    "roofline ceilings, not predictions; measured decode lands at ~{:.0}% of \
+                     the resident figure",
+                    if moe.is_some() { fit::MOE_EFFICIENCY } else { fit::DENSE_EFFICIENCY } * 100.0
+                ),
             }))?
         );
         return Ok(());
@@ -1110,18 +1215,28 @@ fn cmd_plan(src: &Source, hit_rate: f64, json: bool) -> Result<()> {
 
     println!("{}", src.label());
     println!("\nper-token weight traffic");
-    println!(
-        "  routed experts   {:.3} GB   ({} experts x {} layers)",
-        traffic.expert_bytes as f64 / 1e9,
-        shape.experts_per_token,
-        shape.moe_layers
-    );
-    println!(
-        "  always-active    {:.3} GB   (read every token, no cache helps)",
-        trunk_bytes as f64 / 1e9
-    );
+    match &moe {
+        Some(shape) => {
+            println!(
+                "  routed experts   {:.3} GB   ({} experts x {} layers)",
+                traffic.expert_bytes as f64 / 1e9,
+                shape.experts_per_token,
+                shape.moe_layers
+            );
+            println!(
+                "  always-active    {:.3} GB   (read every token, no cache helps)",
+                trunk_bytes as f64 / 1e9
+            );
+        }
+        None => println!(
+            "  dense model      {:.3} GB   (every weight is read every token; a hit rate\n\
+             {:>32}changes nothing without experts to cache)",
+            trunk_bytes as f64 / 1e9,
+            ""
+        ),
+    }
     println!("  total cold       {:.3} GB", traffic.total() as f64 / 1e9);
-    if shape.experts_per_token_assumed {
+    if let Some(shape) = moe.as_ref().filter(|m| m.experts_per_token_assumed) {
         println!(
             "\n  top-k is not stated in this model's metadata, so {} experts per token is\n  \
              assumed. Routed traffic scales with it: read the figures above as a guess.",
@@ -1147,10 +1262,15 @@ fn cmd_plan(src: &Source, hit_rate: f64, json: bool) -> Result<()> {
         traffic.tokens_per_sec(6.15e9, hit_rate)
     );
     println!(
-        "\n  These are roofline ceilings, not predictions. The one MoE model measured on a\n  \
+        "\n  These are roofline ceilings, not predictions. The {} model measured on a\n  \
          real engine reached {:.0}% of the resident figure — `sift fit` applies that factor,\n  \
          this command does not. Measure your own with `sift bench`.",
-        fit::MOE_EFFICIENCY * 100.0
+        if moe.is_some() { "one MoE" } else { "dense" },
+        if moe.is_some() {
+            fit::MOE_EFFICIENCY
+        } else {
+            fit::DENSE_EFFICIENCY
+        } * 100.0
     );
 
     Ok(())
@@ -1188,6 +1308,44 @@ mod tests {
             usable_ram(&facts(64, AccelMemory::Unknown)),
             60 * sift_core::GIB
         );
+    }
+
+    fn parses(args: &[&str]) -> bool {
+        Cli::try_parse_from(std::iter::once("sift").chain(args.iter().copied())).is_ok()
+    }
+
+    #[test]
+    fn nonsense_numbers_are_refused_by_the_parser() {
+        // Regression: `--ctx 0` reached the KV arithmetic and printed "this model's
+        // metadata does not state its attention shape", which was false.
+        assert!(!parses(&["fit", "org/repo", "--ctx", "0"]));
+        assert!(parses(&["fit", "org/repo", "--ctx", "1"]));
+        assert!(!parses(&["route", "org/repo", "--ctx", "0"]));
+        assert!(!parses(&["ls", "--ctx", "0"]));
+        assert!(!parses(&["plan", "org/repo", "--hit-rate", "2"]));
+        assert!(!parses(&["plan", "org/repo", "--hit-rate", "NaN"]));
+        assert!(!parses(&["plan", "org/repo", "--hit-rate", "-0.1"]));
+        assert!(parses(&["plan", "org/repo", "--hit-rate", "0.5"]));
+        assert!(!parses(&["bench", "--repeats", "0"]));
+        assert!(!parses(&["bench", "--max-tokens", "0"]));
+    }
+
+    #[test]
+    fn fit_on_a_local_file_points_elsewhere_without_asking_the_hub() {
+        let f = tempfile::NamedTempFile::new().expect("temp file");
+        let err = cmd_fit(f.path().to_str().unwrap(), 4096, false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("local file"), "{err}");
+        assert!(err.contains("sift inspect"), "{err}");
+    }
+
+    #[test]
+    fn a_missing_disk_sample_is_an_error() {
+        let err = cmd_doctor(Some(PathBuf::from("/nonexistent/sift-sample")), true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no such file"), "{err}");
     }
 
     #[test]
