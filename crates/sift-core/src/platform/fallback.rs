@@ -30,6 +30,7 @@ pub fn machine_facts() -> MachineFacts {
         model: None,
         accel_memory: AccelMemory::Unknown,
         cgroup_limit_bytes: None,
+        memory_pressure: None,
     }
 }
 

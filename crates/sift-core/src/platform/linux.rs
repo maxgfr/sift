@@ -62,6 +62,9 @@ fn facts_from(
         // `gpu_memory`.
         accel_memory: AccelMemory::Unknown,
         cgroup_limit_bytes: cgroup.map(|c| c.limit),
+        memory_pressure: std::fs::read_to_string("/proc/pressure/memory")
+            .ok()
+            .and_then(|t| super::pressure_from_psi(&t)),
     }
 }
 

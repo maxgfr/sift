@@ -48,6 +48,7 @@ pub fn machine_facts() -> MachineFacts {
         // display driver reports is a separate pool, looked for only by `doctor`.
         accel_memory: AccelMemory::Unknown,
         cgroup_limit_bytes: None,
+        memory_pressure: None,
     }
 }
 

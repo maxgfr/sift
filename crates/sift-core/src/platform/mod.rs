@@ -88,6 +88,65 @@ pub struct MachineFacts {
     /// `ram_bytes` and `available_bytes`, and reported so `doctor` can say why they are
     /// smaller than the machine.
     pub cgroup_limit_bytes: Option<u64>,
+    /// How hard the OS is working to find memory right now, where it says.
+    ///
+    /// Everything else here describes the machine at rest. Under pressure — swapping,
+    /// compressing, stalling allocations — a model that "fits" pushes something else out,
+    /// and a bandwidth probe measures paging. Callers warn rather than pretend.
+    pub memory_pressure: Option<MemoryPressure>,
+}
+
+/// The OS's own verdict on memory pressure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryPressure {
+    Normal,
+    /// Swapping or compressing: estimates are optimistic until memory is freed.
+    Warning,
+    /// The OS is close to killing processes.
+    Critical,
+}
+
+impl MemoryPressure {
+    /// Whether figures measured now should be read with suspicion.
+    pub fn is_elevated(self) -> bool {
+        self != MemoryPressure::Normal
+    }
+}
+
+/// macOS `kern.memorystatus_vm_pressure_level`: 1 normal, 2 warning, 4 critical.
+pub fn pressure_from_darwin_level(level: u64) -> Option<MemoryPressure> {
+    match level {
+        1 => Some(MemoryPressure::Normal),
+        2 => Some(MemoryPressure::Warning),
+        4 => Some(MemoryPressure::Critical),
+        _ => None,
+    }
+}
+
+/// Linux pressure-stall information, `/proc/pressure/memory`.
+///
+/// `some avg10` is the share of the last ten seconds in which at least one task waited on
+/// memory; `full avg10` the share in which all of them did. A tenth of the time stalled is
+/// a machine under pressure; a quarter of the time with everything stalled is thrashing.
+pub fn pressure_from_psi(text: &str) -> Option<MemoryPressure> {
+    let avg10 = |kind: &str| -> Option<f64> {
+        text.lines()
+            .find(|l| l.starts_with(kind))?
+            .split_whitespace()
+            .find_map(|f| f.strip_prefix("avg10="))?
+            .parse()
+            .ok()
+    };
+    let some = avg10("some")?;
+    let full = avg10("full").unwrap_or(0.0);
+    Some(if full >= 25.0 {
+        MemoryPressure::Critical
+    } else if some >= 10.0 {
+        MemoryPressure::Warning
+    } else {
+        MemoryPressure::Normal
+    })
 }
 
 /// What we know about this machine's accelerator memory.
@@ -440,6 +499,35 @@ mod tests {
         assert!(!is_integrated_adapter("Intel(R) Arc(TM) A770 Graphics"));
         assert!(!is_integrated_adapter("NVIDIA GeForce RTX 4090"));
         assert!(!is_integrated_adapter("AMD Radeon RX 7900 XTX"));
+    }
+
+    #[test]
+    fn darwin_pressure_levels_are_read_as_the_kernel_defines_them() {
+        assert_eq!(pressure_from_darwin_level(1), Some(MemoryPressure::Normal));
+        assert_eq!(pressure_from_darwin_level(2), Some(MemoryPressure::Warning));
+        assert_eq!(
+            pressure_from_darwin_level(4),
+            Some(MemoryPressure::Critical)
+        );
+        assert_eq!(
+            pressure_from_darwin_level(0),
+            None,
+            "not a level the kernel uses"
+        );
+    }
+
+    #[test]
+    fn linux_psi_is_read_from_the_ten_second_averages() {
+        let calm = "some avg10=0.00 avg60=0.10 avg300=0.05 total=123\n\
+                    full avg10=0.00 avg60=0.00 avg300=0.00 total=45\n";
+        assert_eq!(pressure_from_psi(calm), Some(MemoryPressure::Normal));
+        let stalling = "some avg10=23.50 avg60=10.00 avg300=2.00 total=1\n\
+                        full avg10=2.00 avg60=1.00 avg300=0.10 total=1\n";
+        assert_eq!(pressure_from_psi(stalling), Some(MemoryPressure::Warning));
+        let thrashing = "some avg10=80.00 avg60=60.00 avg300=20.00 total=1\n\
+                         full avg10=35.00 avg60=20.00 avg300=5.00 total=1\n";
+        assert_eq!(pressure_from_psi(thrashing), Some(MemoryPressure::Critical));
+        assert_eq!(pressure_from_psi("garbage"), None);
     }
 
     #[test]

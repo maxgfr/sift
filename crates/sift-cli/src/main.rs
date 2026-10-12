@@ -12,6 +12,26 @@ mod ls;
 mod source;
 use source::Source;
 
+/// A warning to print when the machine is short of memory right now, if it is.
+///
+/// Every estimate `sift` prints assumes a machine at rest: memory that "fits" is free to
+/// take, and the bandwidth probe measures the bus rather than the pager. Under pressure
+/// both are optimistic, and saying so is cheaper than a user finding out an hour in.
+fn pressure_warning(facts: &MachineFacts) -> Option<&'static str> {
+    use sift_core::platform::MemoryPressure;
+    match facts.memory_pressure? {
+        MemoryPressure::Normal => None,
+        MemoryPressure::Warning => Some(
+            "warning: the OS reports memory pressure right now (swapping or compressing).\n  \
+             fits and tok/s assume a machine at rest; close something, then run this again.",
+        ),
+        MemoryPressure::Critical => Some(
+            "warning: the OS reports CRITICAL memory pressure right now. Nothing measured\n  \
+             here is reliable until memory is freed, and loading a model may get it killed.",
+        ),
+    }
+}
+
 /// Memory left to the OS when nothing better is known: a quarter of RAM, between 1 and
 /// 4 GiB.
 ///
@@ -432,6 +452,13 @@ fn cmd_fit(reference: &str, context_tokens: u64, json: bool) -> Result<()> {
             mem.gb_per_sec
         );
     }
+    if let Some(w) = pressure_warning(&facts) {
+        if json {
+            eprintln!("  {w}");
+        } else {
+            println!("  {w}");
+        }
+    }
     let cands = fit::score(swept, mem.gb_per_sec * 1e9, usable, context_tokens);
     // The same answer, and the same exit code, whether or not --json was asked for.
     if cands.is_empty() {
@@ -564,7 +591,11 @@ fn cmd_ls(context_tokens: u64, json: bool) -> Result<()> {
 
     let models = ls::discover();
     let rows = ls::evaluate(models, mem.gb_per_sec * 1e9, usable, context_tokens);
-    ls::report(&rows, context_tokens, json)
+    ls::report(&rows, context_tokens, json)?;
+    if let Some(w) = pressure_warning(&facts) {
+        eprintln!("\n  {w}");
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -777,6 +808,7 @@ fn cmd_doctor(disk_sample: Option<PathBuf>, json: bool) -> Result<()> {
                 "available_bytes": facts.available_bytes,
                 "accel_memory": facts.accel_memory,
                 "cgroup_limit_bytes": facts.cgroup_limit_bytes,
+                "memory_pressure": facts.memory_pressure,
                 "usable_memory_bytes": usable,
                 // True when the figure above rests on sift's estimate of an OS default the
                 // platform does not publish, rather than on a value it reported.
@@ -856,6 +888,16 @@ fn cmd_doctor(disk_sample: Option<PathBuf>, json: bool) -> Result<()> {
         ),
     }
 
+    if let Some(p) = facts.memory_pressure {
+        println!(
+            "  memory pressure  {}",
+            match p {
+                sift_core::platform::MemoryPressure::Normal => "normal",
+                sift_core::platform::MemoryPressure::Warning => "WARNING (swapping or compressing)",
+                sift_core::platform::MemoryPressure::Critical => "CRITICAL",
+            }
+        );
+    }
     println!(
         "  usable for a model {:.1} GiB{}",
         sift_core::gib(usable),
@@ -866,6 +908,9 @@ fn cmd_doctor(disk_sample: Option<PathBuf>, json: bool) -> Result<()> {
         }
     );
 
+    if let Some(w) = pressure_warning(&facts) {
+        println!("\n  {w}");
+    }
     println!("\nmemory bandwidth");
     println!("  read, all cores  {:.1} GB/s", read.gb_per_sec);
     println!("  STREAM copy      {:.1} GB/s", mem.gb_per_sec);
@@ -1319,6 +1364,7 @@ mod tests {
             model: None,
             accel_memory: accel,
             cgroup_limit_bytes: None,
+            memory_pressure: None,
         }
     }
 
@@ -1376,6 +1422,19 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("no such file"), "{err}");
+    }
+
+    #[test]
+    fn pressure_is_warned_about_only_when_the_os_reports_it() {
+        use sift_core::platform::MemoryPressure;
+        let mut f = facts(16, AccelMemory::Unknown);
+        assert!(pressure_warning(&f).is_none(), "unknown is not a warning");
+        f.memory_pressure = Some(MemoryPressure::Normal);
+        assert!(pressure_warning(&f).is_none());
+        f.memory_pressure = Some(MemoryPressure::Warning);
+        assert!(pressure_warning(&f).unwrap().contains("pressure"));
+        f.memory_pressure = Some(MemoryPressure::Critical);
+        assert!(pressure_warning(&f).unwrap().contains("CRITICAL"));
     }
 
     #[test]

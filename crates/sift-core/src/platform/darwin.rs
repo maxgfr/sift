@@ -29,6 +29,8 @@ pub fn machine_facts() -> MachineFacts {
             ram_bytes,
         ),
         cgroup_limit_bytes: None,
+        memory_pressure: sysctl_u64("kern.memorystatus_vm_pressure_level")
+            .and_then(super::pressure_from_darwin_level),
     }
 }
 
