@@ -337,9 +337,9 @@ fn is_quant_tag(part: &str) -> bool {
     if p == "UD" {
         return true;
     }
-    // Q4_K_M, Q8_0, IQ4_XS, F16, F32, BF16, TQ1_0, MXFP4 — all are a known letter prefix
-    // immediately followed by a digit.
-    for prefix in ["IQ", "BF", "TQ", "MXFP", "Q", "F"] {
+    // Q4_K_M, Q8_0, IQ4_XS, F16, F32, BF16, FP16, TQ1_0, MXFP4 — all are a known letter
+    // prefix immediately followed by a digit.
+    for prefix in ["IQ", "BF", "TQ", "MXFP", "FP", "Q", "F"] {
         if let Some(rest) = p.strip_prefix(prefix) {
             if rest.starts_with(|c: char| c.is_ascii_digit()) {
                 return true;
@@ -615,6 +615,15 @@ mod tests {
         assert_eq!(f("Model.i1-Q4_K_M.gguf").quant_label(), "Q4_K_M");
         // A version number with a dot is not mistaken for a separator before a tag.
         assert_eq!(f("Qwen2.5-7B-Instruct-Q8_0.gguf").quant_label(), "Q8_0");
+    }
+
+    #[test]
+    fn fp_spellings_of_float_formats_are_quant_tags() {
+        assert_eq!(
+            f("qwen2.5-coder-7b-instruct-fp16.gguf").quant_label(),
+            "FP16"
+        );
+        assert_eq!(f("model-FP8.gguf").quant_label(), "FP8");
     }
 
     #[test]

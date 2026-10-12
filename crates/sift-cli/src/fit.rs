@@ -456,6 +456,16 @@ fn plan_units(whole: &[hub::RepoFile], sets: &[hub::ShardSet]) -> (Vec<Unit>, Ve
         .collect();
     let mut skipped = Vec::new();
     for set in sets {
+        // Some publishers (Qwen) ship each quantization twice, whole and split. The split
+        // copy is the same weights; listing both showed one model twice under one name.
+        if whole.iter().any(|f| f.path == set.base.path) {
+            skipped.push(format!(
+                "{}: the same model as {}, split into parts",
+                set.base.quant_label(),
+                set.base.path
+            ));
+            continue;
+        }
         if !set.is_complete() {
             skipped.push(format!(
                 "{}: the repo does not hold all {} parts of it",
@@ -1302,6 +1312,29 @@ mod sweep_tests {
             download_glob("model.safetensors", &["model.safetensors".to_string()]),
             "model.safetensors"
         );
+    }
+
+    #[test]
+    fn a_split_copy_of_a_single_file_is_not_a_second_candidate() {
+        // Qwen/Qwen2.5-Coder-7B-Instruct-GGUF ships every quantization twice: one file,
+        // and the same weights split in parts. Two rows of the same model then got the
+        // same "disambiguated" name.
+        let files = vec![
+            file("m-q4_0.gguf", 10),
+            file("m-q4_0-00001-of-00002.gguf", 6),
+            file("m-q4_0-00002-of-00002.gguf", 4),
+            file("m-q8_0-00001-of-00002.gguf", 9),
+            file("m-q8_0-00002-of-00002.gguf", 9),
+        ];
+        let (whole, sets) = hub::group_models(&files, &[]);
+        let (units, skipped) = plan_units(&whole, &sets);
+        let paths: Vec<&str> = units.iter().map(|u| u.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            ["m-q4_0.gguf", "m-q8_0.gguf"],
+            "the split-only quant stays"
+        );
+        assert_eq!(skipped.len(), 1);
     }
 
     #[test]
