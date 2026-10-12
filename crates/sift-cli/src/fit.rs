@@ -1112,7 +1112,14 @@ mod format_tests {
             })
             .collect();
 
-        let rec = engine::route(4 << 30, Format::Safetensors, 12 << 30, &installed);
+        // On a Mac: off one, nothing runs safetensors, which is its own test in `engine`.
+        let rec = engine::route_on(
+            engine::Host::AppleSilicon,
+            4 << 30,
+            Format::Safetensors,
+            12 << 30,
+            &installed,
+        );
         let chosen = rec.engine.as_ref().expect("something must be recommended");
         assert!(
             chosen.formats.contains(&Format::Safetensors),

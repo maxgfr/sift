@@ -113,6 +113,42 @@ pub struct Engine {
     pub sweet_spot: &'static str,
     /// How to install it, when it is absent.
     pub install: &'static str,
+    /// Runs only on Apple Silicon Macs. MLX is a Metal framework: mlx-lm does not exist
+    /// anywhere else, and recommending it on Linux sends someone to `pip install` a
+    /// package that cannot run.
+    pub apple_silicon_only: bool,
+}
+
+/// The kind of machine routing is deciding for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Host {
+    /// An Apple Silicon Mac, where MLX runs.
+    AppleSilicon,
+    /// Anything else.
+    Other,
+}
+
+impl Host {
+    /// The machine this binary is running on.
+    pub fn current() -> Self {
+        if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+            Host::AppleSilicon
+        } else {
+            Host::Other
+        }
+    }
+}
+
+impl Engine {
+    /// Whether this engine can load `format` on `host`.
+    ///
+    /// MLX weights load only where MLX runs, whichever engine is asked: LM Studio reads
+    /// them through its MLX runtime, which exists on Apple Silicon alone.
+    pub fn reads(&self, format: Format, host: Host) -> bool {
+        let runs_here = !self.apple_silicon_only || host == Host::AppleSilicon;
+        let format_here = format != Format::Mlx || host == Host::AppleSilicon;
+        runs_here && format_here && self.formats.contains(&format)
+    }
 }
 
 /// An engine found on this machine.
@@ -136,6 +172,7 @@ pub const ENGINES: &[Engine] = &[
         sweet_spot:
             "models that fit; on Apple Silicon its MLX runtime is near the memory-bandwidth limit",
         install: "https://lmstudio.ai",
+        apple_silicon_only: false,
     },
     Engine {
         id: "ollama",
@@ -144,6 +181,7 @@ pub const ENGINES: &[Engine] = &[
         oversized: Oversized::Thrashes,
         sweet_spot: "models that fit, with the simplest workflow",
         install: "https://ollama.com/download",
+        apple_silicon_only: false,
     },
     Engine {
         id: "llama.cpp",
@@ -152,6 +190,7 @@ pub const ENGINES: &[Engine] = &[
         oversized: Oversized::Thrashes,
         sweet_spot: "models that fit, with the most control over offload and cache types",
         install: "brew install llama.cpp",
+        apple_silicon_only: false,
     },
     Engine {
         id: "mlx",
@@ -160,6 +199,7 @@ pub const ENGINES: &[Engine] = &[
         oversized: Oversized::Refuses,
         sweet_spot: "Apple Silicon, models that fit; fastest below ~14B",
         install: "pip install mlx-lm",
+        apple_silicon_only: true,
     },
     Engine {
         id: "colibri",
@@ -168,6 +208,7 @@ pub const ENGINES: &[Engine] = &[
         oversized: Oversized::Streams,
         sweet_spot: "models far larger than memory, streaming experts from disk",
         install: "https://github.com/JustVugg/colibri",
+        apple_silicon_only: false,
     },
 ];
 
@@ -177,11 +218,15 @@ pub const ENGINES: &[Engine] = &[
 /// never "not installed". Install paths change, and asserting absence on a failed probe
 /// would make the tool wrong in a way users cannot debug.
 pub fn detect_installed() -> Vec<Installed> {
-    let home = std::env::var_os("HOME").map(PathBuf::from);
+    // Windows has no HOME; USERPROFILE is the same directory there.
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from);
+    let local = local_app_data();
     let mut found = Vec::new();
 
     for engine in ENGINES {
-        if let Some(path) = candidate_paths(engine.id, home.as_deref())
+        if let Some(path) = candidate_paths(engine.id, home.as_deref(), local.as_deref())
             .unwrap_or_default()
             .into_iter()
             .find(|p| p.exists())
@@ -211,12 +256,19 @@ pub fn detect_installed() -> Vec<Installed> {
 /// there is a rule and this machine matched none of it. Without that distinction an engine
 /// added to [`ENGINES`] and forgotten here would be undetectable, and the only symptom
 /// would be `(NOT installed)` printed on a machine that has it.
-fn candidate_paths(id: &str, home: Option<&Path>) -> Option<Vec<PathBuf>> {
+fn candidate_paths(
+    id: &str,
+    home: Option<&Path>,
+    local_app_data: Option<&Path>,
+) -> Option<Vec<PathBuf>> {
     let paths: Vec<PathBuf> = match id {
         "lm-studio" => home
             .iter()
-            .map(|h| h.join(".lmstudio/bin/lms"))
+            .flat_map(|h| [h.join(".lmstudio/bin/lms"), h.join(".lmstudio/bin/lms.exe")])
+            .chain(which("lms"))
             .chain(["/Applications/LM Studio.app".into()])
+            // The Windows installer's per-user location.
+            .chain(local_app_data.map(|d| d.join("Programs/LM Studio/LM Studio.exe")))
             .collect(),
         "ollama" => which("ollama")
             .into_iter()
@@ -226,18 +278,38 @@ fn candidate_paths(id: &str, home: Option<&Path>) -> Option<Vec<PathBuf>> {
                 PathBuf::from("/opt/homebrew/bin/ollama"),
             ])
             // Windows installs per-user, off `PATH` for processes that started before it.
-            // Absent elsewhere, so this simply drops out rather than needing a `cfg`.
-            .chain(local_app_data().map(|d| d.join("Programs/Ollama/ollama.exe")))
+            .chain(local_app_data.map(|d| d.join("Programs/Ollama/ollama.exe")))
             .collect(),
         "llama.cpp" => which("llama-server")
             .into_iter()
             .chain(which("llama-cli"))
             .collect(),
-        "mlx" => which("mlx_lm.generate").into_iter().collect(),
+        // `pip install --user` puts the entry point in a directory that is often not on
+        // PATH: `~/Library/Python/3.x/bin` for the system Python on macOS, `~/.local/bin`
+        // elsewhere.
+        "mlx" => which("mlx_lm.generate")
+            .into_iter()
+            .chain(
+                home.into_iter()
+                    .flat_map(user_bin_dirs)
+                    .map(|d| d.join("mlx_lm.generate")),
+            )
+            .collect(),
         "colibri" => which("colibri").into_iter().collect(),
         _ => return None,
     };
     Some(paths)
+}
+
+/// Where per-user Python installs put scripts.
+fn user_bin_dirs(home: &Path) -> Vec<PathBuf> {
+    let mut dirs = vec![home.join(".local/bin")];
+    if let Ok(entries) = std::fs::read_dir(home.join("Library/Python")) {
+        let mut versions: Vec<PathBuf> = entries.flatten().map(|e| e.path().join("bin")).collect();
+        versions.sort();
+        dirs.extend(versions);
+    }
+    dirs
 }
 
 /// Locate an executable on `PATH`.
@@ -248,7 +320,29 @@ fn which(bin: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     std::env::split_paths(&path)
         .flat_map(|d| [d.join(bin), d.join(format!("{bin}.exe"))])
-        .find(|p| p.is_file())
+        .find(|p| is_executable(p))
+}
+
+/// Whether `path` is a file this user could run.
+///
+/// On Unix that takes an execute bit: a stray `ollama` text file in a PATH directory is
+/// not an installed engine.
+fn is_executable(path: &Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !meta.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        meta.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
 }
 
 /// `%LOCALAPPDATA%`, where Windows installers put per-user programs.
@@ -274,8 +368,20 @@ pub struct Recommendation {
     pub avoid: Vec<(Engine, &'static str)>,
 }
 
-/// Recommend an engine for a model of `model_bytes` in `format`, given `usable` memory.
+/// Recommend an engine for a model of `model_bytes` in `format`, given `usable` memory,
+/// for the machine this runs on.
 pub fn route(
+    model_bytes: u64,
+    format: Format,
+    usable: u64,
+    installed: &[Installed],
+) -> Recommendation {
+    route_on(Host::current(), model_bytes, format, usable, installed)
+}
+
+/// [`route`] for an explicit host, so every platform's routing is testable on any one.
+pub fn route_on(
+    host: Host,
     model_bytes: u64,
     format: Format,
     usable: u64,
@@ -284,11 +390,12 @@ pub fn route(
     let regime = Regime::classify(model_bytes, usable);
 
     let is_installed = |e: &Engine| installed.iter().any(|i| i.engine.id == e.id);
+    let readable_here = ENGINES.iter().any(|e| e.reads(format, host));
 
-    // Suitable means: reads this format, and does not fall over in this regime.
+    // Suitable means: runs here, reads this format, and does not fall over in this regime.
     let suitable: Vec<&Engine> = ENGINES
         .iter()
-        .filter(|e| e.formats.contains(&format))
+        .filter(|e| e.reads(format, host))
         .filter(|e| match regime {
             Regime::Fits | Regime::Tight => true,
             Regime::Oversized => e.oversized == Oversized::Streams,
@@ -300,7 +407,7 @@ pub fn route(
     let avoid: Vec<(Engine, &'static str)> = if regime == Regime::Oversized {
         ENGINES
             .iter()
-            .filter(|e| e.formats.contains(&format))
+            .filter(|e| e.reads(format, host))
             .filter(|e| e.oversized != Oversized::Streams)
             .filter(|e| is_installed(e))
             .map(|e| {
@@ -329,6 +436,11 @@ pub fn route(
     // to stand alone in `sift engines`, and spliced into the middle of another sentence it
     // produced "it only just fits — models that fit; on Apple Silicon … — so expect …".
     let reason = match (&chosen, regime) {
+        // A safetensors checkpoint off a Mac: something reads the format, nothing that
+        // runs here does.
+        (None, _) if !readable_here && ENGINES.iter().any(|e| e.formats.contains(&format)) => {
+            "no known engine runs this format on this platform".to_string()
+        }
         (None, Regime::Oversized) => format!(
             "at {:.1} GiB it exceeds what this machine can hold, and no known engine streams \
              this format from disk",
@@ -500,9 +612,79 @@ mod tests {
     #[test]
     fn format_is_respected() {
         // MLX weights do not load under llama.cpp, however well it would otherwise fit.
-        let r = route(5 * GIB, Format::Mlx, 12 * GIB, &installed(&["llama.cpp"]));
+        let r = route_on(
+            Host::AppleSilicon,
+            5 * GIB,
+            Format::Mlx,
+            12 * GIB,
+            &installed(&["llama.cpp"]),
+        );
         let id = r.engine.as_ref().unwrap().id;
         assert!(id == "lm-studio" || id == "mlx", "got {id}");
+    }
+
+    #[test]
+    fn mlx_is_never_recommended_off_apple_silicon() {
+        // Regression: a safetensors repo on Linux was routed to mlx-lm, which cannot run
+        // there at all.
+        for format in [Format::Safetensors, Format::Mlx] {
+            let r = route_on(
+                Host::Other,
+                4 * GIB,
+                format,
+                12 * GIB,
+                &installed(&["mlx", "lm-studio"]),
+            );
+            assert!(
+                r.engine.is_none(),
+                "{format:?} routed to {:?}",
+                r.engine.map(|e| e.id)
+            );
+            assert!(r.reason.contains("this platform"), "{}", r.reason);
+            assert!(r.also_suitable.iter().all(|e| e.id != "mlx"));
+        }
+    }
+
+    #[test]
+    fn lm_studio_reads_mlx_only_on_apple_silicon() {
+        let lms = ENGINES.iter().find(|e| e.id == "lm-studio").unwrap();
+        assert!(lms.reads(Format::Mlx, Host::AppleSilicon));
+        assert!(!lms.reads(Format::Mlx, Host::Other));
+        assert!(lms.reads(Format::Gguf, Host::Other));
+    }
+
+    #[test]
+    fn lm_studio_is_looked_for_where_windows_installs_it() {
+        let home = PathBuf::from("C:/Users/someone");
+        let local = PathBuf::from("C:/Users/someone/AppData/Local");
+        let paths = candidate_paths("lm-studio", Some(&home), Some(&local)).unwrap();
+        assert!(paths.iter().any(|p| p.ends_with(".lmstudio/bin/lms.exe")));
+        assert!(paths
+            .iter()
+            .any(|p| p.ends_with("Programs/LM Studio/LM Studio.exe")));
+    }
+
+    #[test]
+    fn mlx_lm_is_looked_for_in_per_user_python_directories() {
+        let home = tempfile::tempdir().expect("temp dir");
+        std::fs::create_dir_all(home.path().join("Library/Python/3.12/bin")).unwrap();
+        let paths = candidate_paths("mlx", Some(home.path()), None).unwrap();
+        assert!(paths.contains(&home.path().join("Library/Python/3.12/bin/mlx_lm.generate")));
+        assert!(paths.contains(&home.path().join(".local/bin/mlx_lm.generate")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_without_an_execute_bit_is_not_an_installed_program() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().expect("temp dir");
+        let p = d.path().join("ollama");
+        std::fs::write(&p, "not a program").unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(!is_executable(&p));
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(is_executable(&p));
+        assert!(!is_executable(d.path()), "a directory is not a program");
     }
 
     #[test]
@@ -544,7 +726,7 @@ mod tests {
         // there forever. Detecting on it reported an engine that could not run anything —
         // and `route` then recommended it over one that was actually present.
         let home = PathBuf::from("/home/someone");
-        let paths = candidate_paths("ollama", Some(&home)).expect("ollama has a rule");
+        let paths = candidate_paths("ollama", Some(&home), None).expect("ollama has a rule");
         assert!(
             !paths.iter().any(|p| p.ends_with(".ollama")),
             "a data directory is not an engine: {paths:?}"
@@ -558,7 +740,7 @@ mod tests {
         // binary or an application bundle — never a dotfile directory.
         let home = PathBuf::from("/home/someone");
         for engine in ENGINES {
-            for path in candidate_paths(engine.id, Some(&home)).unwrap_or_default() {
+            for path in candidate_paths(engine.id, Some(&home), None).unwrap_or_default() {
                 let name = path
                     .file_name()
                     .and_then(|n| n.to_str())
@@ -584,11 +766,11 @@ mod tests {
         let home = PathBuf::from("/home/someone");
         for engine in ENGINES {
             assert!(
-                candidate_paths(engine.id, Some(&home)).is_some(),
+                candidate_paths(engine.id, Some(&home), None).is_some(),
                 "{} is in the registry but nothing looks for it",
                 engine.id
             );
         }
-        assert_eq!(candidate_paths("not-an-engine", Some(&home)), None);
+        assert_eq!(candidate_paths("not-an-engine", Some(&home), None), None);
     }
 }
